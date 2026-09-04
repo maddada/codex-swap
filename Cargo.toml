@@ -27,4 +27,3 @@ toml = "0.8"
 [profile.release]
 lto = "thin"
 strip = true
-
