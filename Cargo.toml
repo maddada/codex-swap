@@ -1,0 +1,30 @@
+[package]
+name = "codex-swap"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Account-specific Codex launches with shared conversation history"
+license = "MIT"
+repository = "https://github.com/maddada/codex-swap"
+readme = "README.md"
+
+[[bin]]
+name = "xswap"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+fs2 = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+toml = "0.8"
+
+[profile.release]
+lto = "thin"
+strip = true
+
