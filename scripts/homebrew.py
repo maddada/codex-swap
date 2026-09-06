@@ -89,7 +89,7 @@ def main():
         "  def caveats",
         "    <<~EOS",
         "      Install the official Codex CLI separately and make sure codex is on PATH.",
-        "      Get started: xswap add --login --share-history",
+        "      Get started: codex login, then xswap add --alias personal",
         "    EOS",
         "  end",
         "end",

@@ -1,4 +1,6 @@
 //! Operating-system boundaries for account privacy and child execution.
+mod process_guard;
+pub use process_guard::ensure_codex_stopped;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

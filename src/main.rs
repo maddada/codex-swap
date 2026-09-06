@@ -1,3 +1,4 @@
+mod account_state;
 mod auth;
 mod backup;
 mod cli;
@@ -64,7 +65,7 @@ fn execute(cli: &Cli) -> anyhow::Result<()> {
         Action::Upgrade => maintenance::upgrade(),
         Action::Purge { yes, output } => maintenance::purge(cli, *yes, output),
         Action::Status(output) => commands::status(cli, output),
-        Action::Switch { account, output } => commands::switch(cli, account, output),
+        Action::Switch { account, output } => commands::switch(cli, account.as_deref(), output),
         Action::Remove { account, output } => commands::remove(cli, account, output),
         Action::Login {
             account,

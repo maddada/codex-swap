@@ -2,7 +2,7 @@
 
 A CLI for running Codex under different ChatGPT accounts, with usage reporting, directory mappings, portable account backups and optional shared conversation history. Inspired by the `cswap run` workflow from [claude-swap](https://github.com/realiti4/claude-swap), using the permanent account-directory approach from [swapdex](https://github.com/youdie006/swapdex).
 
-Each account has one permanent `CODEX_HOME`. Codex owns login and token refresh in that directory. xswap selects the directory and executes the official Codex binary. Different accounts can run concurrently, and launches of the same account use the same credential store.
+Save your current Codex login with `xswap add`, then use `xswap switch` to change the login used by a plain `codex` command. Saved accounts have private credential snapshots. The globally active account uses the main Codex home; explicit launches of other accounts use their separate homes. Codex owns token refresh.
 
 ## Install
 
@@ -42,7 +42,7 @@ For an explicit version or installation directory, download the script and run i
 
 ```powershell
 Invoke-WebRequest https://github.com/maddada/codex-swap/releases/latest/download/install.ps1 -OutFile install.ps1
-.\install.ps1 -Version v0.2.0 -InstallDir "$env:LOCALAPPDATA\Programs\codex-swap"
+.\install.ps1 -Version v0.3.0 -InstallDir "$env:LOCALAPPDATA\Programs\codex-swap"
 ```
 
 Use `-NoPathUpdate` to manage PATH yourself. The installer also upgrades existing installations; a running old executable is retired and cleaned up by a later installer run after it exits.
@@ -81,35 +81,48 @@ Cargo installs the `xswap` executable into `~/.cargo/bin`. To use `~/.local/bin`
 
 ## Set up accounts
 
-Register your existing file-based ChatGPT login without copying or moving its credentials:
+Close existing Codex sessions. Sign into the first account using Codex, then save it after the login command exits:
 
 ```sh
+codex login
 xswap add --alias personal
 ```
 
-Add another account. Codex opens its normal login flow in a new account directory; your original login stays in place:
+Before signing into another account, save the current account again to capture any credentials Codex refreshed. Then register the new login:
 
 ```sh
-xswap add --login --alias work --share-history
-# On a headless computer:
-xswap add --login --alias secondary --share-history --device-auth
+xswap add
+codex login
+xswap add --alias work
+xswap list
 ```
 
-The login flow tells you how to finish signing in. Use the intended account in your browser. If interrupted, the slot stays registered as incomplete:
+`add` snapshots the current file-based ChatGPT credentials into a private managed account home. Changing the normal Codex login afterward does not overwrite the saved account. Saving an already registered identity refreshes that account’s saved credentials rather than creating a duplicate slot. Existing aliases and directory mappings stay attached to the account. After reauthentication, run `xswap add` again to save the replacement credentials. A direct `codex login` replaces the previous main-home login; xswap cannot recover refreshed credentials that were overwritten before they were saved.
+
+The original account means the first saved account from the main Codex home. `xswap switch default` restores it. Existing 0.2 registries preserve their original account’s slot and alias when moving its credentials from an adopted main home into a managed snapshot.
+
+As a convenience, xswap can also open Codex’s sign-in flow directly in a new account home:
+
+```sh
+xswap add --login --alias secondary --share-history
+# On a headless computer:
+xswap add --login --alias another --share-history --device-auth
+```
+
+Use the intended account in your browser. If sign-in is interrupted, resume the prepared slot instead of adding another one:
 
 ```sh
 xswap login 2
 ```
 
-You can add more accounts at any time, or adopt an existing file-based account home:
+You can choose an explicit slot or register a login from another Codex home:
 
 ```sh
-xswap add --home ~/.codex-profiles/work --alias work --share-history
-xswap add --slot 5 --login --alias another --share-history
-xswap list
+xswap add --slot 5 --alias another
+xswap add --home ~/.codex-profiles/work --alias work
 ```
 
-Adoption keeps the original directory, credentials and settings. Registering the same directory or the same account twice is refused. Email selection is case-insensitive; if the same email belongs to multiple workspaces, select the slot number or a unique alias.
+Email selection is case-insensitive. If the same email belongs to multiple workspaces, select a slot number or unique alias.
 
 ## Run, resume and fork
 
@@ -132,23 +145,27 @@ xf() { x1 fork "$@"; }
 
 Account selection removes inherited `OPENAI_API_KEY`, `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN` and `OPENAI_ACCESS_TOKEN` from the child environment. Registered accounts use Codex's file credential backend. Overrides of that backend, or of `sqlite_home` while sharing history, are rejected rather than silently changing the selected account or conversation store. Other Codex arguments are forwarded unchanged.
 
-## Default account
+## Switch the global Codex login
+
+Exit existing Codex sessions, then switch:
 
 ```sh
 xswap switch work
-xswap run --share-history     # launches work
-xswap --status --json         # cswap-compatible spelling
-xswap --switch-to 1           # cswap-compatible spelling
-xswap switch default          # back to the original Codex home
+codex                         # now uses work
+xswap switch personal
+xswap switch                  # next complete, enabled account
+xswap switch default           # restore the original saved account
+xswap --status --json          # cswap-compatible spelling
+xswap --switch-to 1            # cswap-compatible spelling
 ```
 
-**The default applies to `xswap run`.** A bare `codex` command continues using its own environment and login. xswap does not overwrite the original `auth.json` to change defaults: doing so could change the account used by a terminal already running against that file. Use `xswap run` in your default shell wrapper if you want it to follow the selection:
+`switch` saves the latest outgoing main-home credentials before restoring the selected account into the main home’s regular `auth.json`. It also sets the saved default for future `xswap run` launches. Self-switching keeps the live credentials, including refreshes Codex has already performed. The command does not create an auth symlink or refresh tokens itself.
 
-```sh
-x() { xswap run --share-history -- --yolo "$@"; }
-```
+Existing Codex processes cache authentication. Before replacing the global login, xswap conservatively refuses while it detects a running Codex process for your user, including independently launched Codex sessions and sessions using another account home. Exit those processes and restart Codex after switching. The check detects existing processes, but a new external launch does not share xswap’s lock. Keep Codex closed until `add` or `switch` finishes so it cannot write cached credentials during the operation.
 
-The original Codex home is selected until you explicitly switch. `xswap run default` always selects that original home, even when another account is the xswap default. `status` reports the future-launch default, not the account of every running terminal. Explicit `xswap run work` does not change the default. Remembering a last-used personal account separately can stay in your shell wrapper, as with cswap.
+`status` reports the identity currently installed in the main Codex home; `launchDefault` separately reports the saved choice for `xswap run`. Signing into another account directly with `codex login` can change the global login without changing that saved choice. Run `xswap add` to save the new login, or `xswap switch ACCOUNT` to restore a saved account.
+
+Explicit `xswap run work` and directory mappings select an account for that launch without switching the global login. An explicit `xswap run default` selects the saved original account, even when a different account is globally active.
 
 ## Directory mappings
 
@@ -162,7 +179,7 @@ xswap unmap ~/projects/company/personal-tool
 
 A mapping applies to its directory and all subfolders. The nearest mapped ancestor wins. Paths are canonicalized, so a symlink to the same project uses the same mapping. Omit the directory in `map ACCOUNT` or `unmap` to use the current directory. `unmap` removes only the exact directory’s mapping; removing a nested mapping reveals its parent’s mapping again.
 
-Selection order is an explicit `xswap run ACCOUNT`, then the nearest directory mapping, then the saved global default. `xswap run default` explicitly chooses the original Codex home. `status` and `switch` continue to report and change the global default. Mapping `default` requires the original home to be registered first with `xswap add`.
+Selection order is an explicit `xswap run ACCOUNT`, then the nearest directory mapping, then the saved global default. `xswap run default` explicitly chooses the saved original account. `status` reports the installed main-home login; `switch` updates it and the saved launch default. Mapping `default` requires the original account to be saved first with `xswap add`.
 
 Mappings stay attached to their account when you rename aliases or move/swap slots. Removing an account clears its mappings. If a mapped account is disabled, a bare launch fails with a clear message instead of choosing another account.
 
@@ -192,7 +209,7 @@ xswap disable 5
 xswap enable 5
 ```
 
-Aliases must be unique, ignoring case. Moving or swapping changes only slot numbers, preserving account homes, credentials, directory mappings and the account selected as global default. `disable` prevents implicit selection and choosing that account as a new default or mapping. It does not erase credentials, stop running sessions or remove a saved default/mapping. Explicit commands such as `xswap run 5` still work; a disabled implicit choice produces an error until you enable it or explicitly select another account.
+Aliases must be unique, ignoring case. Moving or swapping changes only slot numbers, preserving account homes, credentials, directory mappings and the account selected as global default. `disable` prevents implicit selection, rotation and choosing that account as a new mapping. An explicit switch or run can still select a disabled account. It does not erase credentials, stop running sessions or remove a saved default/mapping. Explicit commands such as `xswap run 5` still work; a disabled implicit choice produces an error until you enable it or explicitly select another account.
 
 ## Back up and migrate accounts
 
@@ -205,9 +222,9 @@ xswap import accounts-backup.json --remap-slots
 
 **Backups contain plaintext login credentials.** xswap creates a new private JSON file and refuses to overwrite an existing file. Keep backups private and transfer them securely. The backup includes account credentials, aliases, slot numbers, enabled state, history-sharing preferences and the selected default. It excludes conversation history, configuration files, directory mappings and machine-local paths.
 
-Import creates fresh managed account homes and validates all accounts before saving the registry. Imported shared settings/history use the destination computer’s main Codex home. Duplicate identities or aliases are refused. Occupied slots are refused unless `--remap-slots` is provided; remapping allocates free slots and prints the assignments. Failed validation leaves the saved registry unchanged and removes staged credentials. An import restores its backed-up default into an empty registry; an established registry keeps its existing global default.
+Import creates fresh managed account homes and validates all accounts before saving the registry. Imported shared settings/history use the destination computer’s main Codex home. Duplicate identities or aliases are refused. Occupied slots are refused unless `--remap-slots` is provided; remapping allocates free slots and prints the assignments. Failed validation leaves the saved registry unchanged and removes staged credentials. An import restores its backed-up launch default into an empty registry; an established registry keeps its existing launch default. Import does not change the installed global Codex login or redefine the destination’s original account. Use `xswap switch ACCOUNT` when you want to activate an imported account globally.
 
-Export refuses while a selected account is running under an xswap lease, so finish that launch first. Imported credentials do not invalidate the original copy, but Codex’s refresh-token behavior still applies when using copies on multiple machines.
+Export reads the latest main-home credentials for the globally active account and the saved home for inactive accounts. It refuses while a selected account is running under an xswap lease, so finish that launch first. Imported credentials do not invalidate the original copy, but Codex’s refresh-token behavior still applies when using copies on multiple machines.
 
 ## What is shared
 
@@ -240,7 +257,7 @@ xswap remove work
 
 Reauthentication and removal refuse while that account has a live xswap launch lease. Other accounts remain available during login. The lease covers processes launched by xswap, not independently launched `codex` processes; finish those before reauthenticating an adopted home. A changed login identity is reported and requires explicit re-registration rather than silently relabeling the account.
 
-`remove` unregisters the account and prints its retained directory. It does **not** delete credentials or history, and does not log out Codex. Removing the selected default returns future launches to the original home. Slot numbers are not automatically reused.
+`remove` unregisters the account and prints its retained directory. It does **not** delete credentials or history, and does not log out Codex. Removing the selected launch default returns future launches to the saved original account when available. Removal does not rewrite the installed global login. Slot numbers are not automatically reused.
 
 ## Configuration and cleanup
 
@@ -254,7 +271,7 @@ xswap config unset codex-bin
 xswap config unset default-account
 ```
 
-The supported preferences are `codex-bin` (default `codex`) and `default-account` (default `default`, the original Codex home). Preferences live in the registry shown by `config path`. `default-account` accepts the same slot, alias, email or `default` identifiers as `switch`; it stores a slot so renames and moves keep selecting the same account. `config get` and `config list` show the saved preference or its default. For launches/login, executable selection is `--codex-bin`, then `XSWAP_CODEX_BIN`, then the saved preference, then `codex` on PATH. A relative executable path saved by `config set` is resolved when you set it.
+The supported preferences are `codex-bin` (default `codex`) and `default-account` (default `default`, the saved original account). Preferences live in the registry shown by `config path`. `config set default-account ACCOUNT` performs the same global switch as `xswap switch ACCOUNT`, including its running-Codex guard. `config unset default-account` switches back to the saved original account. The preference stores a slot so renames and moves keep selecting the same account. `config get` and `config list` show the saved preference or its default. For launches/login, executable selection is `--codex-bin`, then `XSWAP_CODEX_BIN`, then the saved preference, then `codex` on PATH. A relative executable path saved by `config set` is resolved when you set it.
 
 To erase xswap’s registry, preferences, mappings and managed account credentials/history:
 
@@ -288,7 +305,8 @@ Successful JSON operations emit one object to stdout; login messages and diagnos
   "email": "user@example.com",
   "accountId": "account-id",
   "plan": "pro",
-  "home": "/path/to/account/home",
+  "home": "/path/to/effective/codex/home",
+  "savedHome": "/path/to/saved/account/home",
   "managed": true,
   "enabled": true,
   "shareHistory": true,
@@ -297,7 +315,7 @@ Successful JSON operations emit one object to stdout; login messages and diagnos
 }
 ```
 
-Every response has `schemaVersion: 1`. `list` contains `accounts`; `add` contains `account`; `status` and `switch` contain `active`, `defaultHome` and `usesOriginalDefault`; `remove` contains `removed` and `retainedHome`. `active` is null when the original default home has not been registered.
+Every response has `schemaVersion: 1`. `list` contains `accounts`; `add` contains `account`; `status` and `switch` contain `active`, `defaultHome` and `usesOriginalDefault`; `remove` contains `removed` and `retainedHome`. `active` describes a saved account matching the actual main-home login, or is null when that login does not match a registered account. `launchDefault` reports the separately saved launch choice. Each account’s `home` is its effective credential/launch home (the main home when globally active); `savedHome` is its stored snapshot directory. Use `home` when reading current authentication or usage.
 
 `loginStatus` is `present`, `login_required`, `invalid_credentials`, or `identity_changed`. `present` means structurally valid credentials exist locally; it does **not** promise that the server will accept the token or that quota remains. Identity fields can be null before login completes. Console and JSON status output omit tokens; `export` writes credentials only to the requested backup file. No command rotates tokens itself. Integrations must tolerate additional fields in future versions.
 
@@ -310,7 +328,7 @@ On macOS/Linux, the registry defaults to `$XDG_DATA_HOME/codex-swap` when `XDG_D
 | Option / environment | Meaning |
 | --- | --- |
 | `--data-dir` / `XSWAP_HOME` | Separate xswap registry and managed homes |
-| `--codex-home` / `XSWAP_CODEX_HOME` | Main configuration/history home |
+| `--codex-home` / `XSWAP_CODEX_HOME` | Main Codex login, configuration and history home |
 | `--codex-bin` / `XSWAP_CODEX_BIN` | Codex executable, default `codex` on PATH |
 
 On first use, the main home defaults to `CODEX_HOME`, then `~/.codex` (`%USERPROFILE%\.codex` on Windows). It is persisted on the first registry mutation, so an inherited account-specific `CODEX_HOME` does not subsequently move the sharing anchor. A different explicit main home requires a different registry.

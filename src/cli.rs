@@ -26,7 +26,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Action {
-    /// Register the current login in place, or sign into a new isolated account.
+    /// Save an independent snapshot of the current login, or sign into a new account.
     Add(Add),
     /// List accounts, identities, login state and launch directories (no quota requests).
     List(Output),
@@ -125,10 +125,10 @@ pub enum Action {
     },
     /// Show the saved global default account.
     Status(Output),
-    /// Select the default for future xswap launches; existing sessions keep their account.
+    /// Activate an account for bare Codex and future xswap launches; no account rotates to the next enabled account.
     Switch {
         /// Slot number, alias, email, or 'default' for the original Codex home.
-        account: String,
+        account: Option<String>,
         #[command(flatten)]
         output: Output,
     },
@@ -176,7 +176,7 @@ pub struct Add {
     /// Assign an unused positive slot number.
     #[arg(long)]
     pub slot: Option<u32>,
-    /// Adopt a logged-in Codex home without copying its credentials.
+    /// Snapshot a logged-in Codex home instead of the original home.
     #[arg(long, conflicts_with = "login")]
     pub home: Option<PathBuf>,
     /// Create a permanent account home and open Codex's sign-in flow.

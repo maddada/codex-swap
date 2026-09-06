@@ -139,12 +139,11 @@ pub fn show(cli: &Cli, identifier: Option<&str>, all: bool, output: &Output) -> 
             .data
             .accounts
             .iter()
-            .cloned()
-            .map(Into::into)
-            .collect()
+            .map(|account| store.effective_account(account).map(Into::into))
+            .collect::<Result<_>>()?
     } else {
         vec![match store.selected(identifier)? {
-            Some(account) => account.into(),
+            Some(account) => store.effective_account(&account)?.into(),
             None => Target {
                 number: None,
                 alias: None,

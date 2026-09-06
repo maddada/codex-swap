@@ -17,6 +17,7 @@ struct AccountView {
     account_id: Option<String>,
     plan: Option<String>,
     home: std::path::PathBuf,
+    saved_home: std::path::PathBuf,
     managed: bool,
     share_history: bool,
     is_default: bool,
@@ -24,8 +25,9 @@ struct AccountView {
     enabled: bool,
 }
 
-fn view(store: &Store, account: &Account) -> AccountView {
-    let (identity, login_status) = match auth::identity(&account.home) {
+fn view(store: &Store, account: &Account) -> Result<AccountView> {
+    let effective = store.effective_account(account)?;
+    let (identity, login_status) = match auth::identity(&effective.home) {
         Ok(Some(live)) => {
             if account
                 .identity
@@ -40,20 +42,24 @@ fn view(store: &Store, account: &Account) -> AccountView {
         Ok(None) => (account.identity.clone(), "login_required"),
         Err(_) => (account.identity.clone(), "invalid_credentials"),
     };
-    AccountView {
+    Ok(AccountView {
         number: account.number,
         alias: account.alias.clone(),
         email: identity.as_ref().and_then(|i| i.email.clone()),
         account_id: identity.as_ref().map(|i| i.account_id.clone()),
         plan: identity.as_ref().and_then(|i| i.plan.clone()),
-        home: account.home.clone(),
-        managed: account.managed,
-        share_history: account.share_history || account.home == store.data.main_home,
-        is_default: store.data.default == Some(account.number)
-            || (store.data.default.is_none() && account.home == store.data.main_home),
+        home: effective.home,
+        saved_home: account.home.clone(),
+        managed: effective.managed,
+        share_history: effective.share_history,
+        is_default: store
+            .live_account()
+            .ok()
+            .flatten()
+            .is_some_and(|active| active.number == account.number),
         login_status,
         enabled: account.enabled,
-    }
+    })
 }
 
 fn emit(value: &impl Serialize) -> Result<()> {
@@ -86,7 +92,7 @@ pub fn list(cli: &Cli, output: &Output) -> Result<()> {
         .accounts
         .iter()
         .map(|a| view(&store, a))
-        .collect();
+        .collect::<Result<_>>()?;
     if output.json {
         emit(&json!({"schemaVersion": 1, "accounts": accounts}))?;
     } else if accounts.is_empty() {
@@ -101,49 +107,36 @@ pub fn list(cli: &Cli, output: &Output) -> Result<()> {
 
 pub fn status(cli: &Cli, output: &Output) -> Result<()> {
     let store = Store::open(cli)?;
-    let selected = match store.data.default {
-        Some(number) => Some(store.resolve(&number.to_string())?),
-        None => store.main_account(),
-    };
-    let active = selected.as_ref().map(|a| view(&store, a));
+    let selected = store.live_account()?;
+    let active = selected.as_ref().map(|a| view(&store, a)).transpose()?;
     if output.json {
         emit(
             &json!({"schemaVersion": 1, "active": active, "defaultHome": store.data.main_home,
-            "usesOriginalDefault": store.data.default.is_none()}),
+            "usesOriginalDefault": selected.as_ref().is_some_and(|active| store.main_account().is_some_and(|original| original.number == active.number)), "launchDefault": store.data.default}),
         )?;
     } else if let Some(active) = active {
         human(&active);
-    } else {
+    } else if let Some(identity) = auth::identity(&store.data.main_home)? {
         println!(
-            "Default: original Codex home ({})",
-            store.data.main_home.display()
+            "Current Codex login: {} (not saved; use xswap add)",
+            identity
+                .email
+                .as_deref()
+                .unwrap_or(&identity.account_id)
+                .escape_default()
         );
+    } else {
+        println!("No current Codex login. Sign in with Codex, then use xswap add.");
     }
     Ok(())
 }
 
-pub fn switch(cli: &Cli, identifier: &str, output: &Output) -> Result<()> {
-    let mut store = Store::open(cli)?;
-    let target = if identifier == "default" {
-        if let Some(account) = store.main_account() {
-            Store::require_enabled(&account)?;
-        }
-        None
-    } else {
-        let account = store.resolve(identifier)?;
-        Store::require_enabled(&account)?;
-        if account.identity.is_none() {
-            bail!(
-                "account setup is incomplete; run xswap login {}",
-                account.number
-            );
-        }
-        auth::verify(&account.home, &account.identity)?;
-        Some(account.number)
-    };
-    store.data.default = target;
-    store.save()?;
-    drop(store);
+pub fn select_global(cli: &Cli, identifier: Option<&str>) -> Result<()> {
+    crate::account_state::select_global(cli, identifier)
+}
+
+pub fn switch(cli: &Cli, identifier: Option<&str>, output: &Output) -> Result<()> {
+    select_global(cli, identifier)?;
     status(cli, output)
 }
 
@@ -158,6 +151,9 @@ pub fn remove(cli: &Cli, identifier: &str, output: &Output) -> Result<()> {
         .retain(|_, number| *number != account.number);
     if store.data.default == Some(account.number) {
         store.data.default = None;
+    }
+    if store.data.original_account == Some(account.number) {
+        store.data.original_account = None;
     }
     store.save()?;
     if output.json {
@@ -175,6 +171,19 @@ pub fn remove(cli: &Cli, identifier: &str, output: &Output) -> Result<()> {
 }
 
 pub fn add(cli: &Cli, args: &Add) -> Result<()> {
+    if !args.login {
+        let number = crate::account_state::snapshot(
+            cli,
+            args.home.as_deref(),
+            args.alias.clone(),
+            args.slot,
+            args.share_history,
+        )?;
+        let store = Store::open(cli)?;
+        let account = store.resolve(&number.to_string())?;
+        return account_result(&store, &account, &args.output);
+    }
+
     let mut store = Store::open(cli)?;
     store.validate_alias(&args.alias)?;
     let number = args.slot.unwrap_or(store.data.next_number);
@@ -183,28 +192,14 @@ pub fn add(cli: &Cli, args: &Add) -> Result<()> {
     }
     let next = number.checked_add(1).context("slot number is too large")?;
     launch::prepare_main(&store.data.main_home)?;
-    let (home, managed, identity) = if args.login {
-        let profiles = store.root.join("accounts");
-        fsutil::private_dir(&profiles)?;
-        let dir = fsutil::private_tempdir(&profiles, &format!("{number}-"))?;
-        sharing::config(&store.data.main_home, dir.path())?;
-        if args.share_history {
-            sharing::history(&store.data.main_home, dir.path())?;
-        }
-        (dir.keep(), true, None)
-    } else {
-        let home = fsutil::absolute(args.home.as_deref().unwrap_or(&store.data.main_home))?;
-        if store.data.accounts.iter().any(|a| a.home == home) {
-            bail!("this Codex home is already registered");
-        }
-        launch::validate_file_store(&home)?;
-        let identity = auth::require(&home)?;
-        store.ensure_unique_identity(&identity, number)?;
-        if args.share_history {
-            sharing::history(&store.data.main_home, &home)?;
-        }
-        (home, false, Some(identity))
-    };
+    let profiles = store.root.join("accounts");
+    fsutil::private_dir(&profiles)?;
+    let dir = fsutil::private_tempdir(&profiles, &format!("{number}-"))?;
+    sharing::config(&store.data.main_home, dir.path())?;
+    if args.share_history {
+        sharing::history(&store.data.main_home, dir.path())?;
+    }
+    let (home, managed, identity) = (dir.keep(), true, None);
     let account = Account {
         number,
         alias: args.alias.clone(),
@@ -227,9 +222,9 @@ pub fn add(cli: &Cli, args: &Add) -> Result<()> {
     let store = Store::open(cli)?;
     let saved = store.resolve(&number.to_string())?;
     if args.output.json {
-        emit(&json!({"schemaVersion": 1, "account": view(&store, &saved)}))?;
+        emit(&json!({"schemaVersion": 1, "account": view(&store, &saved)?}))?;
     } else {
-        human(&view(&store, &saved));
+        human(&view(&store, &saved)?);
     }
     Ok(())
 }
@@ -265,7 +260,7 @@ pub fn set_enabled(cli: &Cli, identifier: &str, enabled: bool, output: &Output) 
 }
 
 fn account_result(store: &Store, account: &Account, output: &Output) -> Result<()> {
-    let account = view(store, account);
+    let account = view(store, account)?;
     if output.json {
         emit(&json!({"schemaVersion": 1, "account": account}))
     } else {
@@ -310,6 +305,10 @@ fn renumber(store: &mut Store, from: u32, to: u32, output: &Output) -> Result<()
     store.data.default = store
         .data
         .default
+        .map(|number| remap_number(number, from, to));
+    store.data.original_account = store
+        .data
+        .original_account
         .map(|number| remap_number(number, from, to));
     for number in store.data.directory_mappings.values_mut() {
         *number = remap_number(*number, from, to);

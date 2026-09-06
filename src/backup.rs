@@ -47,20 +47,31 @@ pub fn export(cli: &Cli, file: &Path, identifier: Option<&str>, output: &Output)
         Some(identifier) => vec![store.resolve(identifier)?],
         None => store.data.accounts.clone(),
     };
+    let sources = accounts
+        .iter()
+        .map(|account| {
+            store
+                .effective_account(account)
+                .map(|effective| effective.home)
+        })
+        .collect::<Result<Vec<_>>>()?;
     if accounts.is_empty() {
         bail!("no accounts to export");
     }
-    let _leases: Vec<_> = accounts
+    let _leases: Vec<_> = sources
         .iter()
-        .map(|account| store.lease(&account.home, true))
+        .map(|home| store.lease(home, true))
         .collect::<Result<_>>()?;
     let mut exported = Vec::new();
-    for account in accounts {
-        auth::verify(&account.home, &account.identity)?;
-        let bytes = fsutil::optional_bytes(&account.home.join("auth.json"))?
-            .context("account credentials disappeared")?;
-        let auth = serde_json::from_slice(&bytes)
-            .map_err(|_| anyhow::anyhow!("invalid account credentials (contents omitted)"))?;
+    for (account, home) in accounts.into_iter().zip(sources) {
+        let (auth, identity) = auth::credentials(&home)?;
+        if account.identity.as_ref().is_some_and(|saved| {
+            saved.account_id != identity.account_id || saved.email != identity.email
+        }) {
+            bail!(
+                "account credentials changed identity; save the intended login with xswap add before exporting"
+            );
+        }
         exported.push(BackupAccount {
             number: account.number,
             alias: account.alias,

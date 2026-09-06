@@ -20,6 +20,19 @@ pub fn identity(home: &Path) -> Result<Option<Identity>> {
     };
     let value: Value =
         serde_json::from_slice(&bytes).context("invalid Codex auth.json (contents omitted)")?;
+    identity_value(&value).map(Some)
+}
+
+pub fn credentials(home: &Path) -> Result<(Value, Identity)> {
+    let bytes = crate::fsutil::optional_bytes(&home.join("auth.json"))?
+        .context("no file-based ChatGPT login here; sign in with Codex first")?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("invalid Codex auth.json (contents omitted)"))?;
+    let identity = identity_value(&value)?;
+    Ok((value, identity))
+}
+
+fn identity_value(value: &Value) -> Result<Identity> {
     if value
         .get("auth_mode")
         .and_then(Value::as_str)
@@ -47,13 +60,13 @@ pub fn identity(home: &Path) -> Result<Option<Identity>> {
             .map_err(|_| anyhow::anyhow!("invalid Codex identity token encoding"))?,
     )
     .map_err(|_| anyhow::anyhow!("invalid Codex identity token claims"))?;
-    Ok(Some(Identity {
+    Ok(Identity {
         account_id: account_id.to_owned(),
         email: claims["email"].as_str().map(str::to_owned),
         plan: claims["https://api.openai.com/auth"]["chatgpt_plan_type"]
             .as_str()
             .map(str::to_owned),
-    }))
+    })
 }
 
 pub fn require(home: &Path) -> Result<Identity> {

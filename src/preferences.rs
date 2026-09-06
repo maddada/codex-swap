@@ -70,25 +70,9 @@ pub fn configure(cli: &Cli, action: Option<&ConfigAction>, output: &Output) -> R
                     store.save()?;
                 }
                 "default-account" => {
-                    let account = store.selected(Some(new))?;
-                    if let Some(account) = &account {
-                        Store::require_enabled(account)?;
-                        if new != "default" {
-                            if account.identity.is_none() {
-                                bail!(
-                                    "account setup is incomplete; run xswap login {}",
-                                    account.number
-                                );
-                            }
-                            crate::auth::verify(&account.home, &account.identity)?;
-                        }
-                    }
-                    store.data.default = if new == "default" {
-                        None
-                    } else {
-                        account.map(|a| a.number)
-                    };
-                    store.save()?;
+                    drop(store);
+                    crate::commands::select_global(cli, Some(new))?;
+                    store = Store::open(cli)?;
                 }
                 _ => {
                     value(&store, key)?;
@@ -100,7 +84,11 @@ pub fn configure(cli: &Cli, action: Option<&ConfigAction>, output: &Output) -> R
         ConfigAction::Unset { key } => {
             match key.as_str() {
                 "codex-bin" => store.data.preferences.codex_bin = None,
-                "default-account" => store.data.default = None,
+                "default-account" => {
+                    drop(store);
+                    crate::commands::select_global(cli, Some("default"))?;
+                    store = Store::open(cli)?;
+                }
                 _ => {
                     value(&store, key)?;
                     unreachable!()

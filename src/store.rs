@@ -37,6 +37,8 @@ pub struct Registry {
     pub default: Option<u32>,
     pub accounts: Vec<Account>,
     #[serde(default)]
+    pub original_account: Option<u32>,
+    #[serde(default)]
     pub directory_mappings: BTreeMap<PathBuf, u32>,
     #[serde(default)]
     pub preferences: Preferences,
@@ -91,6 +93,7 @@ impl Store {
                 next_number: 1,
                 default: None,
                 accounts: vec![],
+                original_account: None,
                 directory_mappings: BTreeMap::new(),
                 preferences: Preferences::default(),
             }
@@ -103,6 +106,9 @@ impl Store {
             if account.number == 0 || !seen.insert(account.number) || !account.home.is_absolute() {
                 bail!("invalid or duplicate account in xswap registry");
             }
+        }
+        if data.original_account.is_some_and(|n| !seen.contains(&n)) {
+            bail!("original account is missing from registry");
         }
         if data.default.is_some_and(|n| !seen.contains(&n)) {
             bail!("default account is missing from registry");
@@ -210,8 +216,40 @@ impl Store {
         self.data
             .accounts
             .iter()
-            .find(|a| a.home == self.data.main_home)
+            .find(|a| {
+                self.data.original_account == Some(a.number)
+                    || (self.data.original_account.is_none() && a.home == self.data.main_home)
+            })
             .cloned()
+    }
+
+    pub fn live_account(&self) -> Result<Option<Account>> {
+        let Some(identity) = crate::auth::identity(&self.data.main_home)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .data
+            .accounts
+            .iter()
+            .find(|a| {
+                a.identity.as_ref().is_some_and(|saved| {
+                    saved.account_id == identity.account_id && saved.email == identity.email
+                })
+            })
+            .cloned())
+    }
+
+    pub fn effective_account(&self, account: &Account) -> Result<Account> {
+        let mut effective = account.clone();
+        if self
+            .live_account()?
+            .is_some_and(|live| live.number == account.number)
+        {
+            effective.home = self.data.main_home.clone();
+            effective.managed = false;
+            effective.share_history = true;
+        }
+        Ok(effective)
     }
 
     pub fn validate_alias(&self, alias: &Option<String>) -> Result<()> {

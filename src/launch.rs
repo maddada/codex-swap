@@ -65,7 +65,11 @@ pub fn run(
 ) -> Result<()> {
     let mut store = Store::open(cli)?;
     let mut selected = store.selected_for_run(identifier)?;
-    let home = selected
+    let effective = selected
+        .as_ref()
+        .map(|a| store.effective_account(a))
+        .transpose()?;
+    let home = effective
         .as_ref()
         .map(|a| a.home.clone())
         .unwrap_or_else(|| store.data.main_home.clone());
@@ -77,6 +81,11 @@ pub fn run(
         .as_ref()
         .is_some_and(|a| shared && !a.share_history && home != store.data.main_home);
     let lease = store.lease(&home, enabling)?;
+    let snapshot_lease = selected
+        .as_ref()
+        .filter(|a| a.home != home)
+        .map(|a| store.lease(&a.home, false))
+        .transpose()?;
     if let Some(account) = selected.as_mut() {
         if account.identity.is_none() {
             bail!(
@@ -85,12 +94,12 @@ pub fn run(
             );
         }
         auth::verify(&home, &account.identity)?;
-        if account.managed {
+        if account.managed && home != store.data.main_home {
             sharing::config(&store.data.main_home, &home)?;
         }
         if shared {
             sharing::history(&store.data.main_home, &home)?;
-            if !account.share_history {
+            if !account.share_history && home != store.data.main_home {
                 account.share_history = true;
                 store.replace(account.clone())?;
             }
@@ -110,6 +119,9 @@ pub fn run(
         FileExt::lock_shared(&lease)?;
     }
     crate::platform::keep_lease_across_exec(&lease)?;
+    if let Some(snapshot) = &snapshot_lease {
+        crate::platform::keep_lease_across_exec(snapshot)?;
+    }
     drop(store);
     crate::platform::execute(cmd, lease)
 }
@@ -117,12 +129,19 @@ pub fn run(
 pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
     let store = Store::open(cli)?;
     let mut account = store.resolve(identifier)?;
-    let lease = store.lease(&account.home, true)?;
-    // Refuse a known wrong login before asking Codex to mutate its directory.
-    if auth::identity(&account.home)?.is_some() {
-        auth::verify(&account.home, &account.identity)?;
+    let effective = store.effective_account(&account)?;
+    let lease = store.lease(&effective.home, true)?;
+    let snapshot_lease = (effective.home != account.home)
+        .then(|| store.lease(&account.home, true))
+        .transpose()?;
+    if effective.home == store.data.main_home {
+        crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
     }
-    let mut cmd = command(&store.codex_bin(cli), &account.home, true)?;
+    // Refuse a known wrong login before asking Codex to mutate its directory.
+    if auth::identity(&effective.home)?.is_some() {
+        auth::verify(&effective.home, &account.identity)?;
+    }
+    let mut cmd = command(&store.codex_bin(cli), &effective.home, true)?;
     cmd.arg("login");
     // Keep xswap add --json stdout machine-readable, including during native sign-in.
     cmd.stdout(std::io::stderr());
@@ -142,12 +161,17 @@ pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
             account.number
         );
     }
-    let live = auth::verify(&account.home, &account.identity)?;
+    let live = auth::verify(&effective.home, &account.identity)?;
     let mut store = Store::open(cli)?;
     store.ensure_unique_identity(&live, account.number)?;
+    if effective.home != account.home {
+        let (document, _) = auth::credentials(&effective.home)?;
+        fsutil::atomic_json(&account.home.join("auth.json"), &document)?;
+    }
     account.identity = Some(live);
     store.replace(account)?;
     drop(lease);
+    drop(snapshot_lease);
     eprintln!("Account login saved.");
     Ok(())
 }

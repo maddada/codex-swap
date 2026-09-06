@@ -97,7 +97,7 @@ pub fn purge(cli: &Cli, yes: bool, output: &Output) -> Result<()> {
             );
         }
     }
-    let mut homes = BTreeSet::new();
+    let mut homes = BTreeSet::from([store.data.main_home.clone()]);
     let mut managed_homes = Vec::new();
     for account in &store.data.accounts {
         homes.insert(account.home.clone());

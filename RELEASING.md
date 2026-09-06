@@ -14,7 +14,7 @@ The tap update is separate from the binary workflow, like Ghostex's release tool
 To regenerate a formula from locally downloaded release archives:
 
 ```sh
-python3 scripts/homebrew.py 0.2.0 path/to/archives path/to/Formula/codex-swap.rb
+python3 scripts/homebrew.py 0.3.0 path/to/archives path/to/Formula/codex-swap.rb
 ```
 
 This also writes `SHA256SUMS` into the archive directory. All six archives and the Windows `install.ps1` installer must be present; partial releases cannot produce a formula.
