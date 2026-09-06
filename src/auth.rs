@@ -82,7 +82,7 @@ pub fn verify(home: &Path, expected: &Option<Identity>) -> Result<Identity> {
         .is_some_and(|id| id.account_id != live.account_id || id.email != live.email)
     {
         bail!(
-            "this directory is now signed into another account; remove its registration and add it again"
+            "this directory is now signed into another account; run xswap login with this account's slot or alias and choose its registered identity"
         );
     }
     Ok(live)

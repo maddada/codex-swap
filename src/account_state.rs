@@ -104,6 +104,69 @@ fn same_identity(a: &auth::Identity, b: &auth::Identity) -> bool {
     a.account_id == b.account_id && a.email == b.email
 }
 
+pub(crate) struct LoginDestination {
+    pub account: Account,
+    pub effective_home: PathBuf,
+    pub previous: Vec<(PathBuf, Option<Vec<u8>>)>,
+}
+
+pub(crate) fn commit_login(
+    cli: &Cli,
+    destination: &LoginDestination,
+    document: &Value,
+    identity: auth::Identity,
+) -> Result<()> {
+    let mut store = Store::open(cli)?;
+    let mut account = store.resolve(&destination.account.number.to_string())?;
+    if account.home != destination.account.home
+        || account.identity != destination.account.identity
+        || store.effective_account(&account)?.home != destination.effective_home
+    {
+        bail!(
+            "account selection changed during login; retry xswap login {}",
+            account.number
+        );
+    }
+    if account
+        .identity
+        .as_ref()
+        .is_some_and(|expected| !same_identity(expected, &identity))
+    {
+        bail!(
+            "Codex signed into a different account; saved credentials were unchanged. Retry xswap login {} and choose the registered account",
+            account.number
+        );
+    }
+    store.ensure_unique_identity(&identity, account.number)?;
+    if destination.effective_home == store.data.main_home {
+        crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
+    }
+    for (path, previous) in &destination.previous {
+        if fsutil::optional_bytes(path)? != *previous {
+            bail!(
+                "account credentials changed during login; saved credentials were unchanged. Retry xswap login {}",
+                account.number
+            );
+        }
+    }
+    let mut transaction = Transaction::new();
+    let result = (|| {
+        for (path, _) in &destination.previous {
+            transaction.write(path, document)?;
+        }
+        account.identity = Some(identity);
+        let entry = store
+            .data
+            .accounts
+            .iter_mut()
+            .find(|a| a.number == account.number)
+            .context("account was removed")?;
+        *entry = account;
+        transaction.write(&store.root.join("accounts.json"), &store.data)
+    })();
+    transaction.finish(result)
+}
+
 /// CDXC:AgentProviders 2026-09-06 WHY:
 /// Older registries registered the mutable original home in place, so its login must be preserved before global activation replaces that file.
 /// A legacy identity already overwritten outside xswap cannot be recovered; retain its slot as requiring login instead of assigning another account's credentials.

@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 use fs2::FileExt;
 use std::{
     ffi::{OsStr, OsString},
+    io::Write,
     path::Path,
     process::Command,
 };
@@ -126,9 +127,11 @@ pub fn run(
     crate::platform::execute(cmd, lease)
 }
 
+/// CDXC:AgentProviders 2026-09-06 WHY:
+/// Browser SSO can authenticate the wrong account; logging into a fresh home lets us check the registered identity before replacing credentials and keeps the same login command retryable.
 pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
     let store = Store::open(cli)?;
-    let mut account = store.resolve(identifier)?;
+    let account = store.resolve(identifier)?;
     let effective = store.effective_account(&account)?;
     let lease = store.lease(&effective.home, true)?;
     let snapshot_lease = (effective.home != account.home)
@@ -137,11 +140,41 @@ pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
     if effective.home == store.data.main_home {
         crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
     }
-    // Refuse a known wrong login before asking Codex to mutate its directory.
-    if auth::identity(&effective.home)?.is_some() {
-        auth::verify(&effective.home, &account.identity)?;
+    let mut paths = vec![effective.home.join("auth.json")];
+    if effective.home != account.home {
+        paths.push(account.home.join("auth.json"));
     }
-    let mut cmd = command(&store.codex_bin(cli), &effective.home, true)?;
+    let destination = crate::account_state::LoginDestination {
+        account: account.clone(),
+        effective_home: effective.home.clone(),
+        previous: paths
+            .into_iter()
+            .map(|path| {
+                let bytes = fsutil::optional_bytes(&path)?;
+                Ok((path, bytes))
+            })
+            .collect::<Result<_>>()?,
+    };
+    let staging = fsutil::private_tempdir(&store.root, "login-")?;
+    // Copy configuration instead of linking it: login must not update real settings.
+    let config = effective.home.join("config.toml");
+    if config.exists() {
+        let mut copy = tempfile::NamedTempFile::new_in(staging.path())?;
+        copy.write_all(&std::fs::read(config)?)?;
+        copy.persist(staging.path().join("config.toml"))?;
+    }
+    let mut cmd = command(&store.codex_bin(cli), staging.path(), true)?;
+    let sqlite = toml::Value::String(staging.path().to_string_lossy().into_owned()).to_string();
+    cmd.args(["-c", &format!("sqlite_home={sqlite}")]);
+    if let Some(expected) = &account.identity {
+        eprintln!(
+            "Sign in to account {} ({:?}). Choose this account in the browser.",
+            account.number,
+            expected.email.as_deref().unwrap_or(&expected.account_id)
+        );
+    } else {
+        eprintln!("Sign in to new account {}.", account.number);
+    }
     cmd.arg("login");
     // Keep xswap add --json stdout machine-readable, including during native sign-in.
     cmd.stdout(std::io::stderr());
@@ -150,6 +183,9 @@ pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
     }
     // Other accounts stay available while this browser/terminal login is in progress.
     crate::platform::keep_lease_across_exec(&lease)?;
+    if let Some(snapshot) = &snapshot_lease {
+        crate::platform::keep_lease_across_exec(snapshot)?;
+    }
     drop(store);
     #[cfg(unix)]
     let status = cmd.status().context("could not start Codex login")?;
@@ -161,15 +197,8 @@ pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
             account.number
         );
     }
-    let live = auth::verify(&effective.home, &account.identity)?;
-    let mut store = Store::open(cli)?;
-    store.ensure_unique_identity(&live, account.number)?;
-    if effective.home != account.home {
-        let (document, _) = auth::credentials(&effective.home)?;
-        fsutil::atomic_json(&account.home.join("auth.json"), &document)?;
-    }
-    account.identity = Some(live);
-    store.replace(account)?;
+    let (document, live) = auth::credentials(staging.path())?;
+    crate::account_state::commit_login(cli, &destination, &document, live)?;
     drop(lease);
     drop(snapshot_lease);
     eprintln!("Account login saved.");
