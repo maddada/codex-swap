@@ -1,16 +1,16 @@
 use crate::{auth, cli::Cli, fsutil, sharing, store::Store};
-use anyhow::{Context, Result, bail};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::{Result, bail};
 use fs2::FileExt;
 use std::{
-    ffi::OsString,
-    fs::File,
-    os::{fd::AsRawFd, unix::process::CommandExt},
+    ffi::{OsStr, OsString},
     path::Path,
     process::Command,
 };
 
-fn command(cli: &Cli, home: &Path, file_auth: bool) -> Command {
-    let mut cmd = Command::new(&cli.codex_bin);
+fn command(binary: &OsStr, home: &Path, file_auth: bool) -> Result<Command> {
+    let mut cmd = crate::platform::codex_command(binary)?;
     cmd.env("CODEX_HOME", home);
     // Shell credentials must not silently outrank the explicitly selected account.
     for name in [
@@ -25,17 +25,7 @@ fn command(cli: &Cli, home: &Path, file_auth: bool) -> Command {
     if file_auth {
         cmd.args(["-c", "cli_auth_credentials_store=\"file\""]);
     }
-    cmd
-}
-
-fn keep_lease_across_exec(file: &File) -> Result<()> {
-    let fd = file.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("retain account lease during Codex execution");
-    }
-    Ok(())
+    Ok(cmd)
 }
 
 fn check_overrides(args: &[OsString], shared: bool) -> Result<()> {
@@ -74,7 +64,7 @@ pub fn run(
     args: &[OsString],
 ) -> Result<()> {
     let mut store = Store::open(cli)?;
-    let mut selected = store.selected(identifier)?;
+    let mut selected = store.selected_for_run(identifier)?;
     let home = selected
         .as_ref()
         .map(|a| a.home.clone())
@@ -106,7 +96,7 @@ pub fn run(
             }
         }
     }
-    let mut cmd = command(cli, &home, selected.is_some());
+    let mut cmd = command(&store.codex_bin(cli), &home, selected.is_some())?;
     if shared && home != store.data.main_home {
         let sqlite = sharing::sqlite_home(&store.data.main_home)?;
         let value = toml::Value::String(sqlite.to_string_lossy().into_owned()).to_string();
@@ -115,12 +105,13 @@ pub fn run(
     }
     cmd.args(args);
     if enabling {
+        #[cfg(windows)]
+        FileExt::unlock(&lease)?;
         FileExt::lock_shared(&lease)?;
     }
-    keep_lease_across_exec(&lease)?;
+    crate::platform::keep_lease_across_exec(&lease)?;
     drop(store);
-    // exec preserves the terminal, PID, signals and exact Codex exit status.
-    Err(cmd.exec()).context("could not execute Codex; install it or set XSWAP_CODEX_BIN")
+    crate::platform::execute(cmd, lease)
 }
 
 pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
@@ -131,7 +122,7 @@ pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
     if auth::identity(&account.home)?.is_some() {
         auth::verify(&account.home, &account.identity)?;
     }
-    let mut cmd = command(cli, &account.home, true);
+    let mut cmd = command(&store.codex_bin(cli), &account.home, true)?;
     cmd.arg("login");
     // Keep xswap add --json stdout machine-readable, including during native sign-in.
     cmd.stdout(std::io::stderr());
@@ -139,9 +130,12 @@ pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
         cmd.arg("--device-auth");
     }
     // Other accounts stay available while this browser/terminal login is in progress.
-    keep_lease_across_exec(&lease)?;
+    crate::platform::keep_lease_across_exec(&lease)?;
     drop(store);
+    #[cfg(unix)]
     let status = cmd.status().context("could not start Codex login")?;
+    #[cfg(windows)]
+    let status = crate::platform::status(&mut cmd)?;
     if !status.success() {
         bail!(
             "Codex login did not complete; retry xswap login {}",

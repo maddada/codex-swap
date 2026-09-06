@@ -1,10 +1,28 @@
 use anyhow::{Context, Result, bail};
-use std::{
-    fs,
-    io::ErrorKind,
-    os::unix::fs::{OpenOptionsExt, symlink},
-    path::Path,
-};
+use std::{fs, io::ErrorKind, path::Path};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, symlink};
+
+#[cfg(windows)]
+fn symlink(source: &Path, dest: &Path) -> Result<()> {
+    // Hardlinks detach after atomic replacement, which would split shared settings/history.
+    let result = if source.is_dir() {
+        std::os::windows::fs::symlink_dir(source, dest)
+    } else {
+        std::os::windows::fs::symlink_file(source, dest)
+    };
+    result.with_context(|| format!("create shared link {}: Windows sharing requires Developer Mode (Settings > System > For developers) or the Create symbolic links privilege", dest.display()))
+}
+
+fn append_file(path: &Path) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)?;
+    Ok(())
+}
 
 const CONFIG_ITEMS: &[&str] = &[
     "config.toml",
@@ -49,11 +67,7 @@ fn link(source: &Path, dest: &Path) -> Result<()> {
 
 pub fn config(main: &Path, home: &Path) -> Result<()> {
     // Establish these links before Codex can create independent defaults in a new home.
-    fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(main.join("config.toml"))?;
+    append_file(&main.join("config.toml"))?;
     for name in ["skills", "hooks", "rules", "agents"] {
         fs::create_dir_all(main.join(name))?;
     }
@@ -114,11 +128,7 @@ pub fn history(main: &Path, home: &Path) -> Result<()> {
     for name in HISTORY_FILES {
         let source = main.join(name);
         // Create without truncating: Codex may be appending to the shared index right now.
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&source)?;
+        append_file(&source)?;
         link(&source, &home.join(name))?;
     }
     Ok(())

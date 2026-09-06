@@ -1,6 +1,6 @@
 [package]
 name = "codex-swap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Account-specific Codex launches with shared conversation history"
@@ -23,6 +23,11 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects"] }
 
 [profile.release]
 lto = "thin"

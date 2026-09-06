@@ -8,7 +8,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-2025, windows-11-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +19,17 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo build --release --locked
       - run: target/release/xswap --version
+      - run: target/release/xswap --help
+      - name: Validate PowerShell installer syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts/install.ps1), [ref]$null, [ref]$parseErrors) | Out-Null
+          if ($parseErrors) { throw ($parseErrors | Out-String) }
       - uses: actions/upload-artifact@v4
         with:
           name: xswap-${{ runner.os }}-${{ runner.arch }}
-          path: target/release/xswap
+          path: |
+            target/release/xswap
+            target/release/xswap.exe

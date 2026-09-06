@@ -8,6 +8,7 @@ on:
     paths:
       - ".github/workflows/release.yml"
       - "scripts/homebrew.py"
+      - "scripts/install.ps1"
       - "Cargo.toml"
       - "Cargo.lock"
 
@@ -32,6 +33,10 @@ jobs:
             target: aarch64-unknown-linux-musl
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
@@ -50,6 +55,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build and check the executable
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -74,10 +80,35 @@ jobs:
           mkdir -p staging release
           cp "$binary" LICENSE README.md THIRD_PARTY_NOTICES.md staging/
           tar -czf "release/codex-swap-$version-$TARGET.tar.gz" -C staging xswap LICENSE README.md THIRD_PARTY_NOTICES.md
+      - name: Build and check native Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:RUSTFLAGS = "-C target-feature=+crt-static"
+          cargo build --release --locked --target $env:TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+          $version = python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])'
+          if ($env:GITHUB_REF.StartsWith('refs/tags/') -and $env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag must match Cargo.toml version' }
+          $binary = "target/$env:TARGET/release/xswap.exe"
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vsRoot = & $vswhere -latest -products '*' -property installationPath
+          $hostArch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
+          $dumpbin = Get-ChildItem "$vsRoot/VC/Tools/MSVC/*/bin/Host$hostArch/$hostArch/dumpbin.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dumpbin) { throw 'Cannot locate dumpbin to verify runtime dependencies' }
+          $imports = & $dumpbin.FullName /dependents $binary
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect Windows runtime dependencies' }
+          if ($imports -match '(?i)(vcruntime|msvcp|ucrtbase|api-ms-win-crt)') { throw 'Windows release must link the C runtime statically' }
+          $reported = & $binary --version
+          if ($LASTEXITCODE -ne 0 -or $reported -ne "xswap $version") { throw 'Version check failed' }
+          & $binary --help
+          if ($LASTEXITCODE -ne 0) { throw 'Help check failed' }
+          New-Item staging, release -ItemType Directory | Out-Null
+          Copy-Item $binary, LICENSE, README.md, THIRD_PARTY_NOTICES.md staging/
+          Compress-Archive -Path staging/* -DestinationPath "release/codex-swap-$version-$env:TARGET.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
-          path: release/*.tar.gz
+          path: release/*
           if-no-files-found: error
 
   assemble:
@@ -96,6 +127,7 @@ jobs:
       - name: Generate checksums and Homebrew formula
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          cp scripts/install.ps1 release/install.ps1
           python3 scripts/homebrew.py "$version" release release/codex-swap.rb
           ruby -c release/codex-swap.rb
           (cd release && sha256sum --check SHA256SUMS)

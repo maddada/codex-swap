@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Render the binary-only Homebrew formula from all four release archives."""
+"""Render the binary-only Homebrew formula and checksums from all six release archives."""
 
 import argparse
 import hashlib
 from pathlib import Path
 import re
 import tarfile
+import zipfile
 
 
 TARGETS = {
@@ -63,6 +64,22 @@ def main():
             ])
         lines.pop()
         lines.extend(["  end", ""])
+    for target in ("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"):
+        name = f"codex-swap-{args.version}-{target}.zip"
+        archive = args.archives / name
+        with zipfile.ZipFile(archive) as contents:
+            members = contents.infolist()
+            if {m.filename for m in members} != {
+                "xswap.exe", "LICENSE", "README.md", "THIRD_PARTY_NOTICES.md"
+            } or len(members) != 4 or any(m.is_dir() for m in members):
+                raise ValueError(f"Unexpected Windows archive contents: {archive}")
+            if contents.getinfo("xswap.exe").file_size == 0:
+                raise ValueError(f"Missing executable xswap.exe: {archive}")
+        checksums.append(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {name}\n")
+    installer = args.archives / "install.ps1"
+    if not installer.is_file() or installer.stat().st_size == 0:
+        raise ValueError("Missing Windows installer: install.ps1")
+    checksums.append(f"{hashlib.sha256(installer.read_bytes()).hexdigest()}  install.ps1\n")
     lines.extend([
         "  def install",
         '    bin.install "xswap"',

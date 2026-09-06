@@ -3,6 +3,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
+    ffi::OsString,
     fs::File,
     path::{Path, PathBuf},
 };
@@ -16,6 +18,14 @@ pub struct Account {
     pub managed: bool,
     pub share_history: bool,
     pub identity: Option<Identity>,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Preferences {
+    pub codex_bin: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -26,6 +36,14 @@ pub struct Registry {
     pub next_number: u32,
     pub default: Option<u32>,
     pub accounts: Vec<Account>,
+    #[serde(default)]
+    pub directory_mappings: BTreeMap<PathBuf, u32>,
+    #[serde(default)]
+    pub preferences: Preferences,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 pub struct Store {
@@ -37,16 +55,11 @@ pub struct Store {
 
 impl Store {
     pub fn open(cli: &Cli) -> Result<Self> {
-        let user_home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .context("HOME is not set")?;
-        let root = cli.data_dir.clone().unwrap_or_else(|| {
-            std::env::var_os("XDG_DATA_HOME")
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .unwrap_or_else(|| user_home.join(".local/share"))
-                .join("codex-swap")
-        });
+        let user_home = fsutil::user_home()?;
+        let root = match &cli.data_dir {
+            Some(root) => root.clone(),
+            None => fsutil::default_data_dir(&user_home)?,
+        };
         // Validate before canonicalizing so a planted store-root symlink is refused.
         fsutil::private_dir(&root)?;
         let root = root.canonicalize()?;
@@ -78,6 +91,8 @@ impl Store {
                 next_number: 1,
                 default: None,
                 accounts: vec![],
+                directory_mappings: BTreeMap::new(),
+                preferences: Preferences::default(),
             }
         };
         if !data.main_home.is_absolute() || data.next_number == 0 {
@@ -91,6 +106,19 @@ impl Store {
         }
         if data.default.is_some_and(|n| !seen.contains(&n)) {
             bail!("default account is missing from registry");
+        }
+        for (directory, number) in &data.directory_mappings {
+            if !directory.is_absolute() || !seen.contains(number) {
+                bail!("invalid directory mapping in xswap registry");
+            }
+        }
+        if data
+            .preferences
+            .codex_bin
+            .as_ref()
+            .is_some_and(|bin| bin.trim().is_empty() || bin.contains('\0'))
+        {
+            bail!("invalid configured Codex executable");
         }
         Ok(Self {
             root,
@@ -130,11 +158,52 @@ impl Store {
         match identifier {
             Some("default") => Ok(self.main_account()),
             Some(s) => self.resolve(s).map(Some),
-            None => match self.data.default {
-                Some(n) => self.resolve(&n.to_string()).map(Some),
-                None => Ok(self.main_account()),
-            },
+            None => {
+                let account = match self.data.default {
+                    Some(n) => Some(self.resolve(&n.to_string())?),
+                    None => self.main_account(),
+                };
+                if let Some(account) = &account {
+                    Self::require_enabled(account)?;
+                }
+                Ok(account)
+            }
         }
+    }
+
+    /// CDXC:AgentProviders 2026-09-06 DECISION:
+    /// The user requested directory-to-account mappings inherited by subfolders.
+    /// Explicit launches win; otherwise the nearest canonical ancestor mapping wins before the saved global default.
+    pub fn selected_for_run(&self, identifier: Option<&str>) -> Result<Option<Account>> {
+        if identifier.is_some() {
+            return self.selected(identifier);
+        }
+        let current = std::env::current_dir()?.canonicalize()?;
+        for ancestor in current.ancestors() {
+            if let Some(number) = self.data.directory_mappings.get(ancestor) {
+                let account = self.resolve(&number.to_string())?;
+                Self::require_enabled(&account)?;
+                return Ok(Some(account));
+            }
+        }
+        self.selected(None)
+    }
+
+    pub fn codex_bin(&self, cli: &Cli) -> OsString {
+        cli.codex_bin
+            .clone()
+            .or_else(|| self.data.preferences.codex_bin.as_ref().map(OsString::from))
+            .unwrap_or_else(|| OsString::from("codex"))
+    }
+
+    pub fn require_enabled(account: &Account) -> Result<()> {
+        if !account.enabled {
+            bail!(
+                "account {} is disabled; enable it or select an account explicitly",
+                account.number
+            );
+        }
+        Ok(())
     }
 
     pub fn main_account(&self) -> Option<Account> {

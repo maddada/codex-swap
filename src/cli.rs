@@ -1,8 +1,9 @@
 use clap::{Args, Parser, Subcommand};
 use std::{ffi::OsString, path::PathBuf};
 
-/// CDXC:AgentProviders 2026-09-05 DECISION:
-/// The executable is xswap; implement the user's cswap account-launch and shared-history workflow, with usage polling and auto-swap policy owned by gxserver.
+/// CDXC:AgentProviders 2026-09-06 DECISION:
+/// The user requested standalone usage reporting, account backups, account management and native Windows support alongside the cswap account-launch workflow.
+/// This supersedes the usage-polling exclusion; automatic switching policy remains owned by gxserver.
 #[derive(Parser)]
 #[command(
     name = "xswap",
@@ -17,8 +18,8 @@ pub struct Cli {
     #[arg(long, env = "XSWAP_CODEX_HOME", global = true)]
     pub codex_home: Option<PathBuf>,
     /// Official Codex executable, resolved on PATH by default.
-    #[arg(long, env = "XSWAP_CODEX_BIN", default_value = "codex", global = true)]
-    pub codex_bin: OsString,
+    #[arg(long, env = "XSWAP_CODEX_BIN", global = true)]
+    pub codex_bin: Option<OsString>,
     #[command(subcommand)]
     pub command: Action,
 }
@@ -29,7 +30,100 @@ pub enum Action {
     Add(Add),
     /// List accounts, identities, login state and launch directories (no quota requests).
     List(Output),
-    /// Show the account selected for future xswap run launches.
+    /// Fetch Codex quota percentages, reset windows and pacing.
+    Usage {
+        account: Option<String>,
+        #[arg(long, conflicts_with = "account")]
+        all: bool,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// Set or clear an account alias.
+    #[command(visible_alias = "alias")]
+    Rename {
+        account: String,
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        alias: Option<String>,
+        #[arg(long)]
+        clear: bool,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// Move to a slot; swap accounts if that slot is occupied.
+    Move {
+        account: String,
+        slot: u32,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// Swap two accounts' slot numbers, keeping defaults attached to each account.
+    Swap {
+        account: String,
+        other: String,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// Allow an account to be selected implicitly.
+    Enable {
+        account: String,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// Disable implicit selection; explicit launches remain available.
+    Disable {
+        account: String,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// Export portable account credentials as a new plaintext JSON backup file.
+    Export {
+        file: PathBuf,
+        #[arg(long)]
+        account: Option<String>,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// Import a portable backup into new managed account homes.
+    Import {
+        file: PathBuf,
+        /// Reassign occupied slots; aliases and account identities must remain unique.
+        #[arg(long)]
+        remap_slots: bool,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// Map a directory (and its subfolders) to an account, or list mappings.
+    Map {
+        account: Option<String>,
+        #[arg(requires = "account")]
+        directory: Option<PathBuf>,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// Remove the mapping on this exact directory (defaults to the current directory).
+    Unmap {
+        directory: Option<PathBuf>,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// Read or change xswap preferences.
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// Upgrade through Homebrew, or the official Windows binary installer.
+    Upgrade,
+    /// Delete xswap credentials and managed homes, retaining original/adopted homes.
+    Purge {
+        /// Skip the interactive destructive-action confirmation.
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// Show the saved global default account.
     Status(Output),
     /// Select the default for future xswap launches; existing sessions keep their account.
     Switch {
@@ -61,6 +155,20 @@ pub enum Action {
     },
 }
 
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Show saved preferences and their defaults.
+    List,
+    /// Print the registry file containing these preferences.
+    Path,
+    /// Read codex-bin or default-account.
+    Get { key: String },
+    /// Set codex-bin or default-account (slot, alias, email or default).
+    Set { key: String, value: String },
+    /// Restore a preference to its default.
+    Unset { key: String },
+}
+
 #[derive(Args)]
 pub struct Add {
     #[arg(long)]
@@ -84,7 +192,7 @@ pub struct Add {
 
 #[derive(Args)]
 pub struct Output {
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub json: bool,
 }
 
