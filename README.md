@@ -6,7 +6,44 @@ Each account has one permanent `CODEX_HOME`. Codex owns login and token refresh 
 
 ## Install
 
-Requires Rust 1.85 or newer and the official Codex CLI on PATH. Supports macOS, Linux and WSL. Native Windows is not supported in this version.
+Supports macOS 11 or newer, Linux and WSL on Apple Silicon/ARM64 and Intel/AMD x86-64. Native Windows is not supported in this version. Install the official Codex CLI separately and make sure `codex` is on PATH.
+
+### Homebrew (recommended)
+
+Add the tap and [trust the Codex Swap formula](https://docs.brew.sh/Tap-Trust), then install:
+
+```sh
+brew tap maddada/tap
+brew trust --formula maddada/tap/codex-swap
+brew install maddada/tap/codex-swap
+xswap --version
+```
+
+Homebrew installs a prebuilt `xswap` executable. Rust and Cargo are not required. Linux releases are statically linked with musl, so they do not depend on a particular glibc version.
+
+To update:
+
+```sh
+brew update
+brew upgrade maddada/tap/codex-swap
+```
+
+### Download a binary
+
+Download the archive for your computer and `SHA256SUMS` from [GitHub Releases](https://github.com/maddada/codex-swap/releases/latest):
+
+| Computer | Archive target |
+| --- | --- |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| macOS Intel | `x86_64-apple-darwin` |
+| Linux / WSL ARM64 | `aarch64-unknown-linux-musl` |
+| Linux / WSL x86-64 | `x86_64-unknown-linux-musl` |
+
+Verify the downloaded archive against its entry in `SHA256SUMS` using `shasum -a 256` on macOS or `sha256sum` on Linux. Extract the archive and install `xswap` into a directory on PATH, such as `~/.local/bin`. No compiler is needed.
+
+### Build from source
+
+Developers building from source need Rust 1.85 or newer:
 
 ```sh
 cargo install --git https://github.com/maddada/codex-swap --locked
