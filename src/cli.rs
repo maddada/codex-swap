@@ -113,7 +113,8 @@ pub enum Action {
         #[command(flatten)]
         output: Output,
     },
-    /// Upgrade through Homebrew, or the official Windows binary installer.
+    /// Upgrade through Cargo, Homebrew, or the official Windows binary installer.
+    #[command(visible_alias = "update")]
     Upgrade,
     /// Delete xswap credentials and managed homes, retaining original/adopted homes.
     Purge {
@@ -196,7 +197,7 @@ pub struct Output {
     pub json: bool,
 }
 
-/// Accept the exact status/switch spellings used by the user's cs shell wrapper.
+/// Accept cswap-compatible legacy flag spellings before Codex's argument separator.
 pub fn arguments() -> Vec<OsString> {
     let mut args: Vec<_> = std::env::args_os().collect();
     for arg in args.iter_mut().skip(1) {
@@ -207,6 +208,8 @@ pub fn arguments() -> Vec<OsString> {
             *arg = "status".into();
         } else if arg == "--switch-to" {
             *arg = "switch".into();
+        } else if arg == "--upgrade" {
+            *arg = "upgrade".into();
         }
     }
     args

@@ -24,7 +24,7 @@ To update:
 xswap upgrade
 ```
 
-On macOS and Linux this runs `brew upgrade maddada/tap/codex-swap`. Homebrew must own the installation for this command to upgrade it.
+For Homebrew installations on macOS and Linux this runs `brew upgrade maddada/tap/codex-swap`. `xswap update` and `xswap --upgrade` are also accepted, matching cswap.
 
 ### Windows (PowerShell)
 
@@ -42,7 +42,7 @@ For an explicit version or installation directory, download the script and run i
 
 ```powershell
 Invoke-WebRequest https://github.com/maddada/codex-swap/releases/latest/download/install.ps1 -OutFile install.ps1
-.\install.ps1 -Version v0.3.0 -InstallDir "$env:LOCALAPPDATA\Programs\codex-swap"
+.\install.ps1 -Version v0.3.1 -InstallDir "$env:LOCALAPPDATA\Programs\codex-swap"
 ```
 
 Use `-NoPathUpdate` to manage PATH yourself. The installer also upgrades existing installations; a running old executable is retired and cleaned up by a later installer run after it exits.
@@ -78,6 +78,8 @@ cargo install --path . --locked
 ```
 
 Cargo installs the `xswap` executable into `~/.cargo/bin`. To use `~/.local/bin` instead, add `--root ~/.local` to the install command.
+
+On macOS and Linux, `xswap upgrade` detects Cargo installations and runs `cargo install --git https://github.com/maddada/codex-swap --locked --force --root <original-root>`, including for installations originally built with `--path`. Detection follows executable symlinks and preserves custom install roots. Homebrew installations use Homebrew without requiring Cargo. An unrecognized Unix installation prints manual upgrade instructions and exits with status 1; a missing package manager also exits with status 1. Package-manager output and exit status are preserved, and upgrading does not initialize accounts or launch Codex.
 
 ## Set up accounts
 

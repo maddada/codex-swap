@@ -11,6 +11,7 @@ mod platform;
 mod preferences;
 mod sharing;
 mod store;
+mod upgrade;
 mod usage;
 mod usage_client;
 mod usage_model;
@@ -62,7 +63,7 @@ fn execute(cli: &Cli) -> anyhow::Result<()> {
         } => mappings::map(cli, account.as_deref(), directory.as_deref(), output),
         Action::Unmap { directory, output } => mappings::unmap(cli, directory.as_deref(), output),
         Action::Config { action, output } => preferences::configure(cli, action.as_ref(), output),
-        Action::Upgrade => maintenance::upgrade(),
+        Action::Upgrade => upgrade::run(),
         Action::Purge { yes, output } => maintenance::purge(cli, *yes, output),
         Action::Status(output) => commands::status(cli, output),
         Action::Switch { account, output } => commands::switch(cli, account.as_deref(), output),

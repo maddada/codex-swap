@@ -10,47 +10,7 @@ use std::{
     fs,
     io::{IsTerminal, Write},
     path::Path,
-    process::Command,
 };
-
-/// CDXC:AgentProviders 2026-09-06 DECISION:
-/// The user requested built-in upgrade using Homebrew and a native Windows installer, without requiring Cargo.
-pub fn upgrade() -> Result<()> {
-    #[cfg(unix)]
-    let status = Command::new("brew")
-        .args(["upgrade", "maddada/tap/codex-swap"])
-        .status()
-        .context("could not start Homebrew; install Homebrew and the maddada/tap/codex-swap formula first")?;
-    #[cfg(windows)]
-    let status = {
-        let scratch = fsutil::private_tempdir(&std::env::temp_dir(), "xswap-upgrade-")?;
-        let script = scratch.path().join("install.ps1");
-        fs::write(&script, include_str!("../scripts/install.ps1"))?;
-        crate::platform::own_new(&script)?;
-        crate::platform::private_permissions(&script, false)?;
-        let executable = std::env::current_exe().context("resolve current xswap executable")?;
-        let install_dir = executable
-            .parent()
-            .context("xswap executable has no parent directory")?;
-        Command::new("powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-            ])
-            .arg(script)
-            .arg("-InstallDir")
-            .arg(install_dir)
-            .status()
-            .context("could not start the Windows xswap installer")?
-    };
-    if !status.success() {
-        bail!("upgrade failed ({status})");
-    }
-    Ok(())
-}
 
 fn real_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
