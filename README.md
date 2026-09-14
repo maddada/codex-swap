@@ -111,7 +111,9 @@ xswap add --login --alias secondary --share-history
 xswap add --login --alias another --share-history --device-auth
 ```
 
-Use the intended account in your browser. If sign-in is interrupted, resume the prepared slot instead of adding another one:
+Enter the new account’s email when prompted, or pass `--email user@example.com`, then choose that account in the browser. xswap verifies the returned email and rejects accounts already registered. The slot is saved only after login succeeds; cancellation or a mismatched email leaves saved accounts unchanged.
+
+To reconnect an existing account:
 
 ```sh
 xswap login 2

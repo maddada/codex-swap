@@ -205,6 +205,53 @@ pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
     Ok(())
 }
 
+/// CDXC:AgentProviders 2026-09-07 DECISION:
+/// New Codex logins must verify the requested email before being saved, just like Claude.
+pub fn login_new_profile(
+    binary: &OsStr,
+    home: &Path,
+    device_auth: bool,
+    email: Option<&str>,
+) -> Result<(serde_json::Value, auth::Identity)> {
+    let email = match email {
+        Some(email) => email.trim().to_string(),
+        None => {
+            eprint!("Email for the Codex account you want to connect: ");
+            std::io::stderr().flush()?;
+            let mut email = String::new();
+            std::io::stdin().read_line(&mut email)?;
+            email.trim().to_string()
+        }
+    };
+    if !email.contains('@') || email.chars().any(char::is_whitespace) {
+        bail!("enter the email address of the Codex account you want to connect");
+    }
+    eprintln!("Choose the requested account in the browser before authorizing.");
+    let mut cmd = command(binary, home, true)?;
+    let sqlite = toml::Value::String(home.to_string_lossy().into_owned()).to_string();
+    cmd.args(["-c", &format!("sqlite_home={sqlite}"), "login"]);
+    cmd.stdout(std::io::stderr());
+    if device_auth {
+        cmd.arg("--device-auth");
+    }
+    #[cfg(unix)]
+    let status = cmd.status().context("could not start Codex login")?;
+    #[cfg(windows)]
+    let status = crate::platform::status(&mut cmd)?;
+    if !status.success() {
+        bail!("Codex login did not complete; no account was added");
+    }
+    let (document, identity) = auth::credentials(home)?;
+    if !identity
+        .email
+        .as_deref()
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(&email))
+    {
+        bail!("the browser signed in to a different email; no account was added");
+    }
+    Ok((document, identity))
+}
+
 pub fn validate_file_store(home: &Path) -> Result<()> {
     let path = home.join("config.toml");
     if !path.exists() {

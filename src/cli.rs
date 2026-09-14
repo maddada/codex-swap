@@ -183,6 +183,9 @@ pub struct Add {
     /// Create a permanent account home and open Codex's sign-in flow.
     #[arg(long)]
     pub login: bool,
+    /// Email expected from the browser login; prompted when omitted.
+    #[arg(long, requires = "login")]
+    pub email: Option<String>,
     #[arg(long, requires = "login")]
     pub device_auth: bool,
     #[arg(long)]

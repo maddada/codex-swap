@@ -184,8 +184,33 @@ pub fn add(cli: &Cli, args: &Add) -> Result<()> {
         return account_result(&store, &account, &args.output);
     }
 
-    let mut store = Store::open(cli)?;
+    let store = Store::open(cli)?;
     store.validate_alias(&args.alias)?;
+    if args.slot.is_some_and(|number| {
+        number == 0 || number == u32::MAX || store.data.accounts.iter().any(|a| a.number == number)
+    }) {
+        bail!("slot must be a positive, unused number below {}", u32::MAX);
+    }
+    let main_home = store.data.main_home.clone();
+    let binary = store.codex_bin(cli);
+    let staging = fsutil::private_tempdir(&store.root, "new-login-")?;
+    let config = main_home.join("config.toml");
+    if config.exists() {
+        std::fs::copy(config, staging.path().join("config.toml"))?;
+    }
+    drop(store);
+    let (credentials, identity) = launch::login_new_profile(
+        &binary,
+        staging.path(),
+        args.device_auth,
+        args.email.as_deref(),
+    )?;
+    let mut store = Store::open(cli)?;
+    if store.data.main_home != main_home {
+        bail!("the main Codex home changed during login; no account was added");
+    }
+    store.validate_alias(&args.alias)?;
+    store.ensure_unique_identity(&identity, 0)?;
     let number = args.slot.unwrap_or(store.data.next_number);
     if number == 0 || store.data.accounts.iter().any(|a| a.number == number) {
         bail!("slot must be a positive, unused number");
@@ -199,34 +224,22 @@ pub fn add(cli: &Cli, args: &Add) -> Result<()> {
     if args.share_history {
         sharing::history(&store.data.main_home, dir.path())?;
     }
-    let (home, managed, identity) = (dir.keep(), true, None);
+    fsutil::atomic_json(&dir.path().join("auth.json"), &credentials)?;
     let account = Account {
         number,
         alias: args.alias.clone(),
-        share_history: args.share_history || home == store.data.main_home,
-        home,
-        managed,
-        identity,
+        share_history: args.share_history,
+        home: dir.path().to_path_buf(),
+        managed: true,
+        identity: Some(identity),
         enabled: true,
     };
     store.data.next_number = store.data.next_number.max(next);
     store.data.accounts.push(account.clone());
     store.save()?;
-    drop(store);
-    if args.login {
-        eprintln!(
-            "Created account slot {number}. If sign-in is interrupted, retry xswap login {number}."
-        );
-        launch::login(cli, &number.to_string(), args.device_auth)?;
-    }
-    let store = Store::open(cli)?;
-    let saved = store.resolve(&number.to_string())?;
-    if args.output.json {
-        emit(&json!({"schemaVersion": 1, "account": view(&store, &saved)?}))?;
-    } else {
-        human(&view(&store, &saved)?);
-    }
-    Ok(())
+    let _ = dir.keep();
+    eprintln!("Account login saved.");
+    account_result(&store, &account, &args.output)
 }
 
 /// CDXC:AgentProviders 2026-09-06 DECISION:
