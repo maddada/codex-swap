@@ -2,53 +2,117 @@
 use super::fsutil;
 use anyhow::{Context, Result};
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
 };
 
-pub(super) fn cwd(args: &[OsString], current: &Path) -> PathBuf {
+pub(super) struct Invocation<'a> {
+    pub cwd: PathBuf,
+    pub profile: Option<&'a str>,
+    pub overrides: toml::Value,
+    pub loads_user_config: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ValueOption {
+    Config,
+    Profile,
+    Cwd,
+    Image,
+    Other,
+}
+
+// Advertised root value options in SharedCliOptions, TuiCli,
+// CliConfigOverrides, FeatureToggles and InteractiveRemoteOptions.
+const VALUE_OPTIONS: &[(&str, &str, ValueOption)] = &[
+    ("--config", "-c", ValueOption::Config),
+    ("--profile", "-p", ValueOption::Profile),
+    ("--cd", "-C", ValueOption::Cwd),
+    ("--image", "-i", ValueOption::Image),
+    ("--model", "-m", ValueOption::Other),
+    ("--sandbox", "-s", ValueOption::Other),
+    ("--ask-for-approval", "-a", ValueOption::Other),
+    ("--local-provider", "", ValueOption::Other),
+    ("--add-dir", "", ValueOption::Other),
+    ("--remote", "", ValueOption::Other),
+    ("--remote-auth-token-env", "", ValueOption::Other),
+    ("--enable", "", ValueOption::Other),
+    ("--disable", "", ValueOption::Other),
+];
+
+fn value_option(arg: &str) -> Option<(ValueOption, Option<&str>)> {
+    for &(long, short, kind) in VALUE_OPTIONS {
+        if arg == long || (!short.is_empty() && arg == short) {
+            return Some((kind, None));
+        }
+        if let Some(value) = arg
+            .strip_prefix(long)
+            .and_then(|value| value.strip_prefix('='))
+        {
+            return Some((kind, Some(value)));
+        }
+        if !short.is_empty() {
+            if let Some(value) = arg.strip_prefix(short).filter(|value| !value.is_empty()) {
+                return Some((kind, Some(value.strip_prefix('=').unwrap_or(value))));
+            }
+        }
+    }
+    None
+}
+
+pub(super) fn invocation<'a>(args: &'a [OsString], current: &Path) -> Invocation<'a> {
     let mut directory = None;
     let mut command = None;
     let mut debug_command = None;
+    let mut profile = None;
+    let mut overrides = toml::Value::Table(Default::default());
+    let mut display = false;
+    let mut ignore_user_config = false;
     let mut index = 0;
     while index < args.len() {
         if args[index] == "--" {
             break;
         }
         let arg = args[index].to_str().unwrap_or("");
-        if arg == "--cd" || arg == "-C" {
-            index += 1;
-            directory = args.get(index).map(PathBuf::from);
-        } else if let Some(path) = arg.strip_prefix("--cd=").or_else(|| arg.strip_prefix("-C")) {
-            directory = Some(PathBuf::from(path.strip_prefix('=').unwrap_or(path)));
-        } else if [
-            "-c",
-            "--config",
-            "-p",
-            "--profile",
-            "-m",
-            "--model",
-            "-s",
-            "--sandbox",
-            "-a",
-            "--ask-for-approval",
-            "--local-provider",
-            "--remote",
-            "--remote-auth-token-env",
-            "--enable",
-            "--disable",
-        ]
-        .contains(&arg)
-        {
-            index += 1;
-        } else if arg == "-i" || arg == "--image" {
-            while args
-                .get(index + 1)
-                .and_then(|arg| arg.to_str())
-                .is_some_and(|arg| !arg.starts_with('-'))
-            {
+        // Short display flags take no value and also terminate short clusters.
+        if matches!(arg, "--help" | "--version") || arg.starts_with("-h") || arg.starts_with("-V") {
+            display = true;
+        } else if arg == "--ignore-user-config" {
+            ignore_user_config = true;
+        } else if let Some((kind, attached)) = value_option(arg) {
+            let value = attached.map(OsStr::new).or_else(|| {
+                let value = args.get(index + 1)?;
+                if value.as_encoded_bytes().starts_with(b"-") {
+                    return None;
+                }
                 index += 1;
+                Some(value.as_os_str())
+            });
+            match kind {
+                ValueOption::Cwd => directory = value.map(PathBuf::from),
+                ValueOption::Profile => {
+                    profile = value.and_then(OsStr::to_str).filter(|name| {
+                        !name.is_empty()
+                            && name.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+                            })
+                    });
+                }
+                ValueOption::Config => {
+                    if let Some(raw) = value.and_then(OsStr::to_str) {
+                        add_override(&mut overrides, raw);
+                    }
+                }
+                ValueOption::Image => {
+                    while args
+                        .get(index + 1)
+                        .is_some_and(|arg| !arg.as_encoded_bytes().starts_with(b"-"))
+                    {
+                        index += 1;
+                    }
+                }
+                ValueOption::Other => {}
             }
         } else if !arg.is_empty() && !arg.starts_with('-') {
             if command.is_none() {
@@ -76,12 +140,23 @@ pub(super) fn cwd(args: &[OsString], current: &Path) -> PathBuf {
                 | "help"
         )
     ) || (command == Some("debug") && debug_command != Some("prompt-input"));
-    if ignored {
+    let cwd = if ignored {
         current.to_owned()
     } else {
         directory
             .map(|path| current.join(path))
             .unwrap_or_else(|| current.to_owned())
+    };
+    // exec's LoaderOverrides skips both base and named user config. Help and
+    // version are handled by clap before config loading. Tokens after -- are literal.
+    let loads_user_config = !display
+        && command != Some("help")
+        && !(matches!(command, Some("exec" | "e" | "x")) && ignore_user_config);
+    Invocation {
+        cwd,
+        profile,
+        overrides,
+        loads_user_config,
     }
 }
 
@@ -100,56 +175,34 @@ pub(super) fn merge(base: &mut toml::Value, overlay: toml::Value) {
     }
 }
 
-pub(super) fn cli_overrides(args: &[OsString]) -> toml::Value {
-    let mut root = toml::Value::Table(Default::default());
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == "--" {
+fn add_override(root: &mut toml::Value, raw: &str) {
+    let Some((key, raw)) = raw.split_once('=') else {
+        return;
+    };
+    let key = key.trim();
+    if key.is_empty() {
+        return;
+    }
+    // Match utils/cli/config_override.rs: scalar TOML, then trimmed raw string.
+    let value = toml::from_str::<toml::Table>(&format!("_x_ = {}", raw.trim()))
+        .ok()
+        .and_then(|mut table| table.remove("_x_"))
+        .unwrap_or_else(|| toml::Value::String(raw.trim().trim_matches(['\'', '"']).to_owned()));
+    let mut current = root;
+    let mut segments = key.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        if !current.is_table() {
+            *current = toml::Value::Table(Default::default());
+        }
+        let table = current.as_table_mut().expect("override table");
+        if segments.peek().is_none() {
+            table.insert(segment.to_owned(), value.clone());
             break;
         }
-        let arg = arg.to_str().unwrap_or("");
-        let raw = if arg == "-c" || arg == "--config" {
-            index += 1;
-            args.get(index).and_then(|value| value.to_str())
-        } else {
-            arg.strip_prefix("--config=").or_else(|| {
-                arg.strip_prefix("-c")
-                    .map(|value| value.strip_prefix('=').unwrap_or(value))
-            })
-        };
-        index += 1;
-        let Some((key, raw)) = raw.and_then(|raw| raw.split_once('=')) else {
-            continue;
-        };
-        let key = key.trim();
-        if key.is_empty() {
-            continue;
-        }
-        // Match utils/cli/config_override.rs: scalar TOML, then trimmed raw string.
-        let value = toml::from_str::<toml::Table>(&format!("_x_ = {}", raw.trim()))
-            .ok()
-            .and_then(|mut table| table.remove("_x_"))
-            .unwrap_or_else(|| {
-                toml::Value::String(raw.trim().trim_matches(['\'', '"']).to_owned())
-            });
-        let mut current = &mut root;
-        let mut segments = key.split('.').peekable();
-        while let Some(segment) = segments.next() {
-            if !current.is_table() {
-                *current = toml::Value::Table(Default::default());
-            }
-            let table = current.as_table_mut().expect("override table");
-            if segments.peek().is_none() {
-                table.insert(segment.to_owned(), value.clone());
-                break;
-            }
-            current = table
-                .entry(segment.to_owned())
-                .or_insert_with(|| toml::Value::Table(Default::default()));
-        }
+        current = table
+            .entry(segment.to_owned())
+            .or_insert_with(|| toml::Value::Table(Default::default()));
     }
-    root
 }
 
 fn trust(config: &toml::Value, directory: &Path) -> Option<bool> {

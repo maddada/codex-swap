@@ -1,5 +1,7 @@
 use super::*;
 
+mod unicode;
+
 struct Fixture {
     root: tempfile::TempDir,
     main: PathBuf,
@@ -153,11 +155,14 @@ fn profile_selection_respects_separator_and_supported_flag_forms() {
         vec!["--profile", "first", "exec", "--profile", "work"],
     ] {
         let args: Vec<_> = args.into_iter().map(OsString::from).collect();
-        assert_eq!(selected_profile(&args), Some("work"));
+        assert_eq!(
+            layers::invocation(&args, Path::new(".")).profile,
+            Some("work")
+        );
     }
     for args in [vec!["--", "--profile", "work"], vec!["--profile=../escape"]] {
         let args: Vec<_> = args.into_iter().map(OsString::from).collect();
-        assert_eq!(selected_profile(&args), None);
+        assert_eq!(layers::invocation(&args, Path::new(".")).profile, None);
     }
 }
 
@@ -170,8 +175,26 @@ fn project_discovery_uses_the_cwd_forwarded_to_the_native_command() {
         vec!["-Cproject", "exec", "synthetic prompt"],
         vec!["--cd=project", "resume"],
         vec!["-C", "project", "debug", "prompt-input"],
+        vec![
+            "--add-dir",
+            "features",
+            "-C",
+            "project",
+            "debug",
+            "prompt-input",
+        ],
+        vec![
+            "--add-dir=features",
+            "-C",
+            "project",
+            "debug",
+            "prompt-input",
+        ],
     ] {
-        assert_eq!(layers::cwd(&flags(&args), current), current.join("project"));
+        assert_eq!(
+            layers::invocation(&flags(&args), current).cwd,
+            current.join("project")
+        );
     }
     for args in [
         vec!["--cd", "project", "mcp", "list"],
@@ -179,8 +202,102 @@ fn project_discovery_uses_the_cwd_forwarded_to_the_native_command() {
         vec!["-C", "project", "debug", "config"],
         vec!["--", "-C", "project"],
     ] {
-        assert_eq!(layers::cwd(&flags(&args), current), current);
+        assert_eq!(layers::invocation(&flags(&args), current).cwd, current);
     }
+}
+
+#[test]
+fn invocation_policy_and_value_options_preserve_literal_boundaries() {
+    let current = Path::new("/synthetic/current");
+    let flags = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+    for args in [
+        vec!["--help"],
+        vec!["-h"],
+        vec!["-hV"],
+        vec!["--version"],
+        vec!["-V"],
+        vec!["-Vh"],
+        vec!["help", "exec"],
+        vec!["exec", "--help"],
+        vec!["exec", "--ignore-user-config"],
+        vec!["e", "--ignore-user-config"],
+        vec!["x", "--ignore-user-config"],
+        vec!["--add-dir", "features", "exec", "--ignore-user-config"],
+    ] {
+        assert!(
+            !layers::invocation(&flags(&args), current).loads_user_config,
+            "{args:?}"
+        );
+    }
+    for args in [
+        vec!["exec"],
+        vec!["exec", "--", "--help"],
+        vec!["exec", "--", "--ignore-user-config"],
+        vec!["mcp", "--ignore-user-config"],
+        vec!["--add-dir", "exec", "--ignore-user-config"],
+        vec!["--model=exec", "--ignore-user-config"],
+        vec!["--image=--help", "-C", "project"],
+    ] {
+        assert!(
+            layers::invocation(&flags(&args), current).loads_user_config,
+            "{args:?}"
+        );
+    }
+    for option in [
+        "--model",
+        "--sandbox",
+        "--ask-for-approval",
+        "--local-provider",
+        "--add-dir",
+        "--remote",
+        "--remote-auth-token-env",
+        "--enable",
+        "--disable",
+    ] {
+        let args = flags(&[option, "features", "-Cproject", "debug", "prompt-input"]);
+        assert_eq!(
+            layers::invocation(&args, current).cwd,
+            current.join("project"),
+            "{option}"
+        );
+    }
+    let args = flags(&[
+        "--add-dir=-pwork",
+        "--add-dir=--config=model_instructions_file=ignored.md",
+        "--",
+        "--profile",
+        "work",
+        "-Cproject",
+        "-c",
+        "model_instructions_file=ignored.md",
+        "--help",
+    ]);
+    let invocation = layers::invocation(&args, current);
+    assert!(invocation.loads_user_config);
+    assert_eq!(invocation.cwd, current);
+    assert_eq!(invocation.profile, None);
+    assert!(invocation.overrides.as_table().unwrap().is_empty());
+}
+
+#[test]
+fn ignored_user_config_is_not_read_or_projected() {
+    let fixture = Fixture::new();
+    fixture.write("config.toml", "invalid [ TOML");
+    fixture.write("work.config.toml", "invalid [ TOML");
+    for args in [
+        vec!["exec", "--ignore-user-config", "--profile", "work"],
+        vec!["--help"],
+        vec!["--version"],
+    ] {
+        let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
+        share_at(&fixture.main, &fixture.home, &args, fixture.root.path()).unwrap();
+    }
+    assert!(share_at(&fixture.main, &fixture.home, &[], fixture.root.path()).is_err());
+    assert_eq!(
+        fs::read_to_string(fixture.main.join("config.toml")).unwrap(),
+        "invalid [ TOML"
+    );
+    assert!(fs::read_dir(&fixture.home).unwrap().next().is_none());
 }
 
 #[test]

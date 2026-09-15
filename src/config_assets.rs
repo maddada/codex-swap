@@ -62,6 +62,16 @@ fn path_prefix(path: &Path, prefix: &Path, insensitive: bool) -> bool {
     })
 }
 
+fn uncertain_unicode_alias(path: &Path, home: &Path, roots: &[PathBuf], insensitive: bool) -> bool {
+    let non_ascii = |path: &Path| {
+        path.strip_prefix(home)
+            .unwrap_or(path)
+            .components()
+            .any(|part| !part.as_os_str().as_encoded_bytes().is_ascii())
+    };
+    insensitive && (non_ascii(path) || roots.iter().any(|root| non_ascii(root)))
+}
+
 fn configs(home: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     if home.join("config.toml").exists() {
@@ -87,35 +97,6 @@ fn configs(home: &Path) -> Result<Vec<PathBuf>> {
     }
     paths.sort();
     Ok(paths)
-}
-
-fn selected_profile(args: &[OsString]) -> Option<&str> {
-    let mut selected = None;
-    for (index, arg) in args.iter().enumerate() {
-        if arg == "--" {
-            break;
-        }
-        let Some(arg) = arg.to_str() else {
-            continue;
-        };
-        let name = if arg == "--profile" || arg == "-p" {
-            args.get(index + 1)?.to_str()?
-        } else if let Some(name) = arg.strip_prefix("--profile=") {
-            name
-        } else if let Some(name) = arg.strip_prefix("-p") {
-            name.strip_prefix('=').unwrap_or(name)
-        } else {
-            continue;
-        };
-        // Leave invalid names to Codex, without turning them into filesystem paths.
-        selected = (!name.is_empty()
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
-        .then_some(name);
-    }
-    // Commands with their own shared options override the root profile option.
-    selected
 }
 
 fn read_config(path: &Path) -> Result<toml::Value> {
@@ -217,6 +198,19 @@ impl SharedAssets<'_> {
                     self.home.display()
                 );
             }
+            // Native Unicode case aliases can exist even before the destination
+            // is created. Avoid guessing their fold with an ASCII comparison.
+            if uncertain_unicode_alias(
+                link_destination,
+                self.home,
+                &self.runtime_roots,
+                self.case_insensitive,
+            ) {
+                bail!(
+                    "cannot safely link {field} reference {reference:?} from {}: non-ASCII path components can alias account runtime paths on this case-insensitive filesystem; use an absolute reference",
+                    source_config.display()
+                );
+            }
             let sqlite_file = link_destination.parent() == Some(self.home)
                 && link_destination
                     .file_name()
@@ -295,15 +289,19 @@ impl SharedAssets<'_> {
 
 /// Keep the config symlinks editable and let Codex retain its normal layer precedence.
 pub fn share(source_home: &Path, home: &Path, args: &[OsString]) -> Result<()> {
-    let current = std::env::current_dir()?;
-    share_at(source_home, home, args, &layers::cwd(args, &current))
+    share_at(source_home, home, args, &std::env::current_dir()?)
 }
 
 fn share_at(source_home: &Path, home: &Path, args: &[OsString], cwd: &Path) -> Result<()> {
+    let invocation = layers::invocation(args, cwd);
+    if !invocation.loads_user_config {
+        return Ok(());
+    }
+    let cwd = &invocation.cwd;
     let user_home = fsutil::config_user_home()?;
     // Windows canonical paths may carry a namespace prefix that Codex strips.
     let home = fsutil::resolve_config_path(Path::new("."), home, &user_home);
-    let profile = selected_profile(args);
+    let profile = invocation.profile;
     let mut configs = vec![source_home.join("config.toml")];
     if let Some(profile) = profile {
         configs.push(source_home.join(format!("{profile}.config.toml")));
@@ -330,7 +328,7 @@ fn share_at(source_home: &Path, home: &Path, args: &[OsString], cwd: &Path) -> R
         })?;
         layers::merge(&mut discovery, value);
     }
-    let mut cli = layers::cli_overrides(args);
+    let mut cli = invocation.overrides;
     layers::merge(&mut discovery, cli.clone());
     visit_paths(&mut cli, &mut |field, _, _| {
         assets.remove(field);

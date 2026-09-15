@@ -238,6 +238,8 @@ Managed launches also preserve relative `model_instructions_file`, `model_catalo
 
 Asset linking inspects user, selected-profile, project and CLI settings. If a system config, legacy managed config or macOS managed preference contains file paths, runtime locations, project-root markers or trust entries, relative user assets are conservatively refused because those controlled layers can change the projection. Use absolute file references in the shared config or launch Codex directly. xswap does not reproduce Codex's full managed-policy loader.
 
+Help/version requests and `exec --ignore-user-config` skip user-asset inspection, as Codex does; arguments after the forwarded `--` remain literal. On case-insensitive filesystems, new links with non-ASCII relative path components, or non-ASCII runtime locations, are conservatively refused because native Unicode aliases can overlap private account state. Use absolute asset references for those paths. Safe Unicode asset paths remain supported on case-sensitive filesystems.
+
 New login and reauthentication copy configs independently and resolve these file references against their original home. Native login can write its staging config without changing source settings, credentials or conversations. Adopted homes retain their own configuration base.
 
 `--share-history` enables sharing with the main Codex home for:
