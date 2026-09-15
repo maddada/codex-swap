@@ -234,6 +234,10 @@ Export reads the latest main-home credentials for the globally active account an
 
 New managed homes share existing main-home settings and customizations: `config.toml`, named `*.config.toml` profiles, `AGENTS.md`, `AGENTS.override.md`, `skills`, `hooks`, `hooks.json`, `rules` and `agents`. These are symlinks, so edits are shared. Adopted homes keep their own configuration.
 
+Managed launches also preserve relative `model_instructions_file`, `model_catalog_json`, `experimental_compact_prompt_file` and agent role `config_file` references from the main config and selected profile. Referenced files are linked within the account home; agent role directories are linked so nested references retain the role file's base. Put relative role files in a subdirectory such as `agents/`, or use an absolute path. References that require writing outside the managed home, root-level relative role files, account runtime paths and conflicting destination files are refused with guidance. Missing assets keep a link to their source; Codex decides whether the effective settings require them, so shadowed home settings do not break project configuration. Source settings remain editable through the existing shared config links, and project configuration keeps Codex's usual precedence.
+
+New login and reauthentication copy configs independently and resolve these file references against their original home. Native login can write its staging config without changing source settings, credentials or conversations. Adopted homes retain their own configuration base.
+
 `--share-history` enables sharing with the main Codex home for:
 
 | Item | Purpose |

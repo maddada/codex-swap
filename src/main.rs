@@ -3,6 +3,7 @@ mod auth;
 mod backup;
 mod cli;
 mod commands;
+mod config_assets;
 mod fsutil;
 mod launch;
 mod maintenance;

@@ -1,4 +1,4 @@
-use crate::{auth, cli::Cli, fsutil, sharing, store::Store};
+use crate::{auth, cli::Cli, config_assets, fsutil, sharing, store::Store};
 #[cfg(unix)]
 use anyhow::Context;
 use anyhow::{Result, bail};
@@ -97,6 +97,7 @@ pub fn run(
         auth::verify(&home, &account.identity)?;
         if account.managed && home != store.data.main_home {
             sharing::config(&store.data.main_home, &home)?;
+            config_assets::share(&store.data.main_home, &home, args)?;
         }
         if shared {
             sharing::history(&store.data.main_home, &home)?;
@@ -156,13 +157,11 @@ pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
             .collect::<Result<_>>()?,
     };
     let staging = fsutil::private_tempdir(&store.root, "login-")?;
-    // Copy configuration instead of linking it: login must not update real settings.
-    let config = effective.home.join("config.toml");
-    if config.exists() {
-        let mut copy = tempfile::NamedTempFile::new_in(staging.path())?;
-        copy.write_all(&std::fs::read(config)?)?;
-        copy.persist(staging.path().join("config.toml"))?;
-    }
+    config_assets::copy_for_login(
+        &effective.home,
+        effective.managed.then_some(store.data.main_home.as_path()),
+        staging.path(),
+    )?;
     let mut cmd = command(&store.codex_bin(cli), staging.path(), true)?;
     let sqlite = toml::Value::String(staging.path().to_string_lossy().into_owned()).to_string();
     cmd.args(["-c", &format!("sqlite_home={sqlite}")]);
