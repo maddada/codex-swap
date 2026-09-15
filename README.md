@@ -128,6 +128,8 @@ xswap add --home ~/.codex-profiles/work --alias work
 
 Email selection is case-insensitive. If the same email belongs to multiple workspaces, select a slot number or unique alias.
 
+Aliases are 1-64 ASCII letters, digits, dots, hyphens or underscores. They cannot start with a hyphen, be a number or be `default`; aliases are unique regardless of case. To repair an older alias beginning with a hyphen, use its slot number: `xswap rename 2 work-team`.
+
 ## Run, resume and fork
 
 ```sh
