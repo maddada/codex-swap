@@ -80,6 +80,10 @@ function Remove-Item {
     [CmdletBinding()]
     param([string]$LiteralPath, [switch]$Force, [switch]$Recurse)
     $name = [IO.Path]::GetFileName($LiteralPath)
+    if ($global:XswapInstallerTest.rollbackFailure -and $name -eq 'xswap.exe' -and
+        (Split-Path $LiteralPath -Parent) -eq $global:XswapInstallerTest.installDirectory) {
+        throw 'Injected rollback removal failure.'
+    }
     if ($global:XswapInstallerTest.failure -eq "retire-$name" -and
         (Split-Path $LiteralPath -Parent) -eq $global:XswapInstallerTest.installDirectory) {
         throw 'Injected replacement failure.'
@@ -192,6 +196,14 @@ try {
                 Assert-Condition (@(Get-ChildItem -LiteralPath $installDirectory -File).Count -eq 0) "Failed fresh install left files after $failureCase"
             }
         }
+    }
+    # A document placement failure cannot leave a new executable whose rollback removal would fail.
+    foreach ($failureCase in @('install-LICENSE', 'install-THIRD_PARTY_NOTICES.md')) {
+        Reset-Installation $false
+        $global:XswapInstallerTest.failure = $failureCase
+        $global:XswapInstallerTest.rollbackFailure = $true
+        Invoke-TestInstaller $true | Out-Null
+        Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $installDirectory 'xswap.exe'))) "Failed fresh install left an executable without documents after $failureCase"
     }
     foreach ($failureCase in @('retire-LICENSE', 'retire-THIRD_PARTY_NOTICES.md', 'install-THIRD_PARTY_NOTICES.md')) {
         Reset-Installation $true

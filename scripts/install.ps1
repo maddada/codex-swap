@@ -137,7 +137,8 @@ try {
                 $retired += $name
             }
         }
-        foreach ($name in $installedFiles) {
+        # Publish the executable only after both matching documents are in place.
+        foreach ($name in @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'xswap.exe')) {
             Move-Item -LiteralPath (Join-Path $staged $name) -Destination (Join-Path $InstallDir $name)
             $installed += $name
         }
