@@ -249,9 +249,14 @@ impl Store {
     }
 
     pub fn account_for_identity(&self, identity: &Identity) -> Result<Option<Account>> {
-        let matches: Vec<_> = self
-            .data
-            .accounts
+        Self::account_for_identity_in(&self.data.accounts, identity)
+    }
+
+    pub fn account_for_identity_in(
+        accounts: &[Account],
+        identity: &Identity,
+    ) -> Result<Option<Account>> {
+        let matches: Vec<_> = accounts
             .iter()
             .filter(|a| {
                 a.identity

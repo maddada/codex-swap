@@ -166,10 +166,13 @@ pub(crate) fn commit_login(
     transaction.finish(result)
 }
 
-/// CDXC:AgentProviders 2026-09-06 WHY:
-/// Older registries registered the mutable original home in place, so its login must be preserved before global activation replaces that file.
-/// A legacy identity already overwritten outside xswap cannot be recovered; retain its slot as requiring login instead of assigning another account's credentials.
-fn migrate_original(store: &mut Store, transaction: &mut Transaction) -> Result<()> {
+struct OriginalProjection {
+    account: Account,
+    credentials: Option<Value>,
+    needs_login: bool,
+}
+
+fn project_original(store: &Store) -> Result<Option<OriginalProjection>> {
     let Some(legacy) = store
         .data
         .accounts
@@ -177,38 +180,57 @@ fn migrate_original(store: &mut Store, transaction: &mut Transaction) -> Result<
         .find(|a| a.home == store.data.main_home)
         .cloned()
     else {
-        return Ok(());
+        return Ok(None);
     };
-    let home = profile(store, transaction, legacy.number, true)?;
-    let mut copied_identity = None;
+    let mut projection = OriginalProjection {
+        account: legacy,
+        credentials: None,
+        needs_login: false,
+    };
     if let Some((document, live)) = auth::optional_credentials(&store.data.main_home)? {
-        if legacy
+        if projection
+            .account
             .identity
             .as_ref()
             .is_some_and(|saved| saved.same_owner(&live))
         {
-            transaction.write(&home.join("auth.json"), &document)?;
-            copied_identity = Some(live);
+            projection.account.identity = Some(live);
+            projection.credentials = Some(document);
         } else {
-            eprintln!(
-                "Original slot {} needs sign-in again: its saved owner could not be matched to the current login. Use xswap login for a known owner; an unknown legacy owner needs xswap add --login --email <owner> --slot <unused-slot>.",
-                legacy.number
-            );
+            projection.needs_login = true;
         }
     }
-    let account = store
+    Ok(Some(projection))
+}
+
+/// CDXC:AgentProviders 2026-09-06 WHY:
+/// Older registries registered the mutable original home in place, so its login must be preserved before global activation replaces that file.
+/// A legacy identity already overwritten outside xswap cannot be recovered; retain its slot as requiring login instead of assigning another account's credentials.
+fn migrate_original(store: &mut Store, transaction: &mut Transaction) -> Result<()> {
+    let Some(mut original) = project_original(store)? else {
+        return Ok(());
+    };
+    let home = profile(store, transaction, original.account.number, true)?;
+    if let Some(document) = original.credentials {
+        transaction.write(&home.join("auth.json"), &document)?;
+    }
+    if original.needs_login {
+        eprintln!(
+            "Original slot {} needs sign-in again: its saved owner could not be matched to the current login. Use xswap login for a known owner; an unknown legacy owner needs xswap add --login --email <owner> --slot <unused-slot>.",
+            original.account.number
+        );
+    }
+    original.account.home = home;
+    original.account.managed = true;
+    original.account.share_history = true;
+    let number = original.account.number;
+    *store
         .data
         .accounts
         .iter_mut()
-        .find(|a| a.number == legacy.number)
-        .unwrap();
-    account.home = home;
-    if let Some(identity) = copied_identity {
-        account.identity = Some(identity);
-    }
-    account.managed = true;
-    account.share_history = true;
-    store.data.original_account.get_or_insert(legacy.number);
+        .find(|a| a.number == number)
+        .unwrap() = original.account;
+    store.data.original_account.get_or_insert(number);
     Ok(())
 }
 
@@ -307,7 +329,12 @@ fn capture(
 
 fn validate_snapshot_alias(store: &Store, source: &Path, alias: &Option<String>) -> Result<()> {
     let identity = auth::require(source)?;
-    let existing = store.account_for_identity(&identity)?.map(|a| a.number);
+    let mut accounts = store.data.accounts.clone();
+    if let Some(original) = project_original(store)? {
+        let number = original.account.number;
+        *accounts.iter_mut().find(|a| a.number == number).unwrap() = original.account;
+    }
+    let existing = Store::account_for_identity_in(&accounts, &identity)?.map(|a| a.number);
     store.validate_alias_except(alias, existing)
 }
 
@@ -457,6 +484,131 @@ mod alias_tests {
     use super::*;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::json;
+
+    fn shared_workspace_login(uid: &str) -> Value {
+        let payload = URL_SAFE_NO_PAD.encode(format!(
+            r#"{{"email":"shared@example.invalid","https://api.openai.com/auth":{{"chatgpt_user_id":"{uid}"}}}}"#,
+        ));
+        json!({"auth_mode": "chatgpt", "tokens": {
+            "account_id": "synthetic-shared-workspace", "access_token": "synthetic-access",
+            "refresh_token": "synthetic-refresh", "id_token": format!("e30.{payload}.synthetic")
+        }})
+    }
+
+    fn legacy_fixture(saved_source: bool) -> (tempfile::TempDir, Store, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            data_dir: Some(directory.path().join("data")),
+            codex_home: Some(directory.path().join("main")),
+            codex_bin: None,
+            command: crate::cli::Action::List(crate::cli::Output { json: false }),
+        };
+        let source = directory.path().join("source");
+        fsutil::private_dir(&source).unwrap();
+        let mut store = Store::open(&cli).unwrap();
+        fsutil::private_dir(&store.data.main_home).unwrap();
+        fsutil::atomic_json(
+            &store.data.main_home.join("auth.json"),
+            &shared_workspace_login("synthetic-user-1"),
+        )
+        .unwrap();
+        fsutil::atomic_json(
+            &source.join("auth.json"),
+            &shared_workspace_login("synthetic-user-2"),
+        )
+        .unwrap();
+        let mut legacy_identity = auth::require(&store.data.main_home).unwrap();
+        legacy_identity.user_id = None;
+        store.data.accounts.push(Account {
+            number: 1,
+            alias: Some("work".into()),
+            home: store.data.main_home.clone(),
+            managed: false,
+            share_history: false,
+            identity: Some(legacy_identity),
+            enabled: true,
+        });
+        if saved_source {
+            store.data.accounts.push(Account {
+                number: 2,
+                alias: Some("personal".into()),
+                home: source.clone(),
+                managed: false,
+                share_history: false,
+                identity: Some(auth::require(&source).unwrap()),
+                enabled: true,
+            });
+        }
+        store.data.next_number = if saved_source { 3 } else { 2 };
+        store.save().unwrap();
+        drop(store);
+        (directory, Store::open(&cli).unwrap(), source)
+    }
+
+    #[test]
+    fn legacy_alias_collision_is_rejected_before_migration() {
+        let (_directory, store, source) = legacy_fixture(false);
+        let paths = [
+            store.root.join("accounts.json"),
+            store.data.main_home.join("auth.json"),
+            source.join("auth.json"),
+        ];
+        let before: Vec<_> = paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        let error = validate_snapshot_alias(&store, &source, &Some("work".into())).unwrap_err();
+        assert!(error.to_string().contains("alias is already in use"));
+        for (path, bytes) in paths.iter().zip(before) {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        assert_eq!(std::fs::read_dir(&store.data.main_home).unwrap().count(), 1);
+        assert!(!store.root.join("accounts").exists());
+        assert!(
+            store.data.accounts[0]
+                .identity
+                .as_ref()
+                .unwrap()
+                .user_id
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_alias_refresh_matches_the_projected_owner() {
+        let (_directory, mut store, source) = legacy_fixture(true);
+        let alias = Some("personal".to_string());
+        validate_snapshot_alias(&store, &source, &alias).unwrap();
+        assert!(
+            store.data.accounts[0]
+                .identity
+                .as_ref()
+                .unwrap()
+                .user_id
+                .is_none()
+        );
+        let mut transaction = Transaction::new();
+        migrate_original(&mut store, &mut transaction).unwrap();
+        let captured = capture(&mut store, &mut transaction, &source, alias, None, false).unwrap();
+        transaction.finish(Ok(())).unwrap();
+        assert_eq!(captured.number, 2);
+        assert_eq!(captured.alias.as_deref(), Some("personal"));
+        assert_eq!(store.data.accounts.len(), 2);
+        assert_eq!(store.data.next_number, 3);
+        assert_eq!(
+            store.data.accounts[0]
+                .identity
+                .as_ref()
+                .unwrap()
+                .user_id
+                .as_deref(),
+            Some("synthetic-user-1")
+        );
+        assert_eq!(
+            captured.identity.as_ref().unwrap().user_id.as_deref(),
+            Some("synthetic-user-2")
+        );
+    }
 
     #[test]
     fn snapshot_alias_preflight_preserves_own_slot_refreshes() {
