@@ -134,16 +134,17 @@ fn human(report: &AccountUsage) {
 /// User: implement standalone Codex usage percentages, quota windows, reset times and pacing using OpenUsage's Codex integration as the reference.
 pub fn show(cli: &Cli, identifier: Option<&str>, all: bool, output: &Output) -> Result<()> {
     let store = Store::open(cli)?;
+    let live = store.observe_live_account();
     let targets: Vec<Target> = if all {
         store
             .data
             .accounts
             .iter()
-            .map(|account| store.effective_account(account).map(Into::into))
-            .collect::<Result<_>>()?
+            .map(|account| store.effective_account(account, live.as_ref()).into())
+            .collect()
     } else {
         vec![match store.selected(identifier)? {
-            Some(account) => store.effective_account(&account)?.into(),
+            Some(account) => store.effective_account(&account, live.as_ref()).into(),
             None => Target {
                 number: None,
                 alias: None,
