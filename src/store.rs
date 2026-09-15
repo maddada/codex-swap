@@ -249,9 +249,14 @@ impl Store {
     }
 
     pub fn account_for_identity(&self, identity: &Identity) -> Result<Option<Account>> {
-        let matches: Vec<_> = self
-            .data
-            .accounts
+        Self::account_for_identity_in(&self.data.accounts, identity)
+    }
+
+    pub fn account_for_identity_in(
+        accounts: &[Account],
+        identity: &Identity,
+    ) -> Result<Option<Account>> {
+        let matches: Vec<_> = accounts
             .iter()
             .filter(|a| {
                 a.identity
@@ -293,9 +298,14 @@ impl Store {
     }
 
     pub fn validate_alias(&self, alias: &Option<String>) -> Result<()> {
+        self.validate_alias_except(alias, None)
+    }
+
+    pub fn validate_alias_except(&self, alias: &Option<String>, except: Option<u32>) -> Result<()> {
         if let Some(alias) = alias {
             if alias.is_empty()
                 || alias.len() > 64
+                || alias.starts_with('-')
                 || alias.eq_ignore_ascii_case("default")
                 || alias.parse::<u32>().is_ok()
                 || !alias
@@ -303,13 +313,14 @@ impl Store {
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
             {
                 bail!(
-                    "alias must be 1-64 letters, digits, dots, hyphens or underscores, and cannot be a number or 'default'"
+                    "alias must be 1-64 letters, digits, dots, hyphens or underscores, cannot start with a hyphen, and cannot be a number or 'default'"
                 );
             }
             if self.data.accounts.iter().any(|a| {
-                a.alias
-                    .as_deref()
-                    .is_some_and(|s| s.eq_ignore_ascii_case(alias))
+                Some(a.number) != except
+                    && a.alias
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case(alias))
             }) {
                 bail!("alias is already in use");
             }
@@ -347,5 +358,54 @@ impl Store {
             .context("account was removed")?;
         *entry = account;
         self.save()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{Action, Output};
+
+    #[test]
+    fn alias_validation_preserves_selectable_names_and_uniqueness() {
+        let directory = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            data_dir: Some(directory.path().join("data")),
+            codex_home: Some(directory.path().join("main")),
+            codex_bin: None,
+            command: Action::List(Output { json: false }),
+        };
+        let mut store = Store::open(&cli).unwrap();
+        assert!(store.validate_alias(&None).is_ok());
+        for alias in ["work-team", "_work", "work.team", "WORK", &"a".repeat(64)] {
+            assert!(store.validate_alias(&Some(alias.into())).is_ok(), "{alias}");
+        }
+        for alias in [
+            "-work",
+            "--work",
+            "-",
+            "",
+            "default",
+            "DEFAULT",
+            "123",
+            "work team",
+            "wörk",
+            &"a".repeat(65),
+        ] {
+            assert!(
+                store.validate_alias(&Some(alias.into())).is_err(),
+                "{alias}"
+            );
+        }
+        store.data.accounts.push(Account {
+            number: 1,
+            alias: Some("work-team".into()),
+            home: directory.path().join("account-1"),
+            managed: true,
+            share_history: false,
+            identity: None,
+            enabled: true,
+        });
+        assert!(store.validate_alias(&Some("WORK-TEAM".into())).is_err());
     }
 }
