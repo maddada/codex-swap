@@ -27,6 +27,50 @@ fn log_parent_alias_cannot_redirect_a_runtime_file_to_a_shared_asset() {
 }
 
 #[test]
+fn home_log_files_are_protected_without_reserving_ordinary_assets() {
+    for log_dir in [".", "alias"] {
+        let fixture = Fixture::new();
+        symlink(".", fixture.home.join("alias")).unwrap();
+        for filename in LOG_FILES {
+            let reference = format!("alias/{filename}");
+            fixture.write(&reference, "shared instructions sentinel\n");
+            fixture.write(
+                "config.toml",
+                &format!("log_dir = {log_dir:?}\nmodel_instructions_file = {reference:?}\n"),
+            );
+            let error = share(&fixture.main, &fixture.home, &[])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("account runtime path"),
+                "{log_dir} {filename}: {error}"
+            );
+            assert!(fs::symlink_metadata(fixture.home.join(filename)).is_err());
+            assert_eq!(
+                fs::read_to_string(fixture.main.join(reference)).unwrap(),
+                "shared instructions sentinel\n"
+            );
+        }
+        fixture.write("alias/ordinary.md", "ordinary asset sentinel\n");
+        fixture.write(
+            "config.toml",
+            &format!("log_dir = {log_dir:?}\nmodel_instructions_file = 'alias/ordinary.md'\n"),
+        );
+        for _ in 0..2 {
+            share(&fixture.main, &fixture.home, &[]).unwrap();
+            assert_eq!(
+                fs::read_to_string(fixture.home.join("ordinary.md")).unwrap(),
+                "ordinary asset sentinel\n"
+            );
+        }
+        assert_eq!(
+            fs::read_link(fixture.home.join("alias")).unwrap(),
+            Path::new(".")
+        );
+    }
+}
+
+#[test]
 fn sqlite_parent_aliases_preserve_future_private_database_files() {
     let fixture = Fixture::new();
     symlink(".", fixture.home.join("alias")).unwrap();

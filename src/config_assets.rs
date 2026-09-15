@@ -31,6 +31,8 @@ const RUNTIME_ITEMS: &[&str] = &[
     "tmp",
     "shell_snapshots",
 ];
+// CLI login appends this file; TUI startup writes/removes its legacy log file.
+const LOG_FILES: &[&str] = &["codex-login.log", "codex-tui.log"];
 
 fn case_insensitive(home: &Path) -> Result<bool> {
     // Query the account filesystem, rather than assuming macOS/Windows volume
@@ -420,10 +422,15 @@ fn share_at(source_home: &Path, home: &Path, args: &[OsString], cwd: &Path) -> R
         return Ok(());
     }
     let mut runtime_roots: Vec<_> = RUNTIME_ITEMS.iter().map(|name| home.join(name)).collect();
-    for (reference, base) in runtime_settings.values() {
+    let physical_home = fsutil::absolute(&home)?;
+    for (&setting, (reference, base)) in &runtime_settings {
         let root = fsutil::resolve_config_path(Path::new(reference), base, &user_home);
         // SQLite/log files in the home root do not own its config subdirectories.
-        if root != home {
+        if root == home || fsutil::absolute(&root)? == physical_home {
+            if setting == "log_dir" {
+                runtime_roots.extend(LOG_FILES.iter().map(|name| root.join(name)));
+            }
+        } else {
             runtime_roots.push(root);
         }
     }
