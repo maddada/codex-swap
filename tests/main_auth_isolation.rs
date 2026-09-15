@@ -29,9 +29,16 @@ fn credentials(account: &str, access: &str) -> Value {
 }
 
 fn invalid_main_kinds() -> impl Iterator<Item = &'static str> {
-    ["malformed", "api-key", "incomplete", "directory"]
-        .into_iter()
-        .chain(cfg!(unix).then_some("unreadable"))
+    [
+        "malformed",
+        "api-key",
+        "incomplete",
+        "directory",
+        "hybrid-missing-mode",
+        "hybrid-null-mode",
+    ]
+    .into_iter()
+    .chain(cfg!(unix).then_some("unreadable"))
 }
 
 fn write(path: &Path, bytes: impl AsRef<[u8]>) {
@@ -120,6 +127,15 @@ impl Fixture {
             "malformed" => write(&path, b"{\"synthetic-secret-that-must-not-appear\":"),
             "api-key" => write(&path, br#"{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-secret-that-must-not-appear"}"#),
             "incomplete" => write(&path, br#"{"tokens":{"account_id":"synthetic","access_token":"synthetic-secret-that-must-not-appear"}}"#),
+            "hybrid-missing-mode" | "hybrid-null-mode" => {
+                let mut document = credentials("synthetic-account", "synthetic-main");
+                document.as_object_mut().unwrap().remove("auth_mode");
+                if kind == "hybrid-null-mode" {
+                    document["auth_mode"] = Value::Null;
+                }
+                document["OPENAI_API_KEY"] = json!("synthetic-secret-that-must-not-appear");
+                write(&path, serde_json::to_vec(&document).unwrap());
+            }
             "directory" => fs::create_dir(path).unwrap(),
             #[cfg(unix)]
             "unreadable" => {
@@ -364,6 +380,59 @@ fn invalid_main_allows_explicit_run_and_staged_login() {
             );
         }
         assert_eq!(fs::read(fixture.main.join("auth.json")).ok(), main_before);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn hybrid_main_allows_verified_repair_of_incompatible_saved_credentials() {
+    for kind in ["hybrid-missing-mode", "hybrid-null-mode"] {
+        let fixture = Fixture::new();
+        fixture.main_source(kind);
+        let main_before = fs::read(fixture.main.join("auth.json")).unwrap();
+        write(&fixture.saved.join("auth.json"), &main_before);
+        let registry_path = fixture.data.join("accounts.json");
+        let registry_before = fs::read(&registry_path).unwrap();
+        let (listed, _) = fixture.listed();
+        assert_eq!(listed["accounts"][0]["home"], json!(fixture.saved));
+        assert_eq!(listed["accounts"][0]["loginStatus"], "invalid_credentials");
+
+        write(
+            &fixture.next_auth,
+            serde_json::to_vec(&credentials("wrong-account", "synthetic-wrong")).unwrap(),
+        );
+        assert_failure(&fixture.run(&["login", "1"]), "different account");
+        assert_eq!(
+            fs::read(fixture.saved.join("auth.json")).unwrap(),
+            main_before
+        );
+        assert_eq!(fs::read(&registry_path).unwrap(), registry_before);
+        assert_eq!(
+            fs::read(fixture.main.join("auth.json")).unwrap(),
+            main_before
+        );
+
+        let repaired = credentials("synthetic-account", "synthetic-repaired");
+        write(&fixture.next_auth, serde_json::to_vec(&repaired).unwrap());
+        assert_success(&fixture.run(&["login", "1"]));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(fixture.saved.join("auth.json")).unwrap())
+                .unwrap(),
+            repaired
+        );
+        let registry_after: Value =
+            serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+        let registry_before: Value = serde_json::from_slice(&registry_before).unwrap();
+        for (field, before) in registry_before.as_object().unwrap() {
+            assert_eq!(&registry_after[field], before);
+        }
+        assert_eq!(
+            fs::read(fixture.main.join("auth.json")).unwrap(),
+            main_before
+        );
+        let (listed, _) = fixture.listed();
+        assert_eq!(listed["accounts"][0]["home"], json!(fixture.saved));
+        assert_eq!(listed["accounts"][0]["loginStatus"], "present");
     }
 }
 
