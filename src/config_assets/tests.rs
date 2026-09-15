@@ -162,6 +162,28 @@ fn profile_selection_respects_separator_and_supported_flag_forms() {
 }
 
 #[test]
+fn project_discovery_uses_the_cwd_forwarded_to_the_native_command() {
+    let current = Path::new("/synthetic/current");
+    let flags = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+    for args in [
+        vec!["--cd", "project"],
+        vec!["-Cproject", "exec", "synthetic prompt"],
+        vec!["--cd=project", "resume"],
+        vec!["-C", "project", "debug", "prompt-input"],
+    ] {
+        assert_eq!(layers::cwd(&flags(&args), current), current.join("project"));
+    }
+    for args in [
+        vec!["--cd", "project", "mcp", "list"],
+        vec!["-m", "mcp", "-Cproject", "features", "list"],
+        vec!["-C", "project", "debug", "config"],
+        vec!["--", "-C", "project"],
+    ] {
+        assert_eq!(layers::cwd(&flags(&args), current), current);
+    }
+}
+
+#[test]
 fn absent_role_parent_keeps_directory_link_kind() {
     let fixture = Fixture::new();
     let user_home = fsutil::config_user_home().unwrap();
@@ -171,6 +193,7 @@ fn absent_role_parent_keeps_directory_link_kind() {
         visited: HashSet::new(),
         links: Vec::new(),
         runtime_roots: Vec::new(),
+        case_insensitive: case_insensitive(&fixture.home).unwrap(),
     };
     assets
         .collect_asset(
@@ -411,7 +434,7 @@ mod unix {
 
     #[test]
     fn runtime_paths_do_not_become_new_asset_shares() {
-        for directory in ["sessions", "logs", "auth.json", "state_99.sqlite"] {
+        for directory in ["sessions", "log", "logs", "auth.json", "state_99.sqlite"] {
             let fixture = Fixture::new();
             fixture.write(
                 "config.toml",
@@ -486,6 +509,151 @@ mod unix {
             fs::read_link(fixture.home.join("sessions")).unwrap(),
             fixture.main.join("sessions")
         );
+    }
+
+    #[test]
+    fn runtime_case_aliases_follow_the_account_filesystem() {
+        for directory in ["Sessions", "Log", "AUTH.JSON", "STATE_99.SQLITE"] {
+            let fixture = Fixture::new();
+            fixture.write(
+                "config.toml",
+                &format!("[agents.reviewer]\nconfig_file = '{directory}/role.toml'\n"),
+            );
+            fixture.write(
+                &format!("{directory}/role.toml"),
+                "developer_instructions = 'synthetic role'\n",
+            );
+            let insensitive = case_insensitive(&fixture.home).unwrap();
+            let result = share(&fixture.main, &fixture.home, &[]);
+            if insensitive {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("account runtime path")
+                );
+                assert!(fs::symlink_metadata(fixture.home.join(directory)).is_err());
+            } else {
+                result.unwrap();
+                assert!(
+                    fs::symlink_metadata(fixture.home.join(directory))
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                let native = directory.to_ascii_lowercase();
+                assert!(fs::symlink_metadata(fixture.home.join(native)).is_err());
+            }
+        }
+        let fixture = Fixture::new();
+        fixture.write(
+            "config.toml",
+            "model_instructions_file = 'STATE_5.SQLITE'\n",
+        );
+        fixture.write("STATE_5.SQLITE", "synthetic SQLite filename control");
+        assert_eq!(
+            share(&fixture.main, &fixture.home, &[]).is_err(),
+            case_insensitive(&fixture.home).unwrap()
+        );
+    }
+
+    fn project_fixture(fixture: &Fixture, trusted: bool) -> (PathBuf, PathBuf) {
+        let project = fixture.root.path().canonicalize().unwrap().join("project");
+        let cwd = project.join("child");
+        fs::create_dir_all(project.join(".git")).unwrap();
+        fs::write(project.join(".git/HEAD"), "ref: refs/heads/synthetic\n").unwrap();
+        fs::create_dir_all(project.join(".codex")).unwrap();
+        fs::create_dir(&cwd).unwrap();
+        fs::write(
+            project.join(".codex/config.toml"),
+            "model_instructions_file = 'project.md'\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join(".codex/project.md"),
+            "synthetic project instructions",
+        )
+        .unwrap();
+        let key = toml::Value::String(project.to_string_lossy().into_owned());
+        fixture.write(
+            "config.toml",
+            &format!(
+                "model_instructions_file = '../outside.md'\n[projects.{key}]\ntrust_level = '{}'\n",
+                if trusted { "trusted" } else { "untrusted" }
+            ),
+        );
+        fs::write(
+            fixture.main.parent().unwrap().join("outside.md"),
+            "synthetic outside instructions",
+        )
+        .unwrap();
+        (project, cwd)
+    }
+
+    #[test]
+    fn shadowed_escaping_user_reference_is_not_relocated_or_rejected() {
+        for trusted in [false, true] {
+            let fixture = Fixture::new();
+            let (_, cwd) = project_fixture(&fixture, trusted);
+            let before = fs::read(fixture.main.join("config.toml")).unwrap();
+            let result = share_at(&fixture.main, &fixture.home, &[], &cwd);
+            assert_eq!(result.is_ok(), trusted);
+            assert!(
+                fs::symlink_metadata(fixture.home.parent().unwrap().join("outside.md")).is_err()
+            );
+            assert_eq!(fs::read(fixture.main.join("config.toml")).unwrap(), before);
+            let absolute = cwd.join("absolute.md");
+            fs::write(&absolute, "synthetic CLI instructions").unwrap();
+            for flags in [
+                vec![
+                    OsString::from("-c"),
+                    format!(
+                        "model_instructions_file={}",
+                        toml::Value::String(absolute.to_string_lossy().into_owned())
+                    )
+                    .into(),
+                ],
+                vec![format!("--config=model_instructions_file={}", absolute.display()).into()],
+            ] {
+                share_at(&fixture.main, &fixture.home, &flags, &cwd).unwrap();
+            }
+            let flags = vec![
+                "--".into(),
+                "-c".into(),
+                format!("model_instructions_file={}", absolute.display()).into(),
+            ];
+            assert_eq!(
+                share_at(&fixture.main, &fixture.home, &flags, &cwd).is_ok(),
+                trusted
+            );
+        }
+    }
+
+    #[test]
+    fn project_boundaries_and_explicit_untrusted_children_keep_lower_reference_active() {
+        let fixture = Fixture::new();
+        let (project, cwd) = project_fixture(&fixture, true);
+        fs::write(
+            project.join(".codex/config.toml"),
+            "model = 'synthetic-model'\n",
+        )
+        .unwrap();
+        fs::create_dir(cwd.join(".codex")).unwrap();
+        fs::write(
+            cwd.join(".codex/config.toml"),
+            "model_instructions_file = 'child.md'\n",
+        )
+        .unwrap();
+        fs::write(cwd.join(".codex/child.md"), "synthetic child instructions").unwrap();
+        let key = toml::Value::String(cwd.to_string_lossy().into_owned());
+        let mut config = fs::read_to_string(fixture.main.join("config.toml")).unwrap();
+        config.push_str(&format!("\n[projects.{key}]\ntrust_level = 'untrusted'\n"));
+        fixture.write("config.toml", &config);
+        assert!(share_at(&fixture.main, &fixture.home, &[], &cwd).is_err());
+        fs::remove_file(cwd.join(".codex/config.toml")).unwrap();
+        let config = format!("project_root_markers = []\n{config}");
+        fixture.write("config.toml", &config);
+        assert!(share_at(&fixture.main, &fixture.home, &[], &cwd).is_err());
     }
 
     fn credentials(id: &str, email: &str) -> serde_json::Value {

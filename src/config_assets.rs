@@ -9,6 +9,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod controlled;
+mod layers;
 #[cfg(test)]
 mod tests;
 
@@ -24,10 +26,41 @@ const RUNTIME_ITEMS: &[&str] = &[
     "thread-writer-locks",
     "history.jsonl",
     "session_index.jsonl",
+    "log",
     "logs",
     "tmp",
     "shell_snapshots",
 ];
+
+fn case_insensitive(home: &Path) -> Result<bool> {
+    // Query the account filesystem, rather than assuming macOS/Windows volume
+    // defaults. The unique private probe never uses a runtime filename.
+    let probe = tempfile::Builder::new()
+        .prefix(".xswap-case-")
+        .tempfile_in(home)?;
+    let name = probe
+        .path()
+        .file_name()
+        .context("case probe name")?
+        .to_string_lossy();
+    Ok(home
+        .join(name.replacen(".xswap-case-", ".XSWAP-CASE-", 1))
+        .exists())
+}
+
+fn path_prefix(path: &Path, prefix: &Path, insensitive: bool) -> bool {
+    let mut components = path.components();
+    prefix.components().all(|expected| {
+        components.next().is_some_and(|actual| {
+            actual == expected
+                || (insensitive
+                    && actual
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .eq_ignore_ascii_case(expected.as_os_str().as_encoded_bytes()))
+        })
+    })
+}
 
 fn configs(home: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
@@ -45,6 +78,9 @@ fn configs(home: &Path) -> Result<Vec<PathBuf>> {
             .file_name()
             .to_str()
             .is_some_and(|name| name.ends_with(".config.toml"))
+            // Follow regular config symlinks, but never open an unused FIFO,
+            // device or directory merely because its filename looks like a profile.
+            && fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_file())
         {
             paths.push(entry.path());
         }
@@ -121,6 +157,7 @@ struct SharedAssets<'a> {
     visited: HashSet<(PathBuf, PathBuf)>,
     links: Vec<AssetLink>,
     runtime_roots: Vec<PathBuf>,
+    case_insensitive: bool,
 }
 
 impl SharedAssets<'_> {
@@ -185,6 +222,11 @@ impl SharedAssets<'_> {
                     .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| {
+                        let name = if self.case_insensitive {
+                            name.to_ascii_lowercase()
+                        } else {
+                            name.to_owned()
+                        };
                         [
                             "state_",
                             "logs_",
@@ -201,7 +243,8 @@ impl SharedAssets<'_> {
                     });
             if sqlite_file
                 || self.runtime_roots.iter().any(|root| {
-                    link_destination.starts_with(root) || root.starts_with(link_destination)
+                    path_prefix(link_destination, root, self.case_insensitive)
+                        || path_prefix(root, link_destination, self.case_insensitive)
                 })
             {
                 bail!(
@@ -252,6 +295,11 @@ impl SharedAssets<'_> {
 
 /// Keep the config symlinks editable and let Codex retain its normal layer precedence.
 pub fn share(source_home: &Path, home: &Path, args: &[OsString]) -> Result<()> {
+    let current = std::env::current_dir()?;
+    share_at(source_home, home, args, &layers::cwd(args, &current))
+}
+
+fn share_at(source_home: &Path, home: &Path, args: &[OsString], cwd: &Path) -> Result<()> {
     let user_home = fsutil::config_user_home()?;
     // Windows canonical paths may carry a namespace prefix that Codex strips.
     let home = fsutil::resolve_config_path(Path::new("."), home, &user_home);
@@ -262,11 +310,12 @@ pub fn share(source_home: &Path, home: &Path, args: &[OsString]) -> Result<()> {
     }
     let mut assets = BTreeMap::new();
     let mut runtime_settings = BTreeMap::new();
+    let mut discovery = toml::Value::Table(Default::default());
     for config in configs.into_iter().filter(|path| path.exists()) {
         let mut value = read_config(&config)?;
         for key in ["log_dir", "sqlite_home"] {
             if let Some(path) = value.get(key).and_then(toml::Value::as_str) {
-                runtime_settings.insert(key, path.to_owned());
+                runtime_settings.insert(key, (path.to_owned(), home.clone()));
             }
         }
         visit_paths(&mut value, &mut |field, value, role| {
@@ -279,10 +328,55 @@ pub fn share(source_home: &Path, home: &Path, args: &[OsString]) -> Result<()> {
             }
             Ok(())
         })?;
+        layers::merge(&mut discovery, value);
+    }
+    let mut cli = layers::cli_overrides(args);
+    layers::merge(&mut discovery, cli.clone());
+    visit_paths(&mut cli, &mut |field, _, _| {
+        assets.remove(field);
+        Ok(())
+    })?;
+    if assets.values().any(|(config, reference, _)| {
+        let source_base = config.parent().unwrap_or(source_home);
+        fsutil::resolve_config_path(Path::new(reference), source_base, &user_home)
+            != fsutil::resolve_config_path(Path::new(reference), &home, &user_home)
+    }) {
+        controlled::guard_relocation()?;
+    }
+    // Project paths keep their native project-layer base. Only user references
+    // that survive the higher layers need relocation into the account home.
+    for project in layers::project_configs(&discovery, cwd, &home)? {
+        let mut value = read_config(&project)?;
+        for key in ["log_dir", "sqlite_home"] {
+            if let Some(path) = value.get(key).and_then(toml::Value::as_str) {
+                runtime_settings.insert(
+                    key,
+                    (
+                        path.to_owned(),
+                        project
+                            .parent()
+                            .context("project config parent")?
+                            .to_owned(),
+                    ),
+                );
+            }
+        }
+        visit_paths(&mut value, &mut |field, _, _| {
+            assets.remove(field);
+            Ok(())
+        })?;
+    }
+    for key in ["log_dir", "sqlite_home"] {
+        if let Some(path) = cli.get(key).and_then(toml::Value::as_str) {
+            runtime_settings.insert(key, (path.to_owned(), cwd.to_owned()));
+        }
+    }
+    if assets.is_empty() {
+        return Ok(());
     }
     let mut runtime_roots: Vec<_> = RUNTIME_ITEMS.iter().map(|name| home.join(name)).collect();
-    for reference in runtime_settings.values() {
-        let root = fsutil::resolve_config_path(Path::new(reference), &home, &user_home);
+    for (reference, base) in runtime_settings.values() {
+        let root = fsutil::resolve_config_path(Path::new(reference), base, &user_home);
         // SQLite/log files in the home root do not own its config subdirectories.
         if root != home {
             runtime_roots.push(root);
@@ -294,6 +388,7 @@ pub fn share(source_home: &Path, home: &Path, args: &[OsString]) -> Result<()> {
         visited: HashSet::new(),
         links: Vec::new(),
         runtime_roots,
+        case_insensitive: case_insensitive(&home)?,
     };
     for (field, (config, reference, role)) in assets {
         let destination = home.join(config.file_name().context("config file name")?);
