@@ -18,6 +18,7 @@ $installDirectory = Join-Path $testDirectory 'installation with spaces'
 # Mocks invoked by another script need state anchored to this disposable test process.
 $global:XswapInstallerTest = [pscustomobject]@{
     archivePath = (Join-Path $testDirectory $archiveName)
+    installDirectory = $installDirectory
     downloadDirectory = $null; failure = ''; rollbackFailure = $false; badChecksum = $false
     version = $version; archiveName = $archiveName
 }
@@ -54,7 +55,11 @@ function Invoke-WebRequest {
 function Copy-Item {
     [CmdletBinding()]
     param([string]$LiteralPath, [string]$Destination)
-    if ($global:XswapInstallerTest.failure -eq ('stage-' + [IO.Path]::GetFileName($LiteralPath))) { throw 'Injected staging failure.' }
+    $name = [IO.Path]::GetFileName($LiteralPath)
+    if ($global:XswapInstallerTest.failure -eq ('stage-' + $name)) { throw 'Injected staging failure.' }
+    if ($global:XswapInstallerTest.rollbackFailure -and (Split-Path $LiteralPath -Parent).EndsWith('.previous') -and $name -eq 'xswap.exe') {
+        throw 'Injected rollback failure.'
+    }
     Microsoft.PowerShell.Management\Copy-Item @PSBoundParameters
 }
 
@@ -68,10 +73,18 @@ function Move-Item {
         ($destinationDirectory.EndsWith('.previous') -and $global:XswapInstallerTest.failure -eq "retire-$name")) {
         throw 'Injected replacement failure.'
     }
-    if ($global:XswapInstallerTest.rollbackFailure -and $sourceDirectory.EndsWith('.previous') -and $name -eq 'xswap.exe') {
-        throw 'Injected rollback failure.'
-    }
     Microsoft.PowerShell.Management\Move-Item @PSBoundParameters
+}
+
+function Remove-Item {
+    [CmdletBinding()]
+    param([string]$LiteralPath, [switch]$Force, [switch]$Recurse)
+    $name = [IO.Path]::GetFileName($LiteralPath)
+    if ($global:XswapInstallerTest.failure -eq "retire-$name" -and
+        (Split-Path $LiteralPath -Parent) -eq $global:XswapInstallerTest.installDirectory) {
+        throw 'Injected replacement failure.'
+    }
+    Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters
 }
 
 function New-Archive([string]$Fault = '') {
@@ -180,22 +193,25 @@ try {
             }
         }
     }
-    Reset-Installation $true
-    $prior = Get-InstalledHashes
-    $global:XswapInstallerTest.failure = 'install-THIRD_PARTY_NOTICES.md'
-    $global:XswapInstallerTest.rollbackFailure = $true
-    $message = Invoke-TestInstaller $true
-    Assert-Condition ($message -match 'Rollback could not complete; previous files are retained') 'Rollback failure did not identify recovery files.'
-    $backup = @(Get-ChildItem -LiteralPath $installDirectory -Filter 'xswap.*.previous' -Directory)
-    Assert-Condition ($backup.Count -eq 1) 'Rollback recovery directory was discarded.'
-    Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $backup[0].FullName 'xswap.exe')).Hash -eq $prior['xswap.exe']) 'Previous executable was lost.'
-    foreach ($name in @('LICENSE', 'THIRD_PARTY_NOTICES.md')) {
-        Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $installDirectory $name)).Hash -eq $prior[$name]) "Rollback failed to retain $name"
+    foreach ($failureCase in @('retire-LICENSE', 'retire-THIRD_PARTY_NOTICES.md', 'install-THIRD_PARTY_NOTICES.md')) {
+        Reset-Installation $true
+        $prior = Get-InstalledHashes
+        $global:XswapInstallerTest.failure = $failureCase
+        $global:XswapInstallerTest.rollbackFailure = $true
+        $message = Invoke-TestInstaller $true
+        Assert-Condition ($message -match 'Rollback could not complete; previous files are retained') 'Rollback failure did not identify recovery files.'
+        $backup = @(Get-ChildItem -LiteralPath $installDirectory -Filter 'xswap.*.previous' -Directory)
+        Assert-Condition ($backup.Count -eq 1) 'Rollback recovery directory was discarded.'
+        foreach ($name in $prior.Keys) {
+            Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $backup[0].FullName $name)).Hash -eq $prior[$name]) "Rollback recovery lost $name after $failureCase"
+        }
+        $global:XswapInstallerTest.failure = ''
+        $global:XswapInstallerTest.rollbackFailure = $false
+        Invoke-TestInstaller $false | Out-Null
+        foreach ($name in $prior.Keys) {
+            Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $backup[0].FullName $name)).Hash -eq $prior[$name]) "Later cleanup discarded rollback recovery $name after $failureCase"
+        }
     }
-    $global:XswapInstallerTest.failure = ''
-    $global:XswapInstallerTest.rollbackFailure = $false
-    Invoke-TestInstaller $false | Out-Null
-    Assert-Condition ((Get-FileHash -LiteralPath (Join-Path $backup[0].FullName 'xswap.exe')).Hash -eq $prior['xswap.exe']) 'Later cleanup discarded rollback recovery files.'
     foreach ($fault in @('missing', 'extra', 'duplicate', 'escaping', 'link', 'directory', 'empty', 'checksum')) {
         Reset-Installation $true
         $prior = Get-InstalledHashes

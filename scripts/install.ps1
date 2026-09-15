@@ -118,11 +118,22 @@ try {
     $retired = @()
     $installed = @()
     try {
+        # Save the documents before retiring any file so recovery always has the old executable's notices.
+        foreach ($name in @('LICENSE', 'THIRD_PARTY_NOTICES.md')) {
+            $current = Join-Path $InstallDir $name
+            if (Test-Path -LiteralPath $current) {
+                Copy-Item -LiteralPath $current -Destination (Join-Path $previous $name)
+            }
+        }
         foreach ($name in $installedFiles) {
             $current = Join-Path $InstallDir $name
             if (Test-Path -LiteralPath $current) {
-                # Windows permits renaming a running executable, but cannot overwrite its image.
-                Move-Item -LiteralPath $current -Destination (Join-Path $previous $name)
+                if ($name -eq 'xswap.exe') {
+                    # Windows permits renaming a running executable, but cannot overwrite its image.
+                    Move-Item -LiteralPath $current -Destination (Join-Path $previous $name)
+                } else {
+                    Remove-Item -LiteralPath $current -Force
+                }
                 $retired += $name
             }
         }
@@ -137,7 +148,8 @@ try {
             try { Remove-Item -LiteralPath (Join-Path $InstallDir $name) -Force } catch { $rollbackErrors += $_ }
         }
         foreach ($name in $retired) {
-            try { Move-Item -LiteralPath (Join-Path $previous $name) -Destination (Join-Path $InstallDir $name) } catch { $rollbackErrors += $_ }
+            # Restoring one file must not consume part of an incomplete recovery set.
+            try { Copy-Item -LiteralPath (Join-Path $previous $name) -Destination (Join-Path $InstallDir $name) } catch { $rollbackErrors += $_ }
         }
         if ($rollbackErrors.Count) {
             throw "Installation failed: $installError. Rollback could not complete; previous files are retained in $previous. $rollbackErrors"
