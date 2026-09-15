@@ -43,6 +43,7 @@ $tempDir = Join-Path ([IO.Path]::GetTempPath()) ('codex-swap-' + [Guid]::NewGuid
 $destination = Join-Path $InstallDir 'xswap.exe'
 $previous = $null
 $staged = $null
+$installationLock = $null
 $installedFiles = @('xswap.exe', 'LICENSE', 'THIRD_PARTY_NOTICES.md')
 
 function Remove-PreviousInstallation([string]$Directory) {
@@ -96,6 +97,12 @@ try {
     }
 
     [IO.Directory]::CreateDirectory($InstallDir) | Out-Null
+    try {
+        # Keep the lock file so waiting installers always contend for the same file.
+        $installationLock = [IO.File]::Open((Join-Path $InstallDir 'INSTALLATION_LOCK'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    } catch [IO.IOException] {
+        throw "Could not acquire the installation lock in $InstallDir. Wait for any other installer to finish, then try again. $_"
+    }
     # Earlier upgrades can leave an executable that was still running at replacement time.
     foreach ($old in @(Get-ChildItem -LiteralPath $InstallDir -Filter 'xswap.*.previous.exe' -File)) {
         try { Remove-Item -LiteralPath $old.FullName -Force } catch {
@@ -176,6 +183,11 @@ try {
     Write-Host "Installed xswap $versionNumber to $destination"
     Write-Host 'Open a new terminal to use the updated PATH. Install the official Codex CLI separately.'
 } finally {
-    if ($staged -and (Test-Path -LiteralPath $staged)) { Remove-Item -LiteralPath $staged -Recurse -Force }
-    Remove-Item -LiteralPath $tempDir -Recurse -Force
+    try {
+        if ($staged -and (Test-Path -LiteralPath $staged)) { Remove-Item -LiteralPath $staged -Recurse -Force }
+    } finally {
+        try { Remove-Item -LiteralPath $tempDir -Recurse -Force } finally {
+            if ($installationLock) { $installationLock.Dispose() }
+        }
+    }
 }

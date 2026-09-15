@@ -19,6 +19,7 @@ $installDirectory = Join-Path $testDirectory 'installation with spaces'
 $global:XswapInstallerTest = [pscustomobject]@{
     archivePath = (Join-Path $testDirectory $archiveName)
     installDirectory = $installDirectory
+    installerPath = $installer; competingAt = ''; competingError = $null
     downloadDirectory = $null; failure = ''; rollbackFailure = $false; badChecksum = $false
     version = $version; archiveName = $archiveName
 }
@@ -52,6 +53,17 @@ function Invoke-WebRequest {
     } else { throw "Unexpected download request: $Uri" }
 }
 
+function Invoke-CompetingInstaller {
+    $global:XswapInstallerTest.competingAt = ''
+    $activeDownload = $global:XswapInstallerTest.downloadDirectory
+    try {
+        try {
+            & $global:XswapInstallerTest.installerPath -Version $global:XswapInstallerTest.version -InstallDir $global:XswapInstallerTest.installDirectory -NoPathUpdate
+        } catch { $global:XswapInstallerTest.competingError = $_.ToString() }
+        Assert-Condition ($global:XswapInstallerTest.downloadDirectory -and -not (Test-Path -LiteralPath $global:XswapInstallerTest.downloadDirectory)) 'Competing installer downloads survived cleanup.'
+    } finally { $global:XswapInstallerTest.downloadDirectory = $activeDownload }
+}
+
 function Copy-Item {
     [CmdletBinding()]
     param([string]$LiteralPath, [string]$Destination)
@@ -69,6 +81,9 @@ function Move-Item {
     $name = [IO.Path]::GetFileName($LiteralPath)
     $sourceDirectory = Split-Path $LiteralPath -Parent
     $destinationDirectory = Split-Path $Destination -Parent
+    if ($global:XswapInstallerTest.competingAt -eq 'placement' -and $sourceDirectory.EndsWith('.new') -and $name -eq 'LICENSE') {
+        Invoke-CompetingInstaller
+    }
     if (($sourceDirectory.EndsWith('.new') -and $global:XswapInstallerTest.failure -eq "install-$name") -or
         ($destinationDirectory.EndsWith('.previous') -and $global:XswapInstallerTest.failure -eq "retire-$name")) {
         throw 'Injected replacement failure.'
@@ -80,6 +95,9 @@ function Remove-Item {
     [CmdletBinding()]
     param([string]$LiteralPath, [switch]$Force, [switch]$Recurse)
     $name = [IO.Path]::GetFileName($LiteralPath)
+    if ($global:XswapInstallerTest.competingAt -eq 'cleanup' -and $name.EndsWith('.new')) {
+        Invoke-CompetingInstaller
+    }
     if ($global:XswapInstallerTest.rollbackFailure -and $name -eq 'xswap.exe' -and
         (Split-Path $LiteralPath -Parent) -eq $global:XswapInstallerTest.installDirectory) {
         throw 'Injected rollback removal failure.'
@@ -121,6 +139,8 @@ function Reset-Installation([bool]$WithPrior) {
     }
     $global:XswapInstallerTest.failure = ''
     $global:XswapInstallerTest.rollbackFailure = $false
+    $global:XswapInstallerTest.competingAt = ''
+    $global:XswapInstallerTest.competingError = $null
     $global:XswapInstallerTest.badChecksum = $false
     $global:XswapInstallerTest.downloadDirectory = $null
     if ($WithPrior) {
@@ -160,13 +180,28 @@ try {
             $source = if ($name -eq 'xswap.exe') { $Binary } else { Join-Path $root $name }
             Assert-Condition ($hashes[$name] -eq (Get-FileHash -LiteralPath $source).Hash) "Wrong installed payload: $name"
         }
-        Assert-Condition (@(Get-ChildItem -LiteralPath $installDirectory).Count -eq 3) 'Unexpected installed files.'
+        Assert-Condition (@(Get-ChildItem -LiteralPath $installDirectory | Where-Object { $_.Name -ne 'INSTALLATION_LOCK' }).Count -eq 3) 'Unexpected installed files.'
     }
     # Installations made by the old installer have only an executable.
     Reset-Installation $true
     foreach ($name in @('LICENSE', 'THIRD_PARTY_NOTICES.md')) { [IO.File]::Delete((Join-Path $installDirectory $name)) }
     Invoke-TestInstaller $false | Out-Null
     Assert-Condition ((Get-InstalledHashes).Count -eq 3) 'Legacy upgrade omitted documents.'
+
+    # A second transaction cannot publish while the active transaction places files or cleans up.
+    foreach ($phase in @('placement', 'cleanup')) {
+        Reset-Installation $true
+        $global:XswapInstallerTest.competingAt = $phase
+        Invoke-TestInstaller $false | Out-Null
+        Assert-Condition ($global:XswapInstallerTest.competingError -match 'Could not acquire the installation lock') "Competing installer entered the active transaction during $phase"
+        $hashes = Get-InstalledHashes
+        foreach ($name in $hashes.Keys) {
+            $source = if ($name -eq 'xswap.exe') { $Binary } else { Join-Path $root $name }
+            Assert-Condition ($hashes[$name] -eq (Get-FileHash -LiteralPath $source).Hash) "Competing installer changed $name during $phase"
+        }
+        # Retrying after final cleanup also proves the active transaction released its lock.
+        Invoke-TestInstaller $false | Out-Null
+    }
 
     # A locked retired executable must keep its own documents until later cleanup.
     $oldDirectory = Join-Path $installDirectory 'xswap.retired.previous'
@@ -193,7 +228,7 @@ try {
                 $after = Get-InstalledHashes
                 foreach ($name in $prior.Keys) { Assert-Condition ($prior[$name] -eq $after[$name]) "Rollback changed $name after $failureCase" }
             } else {
-                Assert-Condition (@(Get-ChildItem -LiteralPath $installDirectory -File).Count -eq 0) "Failed fresh install left files after $failureCase"
+                Assert-Condition (@(Get-ChildItem -LiteralPath $installDirectory -File | Where-Object { $_.Name -ne 'INSTALLATION_LOCK' }).Count -eq 0) "Failed fresh install left files after $failureCase"
             }
         }
     }
