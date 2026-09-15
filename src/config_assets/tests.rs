@@ -223,6 +223,8 @@ fn invocation_policy_and_value_options_preserve_literal_boundaries() {
         vec!["e", "--ignore-user-config"],
         vec!["x", "--ignore-user-config"],
         vec!["--add-dir", "features", "exec", "--ignore-user-config"],
+        vec!["--image=fake.png", "exec", "--ignore-user-config"],
+        vec!["-ifake.png", "exec", "--ignore-user-config"],
     ] {
         assert!(
             !layers::invocation(&flags(&args), current).loads_user_config,
@@ -237,6 +239,9 @@ fn invocation_policy_and_value_options_preserve_literal_boundaries() {
         vec!["--add-dir", "exec", "--ignore-user-config"],
         vec!["--model=exec", "--ignore-user-config"],
         vec!["--image=--help", "-C", "project"],
+        vec!["--image", "fake.png", "exec", "--ignore-user-config"],
+        vec!["--image=fake.png", "exec", "--", "--ignore-user-config"],
+        vec!["-ifake.png", "exec", "--", "--help"],
     ] {
         assert!(
             layers::invocation(&flags(&args), current).loads_user_config,

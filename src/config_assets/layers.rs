@@ -105,9 +105,10 @@ pub(super) fn invocation<'a>(args: &'a [OsString], current: &Path) -> Invocation
                     }
                 }
                 ValueOption::Image => {
-                    while args
-                        .get(index + 1)
-                        .is_some_and(|arg| !arg.as_encoded_bytes().starts_with(b"-"))
+                    while attached.is_none()
+                        && args
+                            .get(index + 1)
+                            .is_some_and(|arg| !arg.as_encoded_bytes().starts_with(b"-"))
                     {
                         index += 1;
                     }

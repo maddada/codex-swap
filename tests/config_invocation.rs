@@ -66,6 +66,18 @@ fn ignored_assets_reach_child_without_bypassing_account_guards() {
         vec!["--help"],
         vec!["--version"],
         vec!["exec", "--ignore-user-config", "--", "--help"],
+        vec![
+            "--image=fake.png",
+            "exec",
+            "--ignore-user-config",
+            "synthetic prompt",
+        ],
+        vec![
+            "-ifake.png",
+            "exec",
+            "--ignore-user-config",
+            "synthetic prompt",
+        ],
     ] {
         let result = invoke(&args);
         assert_eq!(
@@ -95,6 +107,10 @@ fn ignored_assets_reach_child_without_bypassing_account_guards() {
         vec!["exec", "synthetic prompt"],
         vec!["exec", "--", "--help"],
         vec!["exec", "--", "--ignore-user-config"],
+        vec!["--image=fake.png", "exec", "synthetic prompt"],
+        vec!["-ifake.png", "exec", "synthetic prompt"],
+        vec!["--image=fake.png", "exec", "--", "--ignore-user-config"],
+        vec!["-ifake.png", "exec", "--", "--help"],
     ] {
         let result = invoke(&args);
         assert_eq!(result.status.code(), Some(1));
