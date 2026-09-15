@@ -20,8 +20,13 @@ struct Fixture {
 }
 
 fn credentials(account: &str, access: &str) -> Value {
-    let payload = URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&json!({"email": "synthetic@example.test"})).unwrap());
+    let payload = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "email": "synthetic@example.test",
+            "https://api.openai.com/auth": {"chatgpt_user_id": "synthetic-user"}
+        }))
+        .unwrap(),
+    );
     json!({"auth_mode": "chatgpt", "tokens": {
         "account_id": account, "id_token": format!("synthetic.{payload}.sig"),
         "access_token": access, "refresh_token": "synthetic-refresh"
@@ -79,7 +84,7 @@ impl Fixture {
                 "nextNumber": 2, "default": 1, "directoryMappings": {}, "accounts": [{
                     "number": 1, "alias": "synthetic", "home": fixture.saved,
                     "managed": false, "shareHistory": false, "enabled": true,
-                    "identity": {"accountId": "synthetic-account", "email": "synthetic@example.test", "plan": null}
+                    "identity": {"accountId": "synthetic-account", "userId": "synthetic-user", "email": "synthetic@example.test", "plan": null}
                 }]})).unwrap(),
         );
         #[cfg(unix)]

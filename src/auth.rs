@@ -143,18 +143,14 @@ fn identity_value(value: &Value) -> Result<Identity> {
     identity_labels(value)
 }
 
-/// Read-only enrichment is allowed only for a private saved snapshot, never the main home.
+/// Read-only enrichment uses a registered separate home's saved hint, never the main home.
 /// Token labels establish a legacy owner hint without authorizing its transport credentials.
-pub fn enrich_legacy_identity(home: &Path, snapshots: &Path, expected: &mut Option<Identity>) {
+pub fn enrich_legacy_identity(home: &Path, expected: &mut Option<Identity>) {
     let Some(saved) = expected.as_mut() else {
         return;
     };
     saved.legacy_hint_unusable = false;
     if usable(saved.user_id.as_deref()).is_some() || usable(saved.email.as_deref()).is_none() {
-        return;
-    }
-    if !home.starts_with(snapshots) {
-        saved.legacy_hint_unusable = true;
         return;
     }
     let hint = document(home)

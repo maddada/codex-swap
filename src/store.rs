@@ -139,14 +139,9 @@ impl Store {
         {
             bail!("invalid configured Codex executable");
         }
-        let snapshots = root.join("accounts");
         for account in &mut data.accounts {
-            if account.managed && account.home != data.main_home {
-                crate::auth::enrich_legacy_identity(
-                    &account.home,
-                    &snapshots,
-                    &mut account.identity,
-                );
+            if account.home != data.main_home {
+                crate::auth::enrich_legacy_identity(&account.home, &mut account.identity);
             }
         }
         Ok(Self {
@@ -280,7 +275,7 @@ impl Store {
             Ok(account) => account,
             Err(_) => {
                 eprintln!(
-                    "xswap: the main Codex login could not be read as a ChatGPT login; saved accounts use their own homes. Check the main login with xswap status."
+                    "xswap: the main Codex login could not be resolved to a saved account; saved accounts use their own homes. Check the main login with xswap status."
                 );
                 None
             }
