@@ -204,3 +204,69 @@ pub fn show(cli: &Cli, identifier: Option<&str>, all: bool, output: &Output) -> 
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod credit_header_output_regressions {
+    use super::*;
+    use reqwest::header::HeaderMap;
+    use std::process::Command;
+
+    #[test]
+    fn credit_header_reaches_json_and_human_output() {
+        const CHILD: &str = "XSWAP_TEST_CREDIT_HEADER_OUTPUT";
+        if std::env::var_os(CHILD).is_some() {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-codex-credits-balance", "12.5".parse().unwrap());
+            let fetched = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+            let report = AccountUsage {
+                number: None,
+                alias: Some("offline fixture".into()),
+                email: None,
+                account_id: None,
+                fetched_at: usage_model::timestamp(fetched),
+                usage: Some(
+                    usage_model::parse(
+                        &usage_client::Response {
+                            body: json!({}),
+                            headers,
+                        },
+                        fetched,
+                    )
+                    .unwrap(),
+                ),
+                error: None,
+            };
+            human(&report);
+            println!(
+                "CREDIT_HEADER_JSON:{}",
+                serde_json::to_string(&json!({"schemaVersion": 1, "accounts": [report]})).unwrap()
+            );
+            return;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "usage::credit_header_output_regressions::credit_header_reaches_json_and_human_output", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("  Extra usage credits: 12.5"), "{stdout}");
+        let json = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("CREDIT_HEADER_JSON:"))
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(output["schemaVersion"], 1);
+        assert_eq!(output["accounts"][0]["usage"]["credits"]["balance"], 12.5);
+        assert!(output["accounts"][0]["usage"]["credits"]["hasCredits"].is_null());
+        assert!(output["accounts"][0]["usage"]["credits"]["unlimited"].is_null());
+        assert_eq!(
+            output["accounts"][0]["fetchedAt"],
+            usage_model::timestamp(chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap())
+        );
+    }
+}
