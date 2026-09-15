@@ -72,6 +72,37 @@ fn uncertain_unicode_alias(path: &Path, home: &Path, roots: &[PathBuf], insensit
     insensitive && (non_ascii(path) || roots.iter().any(|root| non_ascii(root)))
 }
 
+fn runtime_path(path: &Path, home: &Path, roots: &[PathBuf], insensitive: bool) -> bool {
+    let sqlite = path.parent() == Some(home)
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                let name = if insensitive {
+                    name.to_ascii_lowercase()
+                } else {
+                    name.to_owned()
+                };
+                [
+                    "state_",
+                    "logs_",
+                    "goals_",
+                    "memories_",
+                    "queue_",
+                    "thread_history_",
+                ]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+                    && [".sqlite", ".sqlite-wal", ".sqlite-shm", ".sqlite-journal"]
+                        .iter()
+                        .any(|suffix| name.ends_with(suffix))
+            });
+    sqlite
+        || roots.iter().any(|root| {
+            path_prefix(path, root, insensitive) || path_prefix(root, path, insensitive)
+        })
+}
+
 fn configs(home: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     if home.join("config.toml").exists() {
@@ -190,7 +221,8 @@ impl SharedAssets<'_> {
         } else {
             (source.as_path(), destination.as_path())
         };
-        if fsutil::absolute(link_source)? != fsutil::absolute(link_destination)? {
+        let physical_destination = fsutil::absolute(link_destination)?;
+        if fsutil::absolute(link_source)? != physical_destination {
             if !link_destination.starts_with(self.home) || link_destination == self.home {
                 bail!(
                     "cannot preserve {field} reference {reference:?} from {} inside managed home {}; use an absolute path, or put agent role files in a shared subdirectory such as agents/",
@@ -198,12 +230,35 @@ impl SharedAssets<'_> {
                     self.home.display()
                 );
             }
+            let physical_destination =
+                fsutil::resolve_config_path(&physical_destination, self.home, &self.user_home);
+            if !physical_destination.starts_with(self.home) || physical_destination == self.home {
+                bail!(
+                    "{} resolves outside managed home {}; refusing to write through that link. Use an absolute config reference",
+                    link_destination.display(),
+                    self.home.display()
+                );
+            }
+            let mut runtime_roots = self.runtime_roots.clone();
+            for root in &self.runtime_roots {
+                let physical = fsutil::absolute(root)?;
+                runtime_roots.push(fsutil::resolve_config_path(
+                    &physical,
+                    self.home,
+                    &self.user_home,
+                ));
+            }
             // Native Unicode case aliases can exist even before the destination
             // is created. Avoid guessing their fold with an ASCII comparison.
             if uncertain_unicode_alias(
                 link_destination,
                 self.home,
-                &self.runtime_roots,
+                &runtime_roots,
+                self.case_insensitive,
+            ) || uncertain_unicode_alias(
+                &physical_destination,
+                self.home,
+                &runtime_roots,
                 self.case_insensitive,
             ) {
                 bail!(
@@ -211,36 +266,17 @@ impl SharedAssets<'_> {
                     source_config.display()
                 );
             }
-            let sqlite_file = link_destination.parent() == Some(self.home)
-                && link_destination
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        let name = if self.case_insensitive {
-                            name.to_ascii_lowercase()
-                        } else {
-                            name.to_owned()
-                        };
-                        [
-                            "state_",
-                            "logs_",
-                            "goals_",
-                            "memories_",
-                            "queue_",
-                            "thread_history_",
-                        ]
-                        .iter()
-                        .any(|prefix| name.starts_with(prefix))
-                            && [".sqlite", ".sqlite-wal", ".sqlite-shm", ".sqlite-journal"]
-                                .iter()
-                                .any(|suffix| name.ends_with(suffix))
-                    });
-            if sqlite_file
-                || self.runtime_roots.iter().any(|root| {
-                    path_prefix(link_destination, root, self.case_insensitive)
-                        || path_prefix(root, link_destination, self.case_insensitive)
-                })
-            {
+            if runtime_path(
+                link_destination,
+                self.home,
+                &runtime_roots,
+                self.case_insensitive,
+            ) || runtime_path(
+                &physical_destination,
+                self.home,
+                &runtime_roots,
+                self.case_insensitive,
+            ) {
                 bail!(
                     "cannot link {field} reference {reference:?} from {}: {} is an account runtime path; use an absolute reference to preserve private credentials, logs and history",
                     source_config.display(),

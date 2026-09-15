@@ -1,5 +1,7 @@
 use super::*;
 
+#[cfg(unix)]
+mod aliases;
 mod unicode;
 
 struct Fixture {
