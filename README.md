@@ -287,7 +287,7 @@ xswap purge
 xswap purge --yes
 ```
 
-`purge` requires typing `purge` at its interactive prompt or passing `--yes`. It deletes the managed `accounts/` tree, including homes retained by earlier `remove` commands. Original and adopted Codex homes, and the targets of shared settings/history links, remain intact. It refuses if a managed tree overlaps an original/adopted home, or an account has a live xswap lease. Advisory lock files remain so concurrent processes keep using the same locks. The installed executable is retained; use Homebrew or your installer directory to uninstall it separately.
+`purge` requires typing `purge` at its interactive prompt or passing `--yes`. It deletes the managed `accounts/` tree, including homes retained by earlier `remove` commands, and abandoned private `login-*`/`new-login-*` sign-in staging directories. Original and adopted Codex homes, and the targets of shared settings/history links, remain intact. It refuses if a cleanup directory overlaps an original/adopted home, or an account/sign-in has a live xswap lease. Staging candidates must be owned real directories inside the private data root; links and invalid candidates cause an error. Sign-in staging stays leased through credential saving; interrupted launchers retain that lease in their Unix child, and Windows terminates the child with the launcher. Cleanup failures are reported as errors. JSON preserves `managedHomesRemoved` and reports staging separately as `loginStagingHomesRemoved`. Advisory lock files remain so concurrent processes keep using the same locks. The installed executable is retained; use Homebrew or your installer directory to uninstall it separately.
 
 ## JSON interface for integrations
 

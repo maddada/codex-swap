@@ -155,7 +155,7 @@ pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
             })
             .collect::<Result<_>>()?,
     };
-    let staging = fsutil::private_tempdir(&store.root, "login-")?;
+    let staging = crate::login_staging::LoginStaging::new(&store, "login-")?;
     // Copy configuration instead of linking it: login must not update real settings.
     let config = effective.home.join("config.toml");
     if config.exists() {
