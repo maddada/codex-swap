@@ -43,6 +43,24 @@ $tempDir = Join-Path ([IO.Path]::GetTempPath()) ('codex-swap-' + [Guid]::NewGuid
 $destination = Join-Path $InstallDir 'xswap.exe'
 $previous = $null
 $staged = $null
+$installationLock = $null
+$installedFiles = @('xswap.exe', 'LICENSE', 'THIRD_PARTY_NOTICES.md')
+
+function Remove-PreviousInstallation([string]$Directory) {
+    if (Test-Path -LiteralPath (Join-Path $Directory 'INSTALLATION_INCOMPLETE')) {
+        Write-Verbose "Recovery files are retained: $Directory"
+        return
+    }
+    try {
+        # Keep the old notices until its executable can be removed.
+        $oldBinary = Join-Path $Directory 'xswap.exe'
+        if (Test-Path -LiteralPath $oldBinary) { Remove-Item -LiteralPath $oldBinary -Force }
+        Remove-Item -LiteralPath $Directory -Recurse -Force
+    } catch {
+        Write-Verbose "An earlier installation is still in use: $Directory"
+    }
+}
+
 try {
     $archivePath = Join-Path $tempDir $archiveName
     Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri "$baseUrl/$archiveName" -OutFile $archivePath
@@ -59,46 +77,97 @@ try {
     try {
         $expectedEntries = @('xswap.exe', 'LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md')
         $entries = @($zip.Entries | ForEach-Object { $_.FullName })
-        if ($entries.Count -ne 4 -or @(Compare-Object $expectedEntries $entries).Count -ne 0) {
+        if ($entries.Count -ne 4 -or @(Compare-Object $expectedEntries $entries -CaseSensitive).Count -ne 0) {
             throw 'Unexpected release archive contents.'
         }
-        $entry = $zip.GetEntry('xswap.exe')
-        if ($entry.Length -le 0) { throw 'Release executable is empty.' }
-        $downloaded = Join-Path $tempDir 'xswap.exe'
-        [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $downloaded, $false)
+        foreach ($entry in $zip.Entries) {
+            $fileType = ($entry.ExternalAttributes -shr 16) -band 0xF000
+            if (($entry.ExternalAttributes -band 0x10) -ne 0 -or $fileType -notin @(0, 0x8000) -or $entry.Length -le 0) {
+                throw 'Release archive must contain nonempty regular files.'
+            }
+            if ($entry.FullName -in $installedFiles) {
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, (Join-Path $tempDir $entry.FullName), $false)
+            }
+        }
     } finally { $zip.Dispose() }
+    $downloaded = Join-Path $tempDir 'xswap.exe'
     $reportedVersion = & $downloaded --version
     if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne "xswap $versionNumber") {
         throw 'Downloaded executable did not pass its version check.'
     }
 
     [IO.Directory]::CreateDirectory($InstallDir) | Out-Null
+    try {
+        # Keep the lock file so waiting installers always contend for the same file.
+        $installationLock = [IO.File]::Open((Join-Path $InstallDir 'INSTALLATION_LOCK'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    } catch [IO.IOException] {
+        throw "Could not acquire the installation lock in $InstallDir. Wait for any other installer to finish, then try again. $_"
+    }
     # Earlier upgrades can leave an executable that was still running at replacement time.
     foreach ($old in @(Get-ChildItem -LiteralPath $InstallDir -Filter 'xswap.*.previous.exe' -File)) {
         try { Remove-Item -LiteralPath $old.FullName -Force } catch {
             Write-Verbose "An earlier executable is still in use: $($old.Name)"
         }
     }
-    $staged = Join-Path $InstallDir ('xswap.' + [Guid]::NewGuid().ToString('N') + '.new.exe')
-    Copy-Item -LiteralPath $downloaded -Destination $staged
-    if (Test-Path -LiteralPath $destination) {
-        $previous = Join-Path $InstallDir ('xswap.' + [Guid]::NewGuid().ToString('N') + '.previous.exe')
-        # Windows permits renaming a running executable, but cannot overwrite its image.
-        # If another program denies rename, preserve the current installation and stop.
-        Move-Item -LiteralPath $destination -Destination $previous
+    foreach ($old in @(Get-ChildItem -LiteralPath $InstallDir -Filter 'xswap.*.previous' -Directory)) {
+        Remove-PreviousInstallation $old.FullName
     }
+    $transaction = [Guid]::NewGuid().ToString('N')
+    $staged = Join-Path $InstallDir "xswap.$transaction.new"
+    $previous = Join-Path $InstallDir "xswap.$transaction.previous"
+    [IO.Directory]::CreateDirectory($staged) | Out-Null
+    foreach ($name in $installedFiles) {
+        Copy-Item -LiteralPath (Join-Path $tempDir $name) -Destination (Join-Path $staged $name)
+    }
+    [IO.Directory]::CreateDirectory($previous) | Out-Null
+    $recoveryMarker = Join-Path $previous 'INSTALLATION_INCOMPLETE'
+    [IO.File]::WriteAllText($recoveryMarker, '')
+    $retired = @()
+    $installed = @()
     try {
-        Move-Item -LiteralPath $staged -Destination $destination
-        $staged = $null
+        # Save the documents before retiring any file so recovery always has the old executable's notices.
+        foreach ($name in @('LICENSE', 'THIRD_PARTY_NOTICES.md')) {
+            $current = Join-Path $InstallDir $name
+            if (Test-Path -LiteralPath $current) {
+                Copy-Item -LiteralPath $current -Destination (Join-Path $previous $name)
+            }
+        }
+        foreach ($name in $installedFiles) {
+            $current = Join-Path $InstallDir $name
+            if (Test-Path -LiteralPath $current) {
+                if ($name -eq 'xswap.exe') {
+                    # Windows permits renaming a running executable, but cannot overwrite its image.
+                    Move-Item -LiteralPath $current -Destination (Join-Path $previous $name)
+                } else {
+                    Remove-Item -LiteralPath $current -Force
+                }
+                $retired += $name
+            }
+        }
+        # Publish the executable only after both matching documents are in place.
+        foreach ($name in @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'xswap.exe')) {
+            Move-Item -LiteralPath (Join-Path $staged $name) -Destination (Join-Path $InstallDir $name)
+            $installed += $name
+        }
     } catch {
-        if ($previous) { Move-Item -LiteralPath $previous -Destination $destination }
+        $installError = $_
+        $rollbackErrors = @()
+        foreach ($name in $installed) {
+            try { Remove-Item -LiteralPath (Join-Path $InstallDir $name) -Force } catch { $rollbackErrors += $_ }
+        }
+        foreach ($name in $retired) {
+            # Restoring one file must not consume part of an incomplete recovery set.
+            try { Copy-Item -LiteralPath (Join-Path $previous $name) -Destination (Join-Path $InstallDir $name) } catch { $rollbackErrors += $_ }
+        }
+        if ($rollbackErrors.Count) {
+            throw "Installation failed: $installError. Rollback could not complete; previous files are retained in $previous. $rollbackErrors"
+        }
+        [IO.File]::Delete($recoveryMarker)
+        Remove-PreviousInstallation $previous
         throw
     }
-    if ($previous) {
-        try { Remove-Item -LiteralPath $previous -Force } catch {
-            Write-Verbose 'The previous executable is running; the next installer run will remove it.'
-        }
-    }
+    [IO.File]::Delete($recoveryMarker)
+    Remove-PreviousInstallation $previous
 
     if (-not $NoPathUpdate) {
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -114,6 +183,11 @@ try {
     Write-Host "Installed xswap $versionNumber to $destination"
     Write-Host 'Open a new terminal to use the updated PATH. Install the official Codex CLI separately.'
 } finally {
-    if ($staged -and (Test-Path -LiteralPath $staged)) { Remove-Item -LiteralPath $staged -Force }
-    Remove-Item -LiteralPath $tempDir -Recurse -Force
+    try {
+        if ($staged -and (Test-Path -LiteralPath $staged)) { Remove-Item -LiteralPath $staged -Recurse -Force }
+    } finally {
+        try { Remove-Item -LiteralPath $tempDir -Recurse -Force } finally {
+            if ($installationLock) { $installationLock.Dispose() }
+        }
+    }
 }

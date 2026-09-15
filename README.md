@@ -16,7 +16,7 @@ Add the tap and [trust the Codex Swap formula](https://docs.brew.sh/Tap-Trust), 
 brew tap maddada/tap && brew trust --formula maddada/tap/codex-swap && brew install maddada/tap/codex-swap && xswap --version
 ```
 
-Homebrew installs a prebuilt `xswap` executable. Rust and Cargo are not required. Linux releases are statically linked with musl, so they do not depend on a particular glibc version.
+Homebrew installs a prebuilt `xswap` executable, with `LICENSE` and `THIRD_PARTY_NOTICES.md` in its documentation directory. Rust and Cargo are not required. Linux releases are statically linked with musl, so they do not depend on a particular glibc version.
 
 To update:
 
@@ -34,7 +34,7 @@ Install or upgrade the native executable with one command:
 irm https://github.com/maddada/codex-swap/releases/latest/download/install.ps1 | iex
 ```
 
-The installer selects x64 or ARM64, verifies the archive against the release’s SHA-256 checksums and installs to `%LOCALAPPDATA%\Programs\codex-swap`, adding it to your user PATH. No Cargo or administrator access is needed for installation. Open a new terminal afterward. `xswap upgrade` runs the same installer for the directory containing your current executable.
+The installer selects x64 or ARM64, verifies the archive against the release’s SHA-256 checksums and installs the executable, `LICENSE` and `THIRD_PARTY_NOTICES.md` to `%LOCALAPPDATA%\Programs\codex-swap`, adding it to your user PATH. Upgrades replace the executable and notices together, restoring the previous files if replacement fails. No Cargo or administrator access is needed for installation. Open a new terminal afterward. `xswap upgrade` runs the same installer for the directory containing your current executable.
 
 Managed accounts share configuration through symbolic links. Enable **Windows Developer Mode** (or grant your account the Create symbolic links privilege) before creating or importing managed accounts or enabling shared history. Existing adopted homes can run without shared links. npm’s `codex.cmd` launcher is supported. Windows batch launchers use Rust’s batch-file handling through `cmd.exe`, which can reject special-character or multiline arguments. Use a native `codex.exe` via `--codex-bin` for those prompts.
 
@@ -60,7 +60,7 @@ Download the archive for your computer and `SHA256SUMS` from [GitHub Releases](h
 | Windows ARM64 | `aarch64-pc-windows-msvc` |
 | Windows x64 | `x86_64-pc-windows-msvc` |
 
-Verify the downloaded archive against its entry in `SHA256SUMS` using `shasum -a 256` on macOS, `sha256sum` on Linux or `Get-FileHash -Algorithm SHA256` in PowerShell. Unix archives contain `xswap`; Windows ZIP archives contain `xswap.exe`. Extract the executable into a directory on PATH. No compiler is needed.
+Verify the downloaded archive against its entry in `SHA256SUMS` using `shasum -a 256` on macOS, `sha256sum` on Linux or `Get-FileHash -Algorithm SHA256` in PowerShell. Unix archives contain `xswap`; Windows ZIP archives contain `xswap.exe`. Extract the executable into a directory on PATH and retain the accompanying `LICENSE` and `THIRD_PARTY_NOTICES.md`. Any product embedding or redistributing the executable must include these documents. No compiler is needed.
 
 ### Build from source
 
