@@ -12,6 +12,21 @@ pub struct Identity {
     pub plan: Option<String>,
 }
 
+// Match Codex's externally tagged unit variants, including {"chatgpt": null}.
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum AuthMode {
+    #[serde(rename = "apikey")]
+    ApiKey,
+    Chatgpt,
+    ChatgptAuthTokens,
+    Headers,
+    AgentIdentity,
+    PersonalAccessToken,
+    BedrockApiKey,
+    BedrockAccessKeys,
+}
+
 // Match Codex's derived serde structs, including positional arrays and defaults.
 #[derive(Deserialize)]
 struct BedrockApiKeyAuth {
@@ -52,7 +67,8 @@ pub fn credentials(home: &Path) -> Result<(Value, Identity)> {
 }
 
 fn identity_value(value: &Value) -> Result<Identity> {
-    let mode = optional_string(value, "auth_mode")?;
+    let mode = Option::<AuthMode>::deserialize(&value["auth_mode"])
+        .map_err(|_| anyhow::anyhow!("invalid Codex auth_mode (contents omitted)"))?;
     let api_key = optional_string(value, "OPENAI_API_KEY")?;
     let personal_access_token = optional_string(value, "personal_access_token")?;
     let bedrock_api_key = Option::<BedrockApiKeyAuth>::deserialize(&value["bedrock_api_key"])
@@ -62,7 +78,7 @@ fn identity_value(value: &Value) -> Result<Identity> {
             .map_err(|_| anyhow::anyhow!("invalid Codex bedrock_access_keys (contents omitted)"))?;
     // Match Codex's resolved_mode: an explicit mode wins, otherwise any stored
     // non-ChatGPT credential selects its mode, including an empty API-key string.
-    if mode.is_some_and(|m| m != "chatgpt")
+    if mode.is_some_and(|m| m != AuthMode::Chatgpt)
         || (mode.is_none()
             && (api_key.is_some()
                 || personal_access_token.is_some()

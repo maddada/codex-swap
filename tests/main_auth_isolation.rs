@@ -504,39 +504,47 @@ fn lease(fixture: &Fixture, home: &Path, exclusive: bool) -> fs::File {
 
 #[cfg(unix)]
 #[test]
-fn matching_main_uses_live_credentials_and_preserves_both_launch_leases() {
-    let fixture = Fixture::new();
-    fixture.main_source("matching");
-    write(&fixture.saved.join("auth.json"), b"{");
-    let (listed, _) = fixture.listed();
-    assert_eq!(listed["accounts"][0]["home"], json!(fixture.main));
-    assert_eq!(listed["accounts"][0]["isDefault"], true);
-    assert_eq!(listed["accounts"][0]["loginStatus"], "present");
-    for home in [&fixture.main, &fixture.saved] {
-        let held = lease(&fixture, home, true);
-        assert_failure(&fixture.run(&["run", "1", "--", "--version"]), "busy");
-        assert!(!fixture.marker.exists());
-        drop(held);
+fn explicit_chatgpt_variants_use_live_credentials_and_preserve_launch_leases() {
+    for mode in [json!("chatgpt"), json!({"chatgpt": null})] {
+        let fixture = Fixture::new();
+        let mut document = credentials("synthetic-account", "synthetic-new");
+        document["auth_mode"] = mode;
+        document["OPENAI_API_KEY"] = json!("synthetic-stale-api-key");
+        document["personal_access_token"] = json!("synthetic-stale-personal-token");
+        document["bedrock_api_key"] =
+            json!({"api_key": "synthetic-stale-bedrock", "region": "synthetic-region"});
+        document["bedrock_access_keys"] = json!({"access_key_id": "synthetic-stale-id", "secret_access_key": "synthetic-stale-secret"});
+        let original = serde_json::to_vec(&document).unwrap();
+        write(&fixture.main.join("auth.json"), &original);
+        write(&fixture.saved.join("auth.json"), b"{");
+        let (listed, _) = fixture.listed();
+        assert_eq!(listed["accounts"][0]["home"], json!(fixture.main));
+        assert_eq!(listed["accounts"][0]["isDefault"], true);
+        assert_eq!(listed["accounts"][0]["loginStatus"], "present");
+        for home in [&fixture.main, &fixture.saved] {
+            let held = lease(&fixture, home, true);
+            assert_failure(&fixture.run(&["run", "1", "--", "--version"]), "busy");
+            assert!(!fixture.marker.exists());
+            drop(held);
+        }
+        assert_success(&fixture.run(&["run", "1", "--", "--version"]));
+        assert_eq!(
+            fs::read_to_string(&fixture.marker).unwrap(),
+            fixture.main.to_str().unwrap()
+        );
+        let backup = fixture.data.join("backup.json");
+        assert_success(
+            &fixture
+                .command(&["export"])
+                .arg(&backup)
+                .args(["--account", "1"])
+                .output()
+                .unwrap(),
+        );
+        let exported: Value = serde_json::from_slice(&fs::read(backup).unwrap()).unwrap();
+        assert_eq!(exported["accounts"][0]["auth"], document);
+        assert_eq!(fs::read(fixture.main.join("auth.json")).unwrap(), original);
     }
-    assert_success(&fixture.run(&["run", "1", "--", "--version"]));
-    assert_eq!(
-        fs::read_to_string(&fixture.marker).unwrap(),
-        fixture.main.to_str().unwrap()
-    );
-    let backup = fixture.data.join("backup.json");
-    assert_success(
-        &fixture
-            .command(&["export"])
-            .arg(&backup)
-            .args(["--account", "1"])
-            .output()
-            .unwrap(),
-    );
-    let exported: Value = serde_json::from_slice(&fs::read(backup).unwrap()).unwrap();
-    assert_eq!(
-        exported["accounts"][0]["auth"],
-        credentials("synthetic-account", "synthetic-new")
-    );
 }
 
 #[cfg(unix)]

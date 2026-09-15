@@ -75,41 +75,63 @@ fn inferred_non_chatgpt_modes_reject_complete_chatgpt_tokens() {
 #[test]
 fn explicit_chatgpt_takes_precedence_without_rewriting_credentials() {
     let home = tempfile::tempdir().unwrap();
-    for (api_key, access_keys) in [
-        (
-            json!({"api_key": "", "region": ""}),
-            json!({"access_key_id": "", "secret_access_key": "", "session_token": null}),
-        ),
-        (
-            json!(["synthetic-api", "synthetic-region"]),
-            json!(["synthetic-id", "synthetic-secret"]),
-        ),
-        (
-            json!(["synthetic-api", "synthetic-region"]),
-            json!(["synthetic-id", "synthetic-secret", null]),
-        ),
-        (
-            json!(["synthetic-api", "synthetic-region"]),
-            json!(["synthetic-id", "synthetic-secret", "synthetic-session"]),
-        ),
+    for mode in [json!("chatgpt"), json!({"chatgpt": null})] {
+        for (api_key, access_keys) in [
+            (
+                json!({"api_key": "", "region": ""}),
+                json!({"access_key_id": "", "secret_access_key": "", "session_token": null}),
+            ),
+            (
+                json!(["synthetic-api", "synthetic-region"]),
+                json!(["synthetic-id", "synthetic-secret"]),
+            ),
+            (
+                json!(["synthetic-api", "synthetic-region"]),
+                json!(["synthetic-id", "synthetic-secret", null]),
+            ),
+            (
+                json!(["synthetic-api", "synthetic-region"]),
+                json!(["synthetic-id", "synthetic-secret", "synthetic-session"]),
+            ),
+        ] {
+            let document = json!({
+                "auth_mode": mode,
+                "OPENAI_API_KEY": "sk-synthetic",
+                "personal_access_token": "",
+                "bedrock_api_key": api_key,
+                "bedrock_access_keys": access_keys,
+                "tokens": chatgpt_auth()["tokens"]
+            });
+            fsutil_write(home.path(), &document);
+            let original = std::fs::read(home.path().join("auth.json")).unwrap();
+            let (saved, identity) = credentials(home.path()).unwrap();
+            assert_eq!(saved, document);
+            assert!(verify(home.path(), &Some(identity)).is_ok());
+            assert_eq!(
+                std::fs::read(home.path().join("auth.json")).unwrap(),
+                original
+            );
+        }
+    }
+}
+
+#[test]
+fn explicit_non_chatgpt_unit_variants_reject_complete_chatgpt_tokens() {
+    for name in [
+        "apikey",
+        "personalAccessToken",
+        "bedrockApiKey",
+        "bedrockAccessKeys",
+        "chatgptAuthTokens",
+        "headers",
+        "agentIdentity",
     ] {
-        let document = json!({
-            "auth_mode": "chatgpt",
-            "OPENAI_API_KEY": "sk-synthetic",
-            "personal_access_token": "",
-            "bedrock_api_key": api_key,
-            "bedrock_access_keys": access_keys,
-            "tokens": chatgpt_auth()["tokens"]
-        });
-        fsutil_write(home.path(), &document);
-        let original = std::fs::read(home.path().join("auth.json")).unwrap();
-        let (saved, identity) = credentials(home.path()).unwrap();
-        assert_eq!(saved, document);
-        assert!(verify(home.path(), &Some(identity)).is_ok());
-        assert_eq!(
-            std::fs::read(home.path().join("auth.json")).unwrap(),
-            original
-        );
+        for mode in [json!(name), json!({name: null})] {
+            let mut document = chatgpt_auth();
+            document["auth_mode"] = mode;
+            let error = identity_value(&document).err().unwrap();
+            assert!(error.to_string().contains("another authentication mode"));
+        }
     }
 }
 
@@ -119,22 +141,29 @@ fn malformed_modes_and_auth_material_fail_all_shared_parser_entrypoints() {
     let expected = Some(identity_value(&chatgpt_auth()).unwrap());
     let mut rejected = Vec::new();
     for mode in [
-        json!("apikey"),
-        json!("personalAccessToken"),
-        json!("bedrockApiKey"),
-        json!("bedrockAccessKeys"),
-        json!("chatgptAuthTokens"),
-        json!("headers"),
-        json!("agentIdentity"),
         json!("unknown"),
+        json!("synthetic-secret-that-must-not-appear"),
         json!(""),
         json!(false),
         json!(7),
         json!([]),
+        json!(["chatgpt"]),
+        json!(["chatgpt", null]),
         json!({}),
+        json!({"chatgpt": null, "apikey": null}),
+        json!({"chatgpt": "synthetic-secret-that-must-not-appear"}),
+        json!({"chatgpt": false}),
+        json!({"chatgpt": []}),
+        json!({"chatgpt": {}}),
+        json!({"apikey": "synthetic-secret-that-must-not-appear"}),
+        json!({"synthetic-secret-that-must-not-appear": null}),
     ] {
         let mut document = chatgpt_auth();
         document["auth_mode"] = mode;
+        assert_eq!(
+            format!("{:#}", identity_value(&document).err().unwrap()),
+            "invalid Codex auth_mode (contents omitted)"
+        );
         rejected.push(document);
     }
     for (field, malformed) in [
