@@ -198,6 +198,39 @@ fn leading_hyphen_aliases_fail_before_saved_files_change() {
 }
 
 #[test]
+fn snapshot_rejects_aliases_before_migrating_the_original_home() {
+    let fixture = Fixture::new("work-team");
+    let path = fixture.data.join("accounts.json");
+    let mut registry: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    registry["accounts"][0]["home"] = json!(fixture.main);
+    registry["accounts"][0]["identity"] = json!({
+        "accountId": "workspace-9", "email": "user9@example.invalid", "plan": null
+    });
+    registry["originalAccount"] = Value::Null;
+    write_json(&path, &registry);
+    let before = fixture.saved_files();
+
+    for alias in ["-work", "--work", "-", "work team", "PERSONAL"] {
+        let argument = format!("--alias={alias}");
+        let output = fixture.run(&["add", &argument]);
+        assert_eq!(output.status.code(), Some(1));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(if alias == "PERSONAL" {
+            "alias is already in use"
+        } else {
+            "alias must be"
+        }));
+        assert_eq!(fixture.saved_files(), before);
+        assert!(!fixture.data.join("accounts").exists());
+        assert!(
+            fs::read_dir(&fixture.main)
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() == "auth.json")
+        );
+    }
+}
+
+#[test]
 fn legacy_aliases_remain_readable_and_repairable_by_slot() {
     for alias in ["-work", "--work", "-"] {
         let fixture = Fixture::new(alias);

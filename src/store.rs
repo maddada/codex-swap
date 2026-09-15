@@ -293,6 +293,10 @@ impl Store {
     }
 
     pub fn validate_alias(&self, alias: &Option<String>) -> Result<()> {
+        self.validate_alias_except(alias, None)
+    }
+
+    pub fn validate_alias_except(&self, alias: &Option<String>, except: Option<u32>) -> Result<()> {
         if let Some(alias) = alias {
             if alias.is_empty()
                 || alias.len() > 64
@@ -308,9 +312,10 @@ impl Store {
                 );
             }
             if self.data.accounts.iter().any(|a| {
-                a.alias
-                    .as_deref()
-                    .is_some_and(|s| s.eq_ignore_ascii_case(alias))
+                Some(a.number) != except
+                    && a.alias
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case(alias))
             }) {
                 bail!("alias is already in use");
             }

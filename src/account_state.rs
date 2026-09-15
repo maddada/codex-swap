@@ -256,14 +256,7 @@ fn capture(
     }
     let account = if let Some(mut account) = existing {
         if let Some(alias) = alias {
-            store
-                .data
-                .accounts
-                .iter_mut()
-                .find(|a| a.number == account.number)
-                .unwrap()
-                .alias = None;
-            store.validate_alias(&Some(alias.clone()))?;
+            store.validate_alias_except(&Some(alias.clone()), Some(account.number))?;
             account.alias = Some(alias);
         }
         if !account.managed {
@@ -312,6 +305,12 @@ fn capture(
     Ok(account)
 }
 
+fn validate_snapshot_alias(store: &Store, source: &Path, alias: &Option<String>) -> Result<()> {
+    let identity = auth::require(source)?;
+    let existing = store.account_for_identity(&identity)?.map(|a| a.number);
+    store.validate_alias_except(alias, existing)
+}
+
 /// CDXC:AgentProviders 2026-09-06 DECISION:
 /// The user requested claude-swap registration and global switching: add snapshots the current login, and switch activates credentials for bare Codex launches.
 /// Re-registering the same identity refreshes its existing slot and preserves its alias unless an alias is supplied.
@@ -325,6 +324,7 @@ pub fn snapshot(
     let mut store = Store::open(cli)?;
     let source = fsutil::absolute(source.unwrap_or(&store.data.main_home))?;
     launch::validate_file_store(&source)?;
+    validate_snapshot_alias(&store, &source, &alias)?;
     crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
     let mut homes: std::collections::BTreeSet<_> =
         store.data.accounts.iter().map(|a| a.home.clone()).collect();
@@ -451,3 +451,98 @@ pub fn select_global(cli: &Cli, identifier: Option<&str>) -> Result<()> {
 #[cfg(test)]
 #[path = "identity_tests.rs"]
 mod identity_tests;
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde_json::json;
+
+    #[test]
+    fn snapshot_alias_preflight_preserves_own_slot_refreshes() {
+        let directory = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            data_dir: Some(directory.path().join("data")),
+            codex_home: Some(directory.path().join("main")),
+            codex_bin: None,
+            command: crate::cli::Action::List(crate::cli::Output { json: false }),
+        };
+        let mut store = Store::open(&cli).unwrap();
+        let source = store.data.main_home.clone();
+        let saved_home = store.root.join("saved-home");
+        fsutil::private_dir(&source).unwrap();
+        fsutil::private_dir(&saved_home).unwrap();
+        let payload = URL_SAFE_NO_PAD.encode(
+            r#"{"email":"user@example.invalid","https://api.openai.com/auth":{"chatgpt_user_id":"synthetic-user-1"}}"#,
+        );
+        let document = json!({"auth_mode": "chatgpt", "tokens": {
+            "account_id": "synthetic-workspace", "access_token": "synthetic-refreshed",
+            "refresh_token": "synthetic-refresh", "id_token": format!("e30.{payload}.synthetic")
+        }});
+        fsutil::atomic_json(&source.join("auth.json"), &document).unwrap();
+        let mut previous = document.clone();
+        previous["tokens"]["access_token"] = json!("synthetic-previous");
+        fsutil::atomic_json(&saved_home.join("auth.json"), &previous).unwrap();
+        store.data.accounts.push(Account {
+            number: 1,
+            alias: Some("work-team".into()),
+            home: saved_home.clone(),
+            managed: true,
+            share_history: false,
+            identity: Some(auth::require(&source).unwrap()),
+            enabled: true,
+        });
+        store.data.accounts.push(Account {
+            number: 2,
+            alias: Some("personal".into()),
+            home: store.root.join("other-home"),
+            managed: true,
+            share_history: false,
+            identity: None,
+            enabled: true,
+        });
+        store.data.next_number = 3;
+        for alias in [None, Some("WORK-TEAM"), Some("work.team"), Some("_work")] {
+            validate_snapshot_alias(&store, &source, &alias.map(String::from)).unwrap();
+        }
+        assert!(validate_snapshot_alias(&store, &source, &Some("-work".into())).is_err());
+        assert!(validate_snapshot_alias(&store, &source, &Some("PERSONAL".into())).is_err());
+
+        let mut transaction = Transaction::new();
+        let account = capture(
+            &mut store,
+            &mut transaction,
+            &source,
+            Some("WORK-TEAM".into()),
+            None,
+            false,
+        )
+        .unwrap();
+        transaction.finish(Ok(())).unwrap();
+        assert_eq!(account.number, 1);
+        assert_eq!(account.alias.as_deref(), Some("WORK-TEAM"));
+        assert_eq!(account.home, saved_home);
+        assert_eq!(store.data.accounts.len(), 2);
+        assert_eq!(store.data.next_number, 3);
+        assert_eq!(auth::credentials(&saved_home).unwrap().0, document);
+        store.data.accounts[0].identity.as_mut().unwrap().user_id = Some("synthetic-user-2".into());
+        assert!(
+            validate_snapshot_alias(&store, &source, &Some("WORK-TEAM".into()))
+                .unwrap_err()
+                .to_string()
+                .contains("alias is already in use")
+        );
+        validate_snapshot_alias(&store, &source, &Some("another-team".into())).unwrap();
+
+        store.data.accounts[0].identity.as_mut().unwrap().user_id = None;
+        store.data.accounts[1].identity = store.data.accounts[0].identity.clone();
+        for alias in [None, Some("WORK-TEAM"), Some("another-team")] {
+            assert!(
+                validate_snapshot_alias(&store, &source, &alias.map(String::from))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ambiguous saved account identity")
+            );
+        }
+    }
+}
