@@ -194,10 +194,7 @@ pub fn add(cli: &Cli, args: &Add) -> Result<()> {
     let main_home = store.data.main_home.clone();
     let binary = store.codex_bin(cli);
     let staging = fsutil::private_tempdir(&store.root, "new-login-")?;
-    let config = main_home.join("config.toml");
-    if config.exists() {
-        std::fs::copy(config, staging.path().join("config.toml"))?;
-    }
+    crate::config_assets::copy_for_login(&main_home, None, staging.path())?;
     drop(store);
     let (credentials, identity) = launch::login_new_profile(
         &binary,

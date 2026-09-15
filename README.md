@@ -234,6 +234,14 @@ Export reads the latest main-home credentials for the globally active account an
 
 New managed homes share existing main-home settings and customizations: `config.toml`, named `*.config.toml` profiles, `AGENTS.md`, `AGENTS.override.md`, `skills`, `hooks`, `hooks.json`, `rules` and `agents`. These are symlinks, so edits are shared. Adopted homes keep their own configuration.
 
+Managed launches also preserve relative `model_instructions_file`, `model_catalog_json`, `experimental_compact_prompt_file` and agent role `config_file` references from the main config and selected profile. Referenced files are linked within the account home; agent role directories are linked so nested references retain the role file's base. Put relative role files in a subdirectory such as `agents/`, or use an absolute path. Active references that require writing outside the managed home, root-level relative role files, account runtime paths and conflicting destination files are refused with guidance. Home references overridden by enabled project config or CLI settings are left to Codex's higher layer. Runtime aliases are checked against the account filesystem, including Codex's default `log` directory. Missing assets keep a link to their source; Codex decides whether the effective settings require them. Source settings remain editable through the existing shared config links.
+
+Asset linking inspects user, selected-profile, project and CLI settings. If a system config, legacy managed config or macOS managed preference contains file paths, runtime locations, project-root markers or trust entries, relative user assets are conservatively refused because those controlled layers can change the projection. Use absolute file references in the shared config or launch Codex directly. xswap does not reproduce Codex's full managed-policy loader.
+
+Help/version requests and `exec --ignore-user-config` skip user-asset inspection, as Codex does; arguments after the forwarded `--` remain literal. On case-insensitive filesystems, new links with non-ASCII relative path components, or non-ASCII runtime locations, are conservatively refused because native Unicode aliases can overlap private account state. Use absolute asset references for those paths. Safe Unicode asset paths remain supported on case-sensitive filesystems.
+
+New login and reauthentication copy configs independently and resolve these file references against their original home. Native login can write its staging config without changing source settings, credentials or conversations. Adopted homes retain their own configuration base.
+
 `--share-history` enables sharing with the main Codex home for:
 
 | Item | Purpose |
