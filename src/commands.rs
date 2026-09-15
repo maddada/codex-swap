@@ -25,8 +25,8 @@ struct AccountView {
     enabled: bool,
 }
 
-fn view(store: &Store, account: &Account) -> Result<AccountView> {
-    let effective = store.effective_account(account)?;
+fn view(store: &Store, account: &Account, live: Option<&Account>) -> AccountView {
+    let effective = store.effective_account(account, live);
     let (identity, login_status) = match auth::identity(&effective.home) {
         Ok(Some(live)) => {
             if account
@@ -42,7 +42,7 @@ fn view(store: &Store, account: &Account) -> Result<AccountView> {
         Ok(None) => (account.identity.clone(), "login_required"),
         Err(_) => (account.identity.clone(), "invalid_credentials"),
     };
-    Ok(AccountView {
+    AccountView {
         number: account.number,
         alias: account.alias.clone(),
         email: identity.as_ref().and_then(|i| i.email.clone()),
@@ -52,14 +52,10 @@ fn view(store: &Store, account: &Account) -> Result<AccountView> {
         saved_home: account.home.clone(),
         managed: effective.managed,
         share_history: effective.share_history,
-        is_default: store
-            .live_account()
-            .ok()
-            .flatten()
-            .is_some_and(|active| active.number == account.number),
+        is_default: live.is_some_and(|active| active.number == account.number),
         login_status,
         enabled: account.enabled,
-    })
+    }
 }
 
 fn emit(value: &impl Serialize) -> Result<()> {
@@ -87,12 +83,13 @@ fn human(account: &AccountView) {
 
 pub fn list(cli: &Cli, output: &Output) -> Result<()> {
     let store = Store::open(cli)?;
+    let live = store.observe_live_account();
     let accounts: Vec<_> = store
         .data
         .accounts
         .iter()
-        .map(|a| view(&store, a))
-        .collect::<Result<_>>()?;
+        .map(|a| view(&store, a, live.as_ref()))
+        .collect();
     if output.json {
         emit(&json!({"schemaVersion": 1, "accounts": accounts}))?;
     } else if accounts.is_empty() {
@@ -108,7 +105,9 @@ pub fn list(cli: &Cli, output: &Output) -> Result<()> {
 pub fn status(cli: &Cli, output: &Output) -> Result<()> {
     let store = Store::open(cli)?;
     let selected = store.live_account()?;
-    let active = selected.as_ref().map(|a| view(&store, a)).transpose()?;
+    let active = selected
+        .as_ref()
+        .map(|a| view(&store, a, selected.as_ref()));
     if output.json {
         emit(
             &json!({"schemaVersion": 1, "active": active, "defaultHome": store.data.main_home,
@@ -273,7 +272,7 @@ pub fn set_enabled(cli: &Cli, identifier: &str, enabled: bool, output: &Output) 
 }
 
 fn account_result(store: &Store, account: &Account, output: &Output) -> Result<()> {
-    let account = view(store, account)?;
+    let account = view(store, account, store.observe_live_account().as_ref());
     if output.json {
         emit(&json!({"schemaVersion": 1, "account": account}))
     } else {

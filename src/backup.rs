@@ -47,14 +47,11 @@ pub fn export(cli: &Cli, file: &Path, identifier: Option<&str>, output: &Output)
         Some(identifier) => vec![store.resolve(identifier)?],
         None => store.data.accounts.clone(),
     };
-    let sources = accounts
+    let live = store.observe_live_account();
+    let sources: Vec<_> = accounts
         .iter()
-        .map(|account| {
-            store
-                .effective_account(account)
-                .map(|effective| effective.home)
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .map(|account| store.effective_account(account, live.as_ref()).home)
+        .collect();
     if accounts.is_empty() {
         bail!("no accounts to export");
     }

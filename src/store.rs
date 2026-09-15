@@ -239,17 +239,28 @@ impl Store {
             .cloned())
     }
 
-    pub fn effective_account(&self, account: &Account) -> Result<Account> {
+    /// Observing an unrelated main login must not prevent using a saved home.
+    /// Global credential replacement continues to use strict `live_account()`.
+    pub fn observe_live_account(&self) -> Option<Account> {
+        match self.live_account() {
+            Ok(account) => account,
+            Err(_) => {
+                eprintln!(
+                    "xswap: the main Codex login could not be read as a ChatGPT login; saved accounts use their own homes. Check the main login with xswap status."
+                );
+                None
+            }
+        }
+    }
+
+    pub fn effective_account(&self, account: &Account, live: Option<&Account>) -> Account {
         let mut effective = account.clone();
-        if self
-            .live_account()?
-            .is_some_and(|live| live.number == account.number)
-        {
+        if live.is_some_and(|live| live.number == account.number) {
             effective.home = self.data.main_home.clone();
             effective.managed = false;
             effective.share_history = true;
         }
-        Ok(effective)
+        effective
     }
 
     pub fn validate_alias(&self, alias: &Option<String>) -> Result<()> {
