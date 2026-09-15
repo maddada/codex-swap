@@ -450,4 +450,4 @@ pub fn select_global(cli: &Cli, identifier: Option<&str>) -> Result<()> {
 
 #[cfg(test)]
 #[path = "identity_tests.rs"]
-mod tests;
+mod identity_tests;
