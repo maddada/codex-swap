@@ -12,6 +12,40 @@ pub struct Identity {
     pub plan: Option<String>,
 }
 
+// Match Codex's externally tagged unit variants, including {"chatgpt": null}.
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum AuthMode {
+    #[serde(rename = "apikey")]
+    ApiKey,
+    Chatgpt,
+    ChatgptAuthTokens,
+    Headers,
+    AgentIdentity,
+    PersonalAccessToken,
+    BedrockApiKey,
+    BedrockAccessKeys,
+}
+
+// Match Codex's derived serde structs, including positional arrays and defaults.
+#[derive(Deserialize)]
+struct BedrockApiKeyAuth {
+    #[serde(rename = "api_key")]
+    _api_key: String,
+    #[serde(rename = "region")]
+    _region: String,
+}
+
+#[derive(Deserialize)]
+struct BedrockAccessKeysAuth {
+    #[serde(rename = "access_key_id")]
+    _access_key_id: String,
+    #[serde(rename = "secret_access_key")]
+    _secret_access_key: String,
+    #[serde(default, rename = "session_token")]
+    _session_token: Option<String>,
+}
+
 /// Identity decoding follows swapdex's Codex adapter; see THIRD_PARTY_NOTICES.md.
 /// Claims label the local account only. They are not an authentication verification.
 pub fn identity(home: &Path) -> Result<Option<Identity>> {
@@ -33,12 +67,27 @@ pub fn credentials(home: &Path) -> Result<(Value, Identity)> {
 }
 
 fn identity_value(value: &Value) -> Result<Identity> {
-    if value
-        .get("auth_mode")
-        .and_then(Value::as_str)
-        .is_some_and(|m| m != "chatgpt")
+    let mode = Option::<AuthMode>::deserialize(&value["auth_mode"])
+        .map_err(|_| anyhow::anyhow!("invalid Codex auth_mode (contents omitted)"))?;
+    let api_key = optional_string(value, "OPENAI_API_KEY")?;
+    let personal_access_token = optional_string(value, "personal_access_token")?;
+    let bedrock_api_key = Option::<BedrockApiKeyAuth>::deserialize(&value["bedrock_api_key"])
+        .map_err(|_| anyhow::anyhow!("invalid Codex bedrock_api_key (contents omitted)"))?;
+    let bedrock_access_keys =
+        Option::<BedrockAccessKeysAuth>::deserialize(&value["bedrock_access_keys"])
+            .map_err(|_| anyhow::anyhow!("invalid Codex bedrock_access_keys (contents omitted)"))?;
+    // Match Codex's resolved_mode: an explicit mode wins, otherwise any stored
+    // non-ChatGPT credential selects its mode, including an empty API-key string.
+    if mode.is_some_and(|m| m != AuthMode::Chatgpt)
+        || (mode.is_none()
+            && (api_key.is_some()
+                || personal_access_token.is_some()
+                || bedrock_api_key.is_some()
+                || bedrock_access_keys.is_some()))
     {
-        bail!("xswap currently manages ChatGPT logins; this home uses another authentication mode");
+        bail!(
+            "xswap currently manages ChatGPT logins; this home uses another authentication mode. Run xswap login <account> and sign in with ChatGPT"
+        );
     }
     let tokens = &value["tokens"];
     let account_id = tokens["account_id"]
@@ -69,6 +118,14 @@ fn identity_value(value: &Value) -> Result<Identity> {
     })
 }
 
+fn optional_string<'a>(value: &'a Value, key: &str) -> Result<Option<&'a str>> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => bail!("invalid Codex {key}; expected a string or null (contents omitted)"),
+    }
+}
+
 pub fn require(home: &Path) -> Result<Identity> {
     identity(home)?.context(
         "no file-based ChatGPT login here; use xswap add --login to sign in to an isolated account",
@@ -87,3 +144,6 @@ pub fn verify(home: &Path, expected: &Option<Identity>) -> Result<Identity> {
     }
     Ok(live)
 }
+
+#[cfg(test)]
+mod tests;
