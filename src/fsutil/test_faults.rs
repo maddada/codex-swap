@@ -11,6 +11,8 @@ pub(crate) enum Point {
     BeforeCommit,
     AfterCommit,
     RollbackRemove,
+    #[cfg(unix)]
+    RollbackSync,
 }
 
 struct Faults {

@@ -322,7 +322,7 @@ fn rollback_failure_retains_every_new_home_and_reports_recovery_paths() {
             for rollback in if existing {
                 vec![Point::BeforeCommit, Point::AfterCommit]
             } else {
-                vec![Point::RollbackRemove]
+                vec![Point::RollbackRemove, Point::RollbackSync]
             } {
                 let mut fixture = Fixture::new(existing);
                 let faults =
@@ -330,6 +330,14 @@ fn rollback_failure_retains_every_new_home_and_reports_recovery_paths() {
                 let error = format!("{:#}", operation.run(&mut fixture).unwrap_err());
                 assert!(error.contains("account rollback also failed"));
                 let commits = faults.commits();
+                if rollback == Point::RollbackSync {
+                    assert!(
+                        !fixture.registry().exists(),
+                        "registry was actually unlinked"
+                    );
+                    assert_eq!(commits.len(), 1);
+                    assert!(error.contains("injected RollbackSync failure"));
+                }
                 let registry = serde_json::from_slice(&commits[0]).unwrap();
                 for home in operation.assert_committed(&fixture, &registry) {
                     assert_credentials(&home);

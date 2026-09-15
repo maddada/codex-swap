@@ -7,7 +7,20 @@ fn new_account_transaction_handles_commit_failures_on_every_platform() {
         store::{Account, Store},
     };
     for existing in [false, true] {
-        for rollback_failure in [false, true] {
+        let mut rollbacks = vec![
+            None,
+            Some(if existing {
+                Point::BeforeCommit
+            } else {
+                Point::RollbackRemove
+            }),
+        ];
+        #[cfg(unix)]
+        if !existing {
+            rollbacks.push(Some(Point::RollbackSync));
+        }
+        for rollback in rollbacks.drain(..) {
+            let rollback_failure = rollback.is_some();
             let temporary = tempfile::tempdir().unwrap();
             let cli = Cli {
                 data_dir: Some(temporary.path().join("store")),
@@ -40,18 +53,9 @@ fn new_account_transaction_handles_commit_failures_on_every_platform() {
                 identity: None,
                 enabled: true,
             });
-            let points = if rollback_failure {
-                vec![
-                    Point::AfterCommit,
-                    if existing {
-                        Point::BeforeCommit
-                    } else {
-                        Point::RollbackRemove
-                    },
-                ]
-            } else {
-                vec![Point::AfterCommit]
-            };
+            let points: Vec<_> = std::iter::once(Point::AfterCommit)
+                .chain(rollback)
+                .collect();
             let faults = inject(&registry, &points);
             let error = format!(
                 "{:#}",
@@ -59,6 +63,11 @@ fn new_account_transaction_handles_commit_failures_on_every_platform() {
             );
             assert!(!faults.commits().is_empty());
             assert_eq!(home.join("auth.json").exists(), rollback_failure);
+            #[cfg(unix)]
+            if rollback == Some(Point::RollbackSync) {
+                assert!(!registry.exists(), "registry was actually unlinked");
+                assert!(error.contains("injected RollbackSync failure"));
+            }
             if rollback_failure {
                 assert!(error.contains(&home.display().to_string()));
             } else {

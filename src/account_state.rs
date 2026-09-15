@@ -42,7 +42,23 @@ impl Transaction {
                 #[cfg(test)]
                 fsutil::test_faults::check(path, fsutil::test_faults::Point::RollbackRemove)?;
                 match std::fs::remove_file(path) {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        #[cfg(unix)]
+                        {
+                            // Make removal durable before staged homes can be deleted.
+                            #[cfg(test)]
+                            fsutil::test_faults::check(
+                                path,
+                                fsutil::test_faults::Point::RollbackSync,
+                            )?;
+                            let parent = path
+                                .parent()
+                                .filter(|p| !p.as_os_str().is_empty())
+                                .unwrap_or(Path::new("."));
+                            std::fs::File::open(parent)?.sync_all()?;
+                        }
+                        Ok(())
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                     Err(error) => Err(error.into()),
                 }
