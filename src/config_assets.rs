@@ -103,6 +103,11 @@ fn runtime_path(path: &Path, home: &Path, roots: &[PathBuf], insensitive: bool) 
         })
 }
 
+fn unresolved_runtime_alias(path: &Path) -> bool {
+    path.ancestors()
+        .any(|ancestor| fs::read_link(ancestor).is_ok() && !ancestor.exists())
+}
+
 fn configs(home: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     if home.join("config.toml").exists() {
@@ -241,6 +246,12 @@ impl SharedAssets<'_> {
             }
             let mut runtime_roots = self.runtime_roots.clone();
             for root in &self.runtime_roots {
+                if unresolved_runtime_alias(root) {
+                    bail!(
+                        "cannot safely link {field} reference {reference:?}: account runtime path {} has an unresolved symlink alias; use an absolute asset reference or resolve the runtime alias before creating shared asset links",
+                        root.display()
+                    );
+                }
                 let physical = fsutil::absolute(root)?;
                 runtime_roots.push(fsutil::resolve_config_path(
                     &physical,

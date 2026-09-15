@@ -87,6 +87,56 @@ fn runtime_roots_also_follow_existing_parent_aliases() {
 }
 
 #[test]
+fn dangling_runtime_aliases_cannot_be_activated_by_new_asset_links() {
+    for setting in ["log_dir", "sqlite_home"] {
+        for runtime in ["runtime-alias", "runtime-alias/nested"] {
+            let fixture = Fixture::new();
+            symlink("private-runtime", fixture.home.join("runtime-alias")).unwrap();
+            fixture.write(
+                "private-runtime/codex-login.log",
+                "shared instructions sentinel\n",
+            );
+            fixture.write("config.toml", &format!("{setting} = {runtime:?}\nmodel_instructions_file = 'private-runtime/codex-login.log'\n"));
+            let error = share(&fixture.main, &fixture.home, &[])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("unresolved symlink alias"),
+                "{setting} {runtime}: {error}"
+            );
+            assert!(error.contains("absolute asset reference"));
+            assert!(fs::symlink_metadata(fixture.home.join("private-runtime")).is_err());
+            assert_eq!(
+                fs::read_link(fixture.home.join("runtime-alias")).unwrap(),
+                Path::new("private-runtime")
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.main.join("private-runtime/codex-login.log")).unwrap(),
+                "shared instructions sentinel\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn unresolved_runtime_alias_does_not_block_canonical_source_reuse() {
+    let fixture = Fixture::new();
+    fixture.write("alias/instructions.md", "shared instructions sentinel\n");
+    symlink(fixture.main.join("alias"), fixture.home.join("alias")).unwrap();
+    symlink("private-runtime", fixture.home.join("runtime-alias")).unwrap();
+    fixture.write(
+        "config.toml",
+        "log_dir = 'runtime-alias'\nmodel_instructions_file = 'alias/instructions.md'\n",
+    );
+    share(&fixture.main, &fixture.home, &[]).unwrap();
+    assert_eq!(
+        fs::read_link(fixture.home.join("alias")).unwrap(),
+        fixture.main.join("alias")
+    );
+    assert!(fs::symlink_metadata(fixture.home.join("private-runtime")).is_err());
+}
+
+#[test]
 fn safe_parent_aliases_and_exact_source_role_directories_are_reused() {
     let fixture = Fixture::new();
     fsutil::private_dir(&fixture.home.join("assets")).unwrap();
