@@ -236,8 +236,7 @@ pub fn add(cli: &Cli, args: &Add) -> Result<()> {
     };
     store.data.next_number = store.data.next_number.max(next);
     store.data.accounts.push(account.clone());
-    store.save()?;
-    let _ = dir.keep();
+    crate::account_state::commit_new_accounts(&store, vec![dir])?;
     eprintln!("Account login saved.");
     account_result(&store, &account, &args.output)
 }
