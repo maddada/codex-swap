@@ -495,7 +495,14 @@ pub fn copy_for_login(home: &Path, shared_from: Option<&Path>, staging: &Path) -
         visit_paths(&mut config, &mut |_, value, _| {
             if let Some(reference) = value.as_str() {
                 let resolved = fsutil::resolve_config_path(Path::new(reference), base, &user_home);
-                *value = toml::Value::String(resolved.to_string_lossy().into_owned());
+                *value = toml::Value::String(
+                    resolved
+                        .to_str()
+                        .context(
+                            "resolved Codex asset path is not UTF-8; use a UTF-8 path or alias",
+                        )?
+                        .to_owned(),
+                );
             }
             Ok(())
         })?;

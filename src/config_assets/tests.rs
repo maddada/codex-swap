@@ -128,6 +128,49 @@ fn adopted_login_keeps_its_own_base_and_absolute_and_home_paths() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn login_copy_never_retargets_an_unrepresentable_source_path() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new();
+    let source = fixture
+        .root
+        .path()
+        .join(OsString::from_vec(b"config-\xff".to_vec()));
+    let replacement = PathBuf::from(source.to_string_lossy().into_owned());
+    let config = "model_instructions_file = 'instructions.md'\n";
+    for (home, instructions) in [
+        (&source, "intended instructions"),
+        (&replacement, "different instructions"),
+    ] {
+        fsutil::private_dir(home).unwrap();
+        fs::write(home.join("config.toml"), config).unwrap();
+        fs::write(home.join("instructions.md"), instructions).unwrap();
+    }
+    let stage = fixture.stage();
+    let error = copy_for_login(&source, None, stage.path()).unwrap_err();
+    assert!(format!("{error:#}").contains("not UTF-8"));
+    assert!(!stage.path().join("config.toml").exists());
+    assert_eq!(
+        fs::read_to_string(source.join("config.toml")).unwrap(),
+        config
+    );
+    assert_eq!(
+        fs::read_to_string(replacement.join("instructions.md")).unwrap(),
+        "different instructions"
+    );
+
+    let unicode_home = fixture.root.path().join("config-λ");
+    fsutil::private_dir(&unicode_home).unwrap();
+    fs::write(unicode_home.join("config.toml"), config).unwrap();
+    copy_for_login(&unicode_home, None, stage.path()).unwrap();
+    assert_eq!(
+        value(&stage.path().join("config.toml"), "model_instructions_file"),
+        unicode_home.join("instructions.md")
+    );
+}
+
 #[test]
 fn login_does_not_require_an_existing_main_home_or_clobber_config() {
     let fixture = Fixture::new();
