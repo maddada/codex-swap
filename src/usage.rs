@@ -59,14 +59,20 @@ fn reports(
                 Ok(usage) => (Some(identity), Some(usage), None),
                 Err(error) => (Some(identity), None, Some(format!("{error:#}"))),
             },
-            Err(error) => (target.identity, None, Some(format!("{error:#}"))),
+            Err(error) => (
+                target
+                    .identity
+                    .clone()
+                    .filter(|identity| identity.has_owner()),
+                None,
+                Some(format!("{error:#}")),
+            ),
         };
+        let labels = identity.as_ref().or(target.identity.as_ref());
         reports.push(AccountUsage {
             number: target.number,
             alias: target.alias,
-            email: identity
-                .as_ref()
-                .and_then(|identity| identity.email.clone()),
+            email: labels.and_then(|identity| identity.email.clone()),
             account_id: identity.map(|identity| identity.account_id),
             fetched_at: usage_model::timestamp(fetched),
             usage,
@@ -232,9 +238,21 @@ mod tests {
             user_id: Some("user-1".into()),
             email: Some("first@example.test".into()),
             plan: None,
+            legacy_hint_unusable: false,
         };
+        let mut ownerless = identity.clone();
+        ownerless.user_id = None;
+        ownerless.email = None;
+        let mut unresolved = ownerless.clone();
+        unresolved.email = Some("stored-label@example.test".into());
+        unresolved.legacy_hint_unusable = true;
         let mut targets = Vec::new();
-        for (number, owner) in [(1, Some(identity.clone())), (2, None)] {
+        for (number, owner) in [
+            (1, Some(identity.clone())),
+            (2, None),
+            (3, Some(ownerless)),
+            (4, Some(unresolved)),
+        ] {
             targets.push(
                 Account {
                     number,
@@ -266,24 +284,30 @@ mod tests {
             ))
         });
         assert_eq!(fetched, vec![Some(1), None]);
-        assert_eq!(reports.len(), 3);
+        assert_eq!(reports.len(), 5);
         assert!(reports[0].error.is_none());
         assert_eq!(
             reports[0].usage.as_ref().unwrap().windows[0].used_percent,
             12.0
         );
-        assert_eq!(reports[1].number, Some(2));
-        assert_eq!(reports[1].alias.as_deref(), Some("slot-2"));
-        assert!(
-            reports[1]
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("setup is incomplete")
-        );
-        assert!(reports[1].usage.is_none());
+        for report in &reports[1..4] {
+            assert!(
+                report
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("setup is incomplete")
+            );
+            assert!(report.usage.is_none());
+            assert!(report.account_id.is_none());
+        }
         assert!(reports[1].email.is_none());
-        assert!(reports[2].error.is_none());
-        assert!(reports[2].usage.is_some());
+        assert!(reports[2].email.is_none());
+        assert_eq!(
+            reports[3].email.as_deref(),
+            Some("stored-label@example.test")
+        );
+        assert!(reports[4].error.is_none());
+        assert!(reports[4].usage.is_some());
     }
 }

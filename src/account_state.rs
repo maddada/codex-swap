@@ -132,7 +132,7 @@ pub(crate) fn commit_login(
         .is_some_and(|expected| !expected.same_owner(&identity))
     {
         bail!(
-            "Codex login did not match the saved owner; saved credentials were unchanged. Retry xswap login {} for a known owner. A legacy owner without a usable user ID or email needs xswap add --login --email <owner> --slot <unused-slot>",
+            "Codex login did not match the saved owner; saved credentials were unchanged. Retry xswap login {} for a known owner. An unresolved legacy owner needs xswap add --login --email <owner> --slot <unused-slot>",
             account.number
         );
     }

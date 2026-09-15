@@ -40,13 +40,14 @@ fn view(store: &Store, account: &Account, live: Option<&Account>) -> AccountView
         (_, Ok(None)) => (account.identity.clone(), "login_required"),
         (_, Err(_)) => (account.identity.clone(), "invalid_credentials"),
     };
+    let labels = identity.as_ref().or(account.identity.as_ref());
     AccountView {
         number: account.number,
         alias: account.alias.clone(),
-        email: identity.as_ref().and_then(|i| i.email.clone()),
+        email: labels.and_then(|i| i.email.clone()),
         account_id: identity.as_ref().map(|i| i.account_id.clone()),
         user_id: identity.as_ref().and_then(|i| i.user_id.clone()),
-        plan: identity.as_ref().and_then(|i| i.plan.clone()),
+        plan: labels.and_then(|i| i.plan.clone()),
         home: effective.home,
         saved_home: account.home.clone(),
         managed: effective.managed,
@@ -366,6 +367,7 @@ mod tests {
             user_id: Some("user-1".into()),
             email: Some("same@example.test".into()),
             plan: None,
+            legacy_hint_unusable: false,
         };
         for (identity, status, user) in [
             (None, "login_required", None),

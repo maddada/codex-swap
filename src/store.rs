@@ -25,7 +25,8 @@ pub struct Account {
 pub fn require_registered_identity(number: u32, identity: &Option<Identity>) -> Result<&Identity> {
     identity
         .as_ref()
-        .with_context(|| format!("account {number} setup is incomplete; run xswap login {number}"))
+        .filter(|identity| identity.has_owner())
+        .with_context(|| format!("account {number} setup is incomplete; use xswap login {number} for new setup, or xswap add --login --email <owner> --slot <unused-slot> for an unresolved legacy owner"))
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -137,6 +138,16 @@ impl Store {
             .is_some_and(|bin| bin.trim().is_empty() || bin.contains('\0'))
         {
             bail!("invalid configured Codex executable");
+        }
+        let snapshots = root.join("accounts");
+        for account in &mut data.accounts {
+            if account.managed && account.home != data.main_home {
+                crate::auth::enrich_legacy_identity(
+                    &account.home,
+                    &snapshots,
+                    &mut account.identity,
+                );
+            }
         }
         Ok(Self {
             root,

@@ -270,6 +270,7 @@ fn original_home_migration_does_not_assign_a_login_without_owner_evidence() -> R
             user_id: None,
             email: Some(email.into()),
             plan: Some("team".into()),
+            legacy_hint_unusable: false,
         });
         store.data.accounts.push(Account {
             number: 4,

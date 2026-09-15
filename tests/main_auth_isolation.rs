@@ -321,7 +321,9 @@ fn legacy_main_errors_do_not_hide_separate_accounts() {
     write(&registry_path, serde_json::to_vec(&registry).unwrap());
     let (listed, _) = fixture.listed();
     assert_eq!(listed["accounts"][0]["loginStatus"], "present");
-    assert_eq!(listed["accounts"][1]["loginStatus"], "invalid_credentials");
+    assert_eq!(listed["accounts"][1]["loginStatus"], "login_required");
+    assert!(listed["accounts"][1]["accountId"].is_null());
+    assert!(listed["accounts"][1]["userId"].is_null());
     #[cfg(unix)]
     {
         assert_failure(
