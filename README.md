@@ -312,6 +312,7 @@ Successful JSON operations emit one object to stdout; login messages and diagnos
   "alias": "work",
   "email": "user@example.com",
   "accountId": "account-id",
+  "userId": "chatgpt-user-id",
   "plan": "pro",
   "home": "/path/to/effective/codex/home",
   "savedHome": "/path/to/saved/account/home",
@@ -345,10 +346,17 @@ On first use, the main home defaults to `CODEX_HOME`, then `~/.codex` (`%USERPRO
 
 xswap manages **file-based ChatGPT logins**. New managed accounts select that backend explicitly through the official login command. It does not import OS-keyring/auto credentials, API-key logins or externally managed tokens. For a keyring-based existing setup, use `xswap add --login` to create an independent login instead of copying a potentially stale `auth.json`. Managed enterprise requirements still apply through Codex itself.
 
+Saved logins match by workspace (`accountId`) and stable ChatGPT member (`userId`); email and plan changes do not create a new account when both user IDs are known. Older logins or registries without a user ID require a shared nonempty email. Registry metadata stays in place, and a safely matched save, login or switch fills in the user ID. Missing owner evidence or multiple legacy matches require repairing the registration; xswap never assigns the current main-home login to an unknown saved owner.
+
+Older registered homes physically separate from the main home resolve their user ID in memory from their saved identity token only when its workspace and known nonempty email match the registry. This includes adopted homes outside the store. Read-only commands leave the registry and credentials unchanged. Missing, unreadable or mismatched hints cannot match an installed main login; matching email-only legacy tokens retain their fallback. Owner labels may survive an unusable authentication mode, but using credentials still requires a complete ChatGPT login.
+
+For an unresolved legacy slot, including one without a matching saved snapshot hint, keep the old slot and register the intended owner with `xswap add --login --email owner@example.com --slot UNUSED_SLOT`. Set its alias and directory mappings explicitly with `rename`, `map` and `unmap`; moving or swapping slots keeps mappings attached to their existing accounts. The old credentials and metadata remain until you explicitly use `remove`. Resolve multiple matching legacy registrations explicitly before retrying; `remove` retains credential homes.
+
 ## Development
 
 ```sh
 cargo fmt --check
+cargo test --locked
 cargo clippy --all-targets -- -D warnings
 cargo build --release --locked
 ```
