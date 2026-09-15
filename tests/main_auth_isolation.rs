@@ -77,7 +77,7 @@ impl Fixture {
         );
         #[cfg(unix)]
         {
-            write(&fixture.fake, b"#!/bin/sh\nset -eu\nprintf '%s' \"$CODEX_HOME\" > \"$SYNTHETIC_MARKER\"\ncase \" $* \" in\n  *' login '*)\n    cp \"$SYNTHETIC_NEXT_AUTH\" \"$CODEX_HOME/auth.json\"\n    if [ -n \"${SYNTHETIC_CHANGED_PATH:-}\" ]; then\n      cp \"$SYNTHETIC_NEXT_AUTH\" \"$SYNTHETIC_CHANGED_PATH\"\n    fi\n    ;;\nesac\n");
+            write(&fixture.fake, b"#!/bin/sh\nset -eu\nprintf '%s' \"$CODEX_HOME\" > \"$SYNTHETIC_MARKER\"\nif [ \"${SYNTHETIC_HOLD:-}\" = 1 ]; then sleep 5; exit 0; fi\ncase \" $* \" in\n  *' login '*)\n    cp \"$SYNTHETIC_NEXT_AUTH\" \"$CODEX_HOME/auth.json\"\n    if [ -n \"${SYNTHETIC_CHANGED_PATH:-}\" ]; then\n      cp \"$SYNTHETIC_NEXT_AUTH\" \"$SYNTHETIC_CHANGED_PATH\"\n    fi\n    if [ -n \"${SYNTHETIC_CHANGED_HOME:-}\" ]; then\n      rm \"$SYNTHETIC_CHANGED_HOME\"\n      ln -s \"$SYNTHETIC_HOME_TARGET\" \"$SYNTHETIC_CHANGED_HOME\"\n    fi\n    ;;\nesac\n");
             fs::set_permissions(&fixture.fake, fs::Permissions::from_mode(0o700)).unwrap();
         }
         fixture
@@ -218,6 +218,24 @@ fn missing_or_unmatched_main_keeps_independent_account() {
         assert_eq!(listed["accounts"][0]["loginStatus"], "present");
         assert!(output.stderr.is_empty());
     }
+}
+
+#[test]
+fn missing_home_directories_remain_read_only_and_require_login() {
+    let fixture = Fixture::new();
+    let registry_before = fs::read(fixture.data.join("accounts.json")).unwrap();
+    fs::remove_file(fixture.saved.join("auth.json")).unwrap();
+    fs::remove_dir(&fixture.saved).unwrap();
+    fs::remove_dir(&fixture.main).unwrap();
+    let (listed, _) = fixture.listed();
+    assert_eq!(listed["accounts"][0]["home"], json!(fixture.saved));
+    assert_eq!(listed["accounts"][0]["loginStatus"], "login_required");
+    assert!(!fixture.saved.exists());
+    assert!(!fixture.main.exists());
+    assert_eq!(
+        fs::read(fixture.data.join("accounts.json")).unwrap(),
+        registry_before
+    );
 }
 
 #[test]
@@ -472,6 +490,116 @@ fn busy_independent_account_refuses_login_and_export() {
         "busy",
     );
     assert!(!backup.exists());
+    assert_eq!(
+        fs::read(fixture.saved.join("auth.json")).unwrap(),
+        saved_before
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn main_home_alias_keeps_strict_source_process_and_lease_guards() {
+    use std::os::unix::fs::symlink;
+    for alias_main in [false, true] {
+        let fixture = Fixture::new();
+        fixture.main_source("api-key");
+        let account_alias = fixture.data.join("account-home-alias");
+        let main_alias = fixture.data.join("main-home-alias");
+        symlink(&fixture.main, &account_alias).unwrap();
+        symlink(&fixture.main, &main_alias).unwrap();
+        let registry_path = fixture.data.join("accounts.json");
+        let mut registry: Value =
+            serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+        if alias_main {
+            registry["mainHome"] = json!(main_alias);
+        }
+        registry["accounts"].as_array_mut().unwrap().push(json!({
+            "number": 2, "alias": "main-alias", "home": account_alias,
+            "managed": false, "shareHistory": false,
+            "identity": {"accountId": "alias-account", "email": "alias@example.test"}
+        }));
+        registry["nextNumber"] = json!(3);
+        write(&registry_path, serde_json::to_vec(&registry).unwrap());
+        let registry_before = fs::read(&registry_path).unwrap();
+        let main_before = fs::read(fixture.main.join("auth.json")).unwrap();
+        let (listed, _) = fixture.listed();
+        assert_eq!(listed["accounts"][0]["loginStatus"], "present");
+        assert_eq!(listed["accounts"][1]["loginStatus"], "invalid_credentials");
+        assert_eq!(listed["accounts"][1]["home"], json!(fixture.main));
+        assert_failure(&fixture.run(&["login", "2"]), "another authentication mode");
+        assert!(!fixture.marker.exists());
+        let held = lease(&fixture, &fixture.main, false);
+        assert_failure(&fixture.run(&["login", "2"]), "busy");
+        drop(held);
+        assert_eq!(fs::read(&registry_path).unwrap(), registry_before);
+        assert_eq!(
+            fs::read(fixture.main.join("auth.json")).unwrap(),
+            main_before
+        );
+
+        write(
+            &fixture.main.join("auth.json"),
+            fs::read(&fixture.next_auth).unwrap(),
+        );
+        let running_marker = fixture.data.join("running-child");
+        let mut child = Command::new("/bin/sh")
+            .arg(&fixture.fake)
+            .env("CODEX_HOME", &fixture.main)
+            .env("SYNTHETIC_MARKER", &running_marker)
+            .env("SYNTHETIC_HOLD", "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !running_marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let result = fixture.run(&["login", "2"]);
+        child.wait().unwrap();
+        assert!(running_marker.exists());
+        assert!(!result.status.success());
+        let diagnostic = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            ["Codex is still running", "cannot enumerate processes"]
+                .iter()
+                .any(|message| diagnostic.contains(message)),
+            "{diagnostic}"
+        );
+        assert!(!fixture.marker.exists());
+        assert_eq!(fs::read(&registry_path).unwrap(), registry_before);
+        assert_eq!(
+            fs::read(fixture.main.join("auth.json")).unwrap(),
+            fs::read(&fixture.next_auth).unwrap()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_login_rechecks_retargeted_home_alias() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new();
+    fixture.main_source("api-key");
+    let account_alias = fixture.data.join("saved-home-alias");
+    symlink(&fixture.saved, &account_alias).unwrap();
+    let registry_path = fixture.data.join("accounts.json");
+    let mut registry: Value = serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    registry["accounts"][0]["home"] = json!(account_alias);
+    write(&registry_path, serde_json::to_vec(&registry).unwrap());
+    let main_before = fs::read(fixture.main.join("auth.json")).unwrap();
+    let saved_before = fs::read(fixture.saved.join("auth.json")).unwrap();
+    let registry_before = fs::read(&registry_path).unwrap();
+    let result = fixture
+        .command(&["login", "1"])
+        .env("SYNTHETIC_CHANGED_HOME", &account_alias)
+        .env("SYNTHETIC_HOME_TARGET", &fixture.main)
+        .output()
+        .unwrap();
+    assert_failure(&result, "selection changed during login");
+    assert_eq!(fs::read(&registry_path).unwrap(), registry_before);
+    assert_eq!(
+        fs::read(fixture.main.join("auth.json")).unwrap(),
+        main_before
+    );
     assert_eq!(
         fs::read(fixture.saved.join("auth.json")).unwrap(),
         saved_before

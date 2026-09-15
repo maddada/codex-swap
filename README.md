@@ -171,7 +171,7 @@ Existing Codex processes cache authentication. Before replacing the global login
 
 Explicit `xswap run work` and directory mappings select an account for that launch without switching the global login. An explicit `xswap run default` selects the saved original account, even when a different account is globally active.
 
-An invalid, incomplete or unsupported login in the main Codex home does not block listing, launching, reconnecting or exporting an account with a separate saved home. xswap reports a main-login diagnostic on stderr and uses the selected account's own credentials unless a valid main identity positively matches it. `status` still reports main-home errors, and global switching refuses to replace an unrecognized main login. Entries whose saved home is the main home still report errors from that source.
+An invalid, incomplete or unsupported login in the main Codex home does not block listing, launching, reconnecting or exporting an account with a separate saved home. xswap reports a main-login diagnostic on stderr and uses the selected account's own credentials unless a valid main identity positively matches it. `status` still reports main-home errors, and global switching refuses to replace an unrecognized main login. Entries whose saved home is the main home still report errors from that source. Home aliases resolve to their physical destinations so leases and main-home replacement checks apply to the same directory.
 
 ## Directory mappings
 

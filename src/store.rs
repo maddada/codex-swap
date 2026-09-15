@@ -67,18 +67,11 @@ impl Store {
         let root = root.canonicalize()?;
         let lock = fsutil::lock(&root.join("registry.lock"), true, true)?;
         let saved = fsutil::optional_bytes(&root.join("accounts.json"))?;
-        let data = if let Some(bytes) = saved {
+        let mut data = if let Some(bytes) = saved {
             let registry: Registry =
                 serde_json::from_slice(&bytes).context("invalid xswap registry")?;
             if registry.schema_version != 1 {
                 bail!("unsupported xswap registry version");
-            }
-            if let Some(home) = &cli.codex_home {
-                if fsutil::absolute(home)? != registry.main_home {
-                    bail!(
-                        "this registry already uses a different main Codex home; use a separate --data-dir"
-                    );
-                }
             }
             registry
         } else {
@@ -105,6 +98,19 @@ impl Store {
         for account in &data.accounts {
             if account.number == 0 || !seen.insert(account.number) || !account.home.is_absolute() {
                 bail!("invalid or duplicate account in xswap registry");
+            }
+        }
+        // Home aliases must share destination comparisons and leases with their
+        // physical home, including the strict guards for main-home replacement.
+        data.main_home = fsutil::absolute(&data.main_home)?;
+        for account in &mut data.accounts {
+            account.home = fsutil::absolute(&account.home)?;
+        }
+        if let Some(home) = &cli.codex_home {
+            if fsutil::absolute(home)? != data.main_home {
+                bail!(
+                    "this registry already uses a different main Codex home; use a separate --data-dir"
+                );
             }
         }
         if data.original_account.is_some_and(|n| !seen.contains(&n)) {
