@@ -149,11 +149,11 @@ pub fn sqlite_home(main: &Path) -> Result<std::path::PathBuf> {
                 .as_str()
                 .context("sqlite_home must be a path string")?,
         );
-        return crate::fsutil::absolute(&if path.is_absolute() {
-            path.to_owned()
-        } else {
-            main.join(path)
-        });
+        return Ok(crate::fsutil::resolve_config_path(
+            path,
+            main,
+            &crate::fsutil::config_user_home()?,
+        ));
     }
     Ok(main.to_owned())
 }
