@@ -234,7 +234,7 @@ fn fake_login_child() {
 }
 
 #[test]
-fn purge_removes_legacy_staging_and_forgotten_homes_but_retains_shared_data_and_locks() {
+fn unmarked_legacy_staging_requires_recovery_before_purge_removes_forgotten_homes() {
     let fixture = Fixture::new();
     let adopted = fixture.root.join("adopted");
     private_directory(&adopted);
@@ -278,11 +278,23 @@ fn purge_removes_legacy_staging_and_forgotten_homes_but_retains_shared_data_and_
         use std::os::unix::fs::MetadataExt;
         fs::metadata(&registry_lock).unwrap().ino()
     };
+    let refused = fixture.purge();
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("provenance"));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("move it outside"));
+    assert!(forgotten.join("auth.json").exists());
+    assert!(fixture.data.join("accounts.json").exists());
+    for prefix in ["login-", "new-login-"] {
+        let staging = fixture.data.join(format!("{prefix}abandoned"));
+        assert!(staging.join("auth.json").exists());
+        // Follow the recovery guidance without deleting either ambiguous directory.
+        fs::rename(&staging, fixture.root.join(format!("recovered-{prefix}"))).unwrap();
+    }
     let output = fixture.purge();
     assert!(output.status.success(), "{output:?}");
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["managedHomesRemoved"], 1);
-    assert_eq!(result["loginStagingHomesRemoved"], 2);
+    assert_eq!(result["loginStagingHomesRemoved"], 0);
     assert!(!fixture.data.join("accounts").exists());
     assert!(!fixture.data.join("accounts.json").exists());
     assert!(!fixture.data.join("login-abandoned").exists());
@@ -472,17 +484,24 @@ fn purge_refuses_staging_that_is_not_private() {
 #[test]
 fn staging_deletion_failure_is_visible_and_does_not_claim_success() {
     let fixture = Fixture::new();
-    let staging = fixture.data.join("login-cannot-delete");
-    private_directory(&staging);
-    let auth = staging.join("auth.json");
-    write_private(&auth, b"synthetic-staging");
+    let mut sign_in = fixture.start(
+        &["add", "--login", "--email", "user@example.invalid"],
+        "new-login-",
+    );
+    sign_in.crash();
+    let blocked = sign_in.staging.join("blocked");
+    private_directory(&blocked);
+    write_private(
+        &blocked.join("auth.json"),
+        b"synthetic-retained-credentials",
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if unsafe { libc::geteuid() } == 0 {
             return; // Root bypasses the directory write permission used for this failure.
         }
-        fs::set_permissions(&staging, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o500)).unwrap();
     }
     #[cfg(windows)]
     let held_auth = {
@@ -490,20 +509,65 @@ fn staging_deletion_failure_is_visible_and_does_not_claim_success() {
         fs::OpenOptions::new()
             .read(true)
             .share_mode(0)
-            .open(&auth)
+            .open(blocked.join("auth.json"))
             .unwrap()
     };
     let output = fixture.purge();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("login staging"));
+    assert!(output.stdout.is_empty());
+    let quarantine = fs::read_dir(&fixture.data)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".purge-login-")
+        });
+    #[cfg(unix)]
+    assert!(quarantine.is_some(), "{output:?}");
+    let retained = quarantine
+        .as_ref()
+        .map(|path| path.join("staging/blocked"))
+        .unwrap_or(blocked);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&retained, fs::Permissions::from_mode(0o700)).unwrap();
     }
     #[cfg(windows)]
     drop(held_auth);
-    assert!(!output.status.success(), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("remove login staging"));
-    assert!(output.stdout.is_empty());
-    assert!(auth.exists());
+    assert!(retained.join("auth.json").exists());
+    if let Some(quarantine) = quarantine {
+        assert!(String::from_utf8_lossy(&output.stderr).contains("quarantined data retained"));
+        let retry = fixture.purge();
+        assert!(!retry.status.success(), "{retry:?}");
+        assert!(String::from_utf8_lossy(&retry.stderr).contains("quarantine remains"));
+        fs::rename(&quarantine, fixture.root.join("recovered-quarantine")).unwrap();
+    }
     assert!(fixture.purge().status.success());
+}
+
+#[test]
+fn purge_never_deletes_unrelated_prefix_collisions_and_checks_before_confirmation() {
+    for name in ["login-notes", "login-backups", "new-login-user-data"] {
+        let fixture = Fixture::new();
+        let unrelated = fixture.data.join(name);
+        private_directory(&unrelated);
+        write_private(&unrelated.join("auth.json"), b"user-data");
+        fixture.registry(json!([]));
+        for arguments in [vec!["purge", "--yes"], vec!["purge"]] {
+            let output = fixture
+                .command(&arguments)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("provenance"));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("confirmation"));
+            assert_eq!(fs::read(unrelated.join("auth.json")).unwrap(), b"user-data");
+            assert!(fixture.data.join("accounts.json").exists());
+        }
+    }
 }

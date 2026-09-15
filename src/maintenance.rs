@@ -83,7 +83,7 @@ pub fn purge(cli: &Cli, yes: bool, output: &Output) -> Result<()> {
         Err(error) => return Err(error.into()),
     }
     let staging = crate::login_staging::directories(&store, &protected)?;
-    homes.extend(staging.iter().cloned());
+    homes.extend(staging.iter().map(|directory| directory.path().to_owned()));
     // Lock forgotten managed homes and staging too: remove retains data, and login releases Store.
     let _leases: Vec<_> = homes
         .iter()
@@ -111,18 +111,8 @@ pub fn purge(cli: &Cli, yes: bool, output: &Output) -> Result<()> {
     }
     // std::fs::remove_dir_all does not follow symbolic links, including shared history/config.
     let mut staging_removed = 0;
-    for home in &staging {
-        match fs::remove_dir_all(home) {
-            Ok(()) => staging_removed += 1,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
-                    && matches!(fs::symlink_metadata(home), Err(missing) if missing.kind() == std::io::ErrorKind::NotFound) =>
-                {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("remove login staging {}", home.display()));
-            }
-        }
+    for directory in staging {
+        staging_removed += usize::from(directory.remove(&store.root)?);
     }
     for home in &managed_homes {
         fs::remove_dir_all(home)
