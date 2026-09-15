@@ -100,10 +100,6 @@ fn profile(
     Ok(path)
 }
 
-fn same_identity(a: &auth::Identity, b: &auth::Identity) -> bool {
-    a.account_id == b.account_id && a.email == b.email
-}
-
 pub(crate) struct LoginDestination {
     pub account: Account,
     pub effective_home: PathBuf,
@@ -133,10 +129,10 @@ pub(crate) fn commit_login(
     if account
         .identity
         .as_ref()
-        .is_some_and(|expected| !same_identity(expected, &identity))
+        .is_some_and(|expected| !expected.same_owner(&identity))
     {
         bail!(
-            "Codex signed into a different account; saved credentials were unchanged. Retry xswap login {} and choose the registered account",
+            "Codex login did not match the saved owner; saved credentials were unchanged. Retry xswap login {} for a known owner. A legacy owner without a usable user ID or email needs xswap add --login --email <owner> --slot <unused-slot>",
             account.number
         );
     }
@@ -184,17 +180,18 @@ fn migrate_original(store: &mut Store, transaction: &mut Transaction) -> Result<
         return Ok(());
     };
     let home = profile(store, transaction, legacy.number, true)?;
-    if let Some(live) = auth::identity(&store.data.main_home)? {
+    let mut copied_identity = None;
+    if let Some((document, live)) = auth::optional_credentials(&store.data.main_home)? {
         if legacy
             .identity
             .as_ref()
-            .is_none_or(|saved| same_identity(saved, &live))
+            .is_some_and(|saved| saved.same_owner(&live))
         {
-            let (document, _) = auth::credentials(&store.data.main_home)?;
             transaction.write(&home.join("auth.json"), &document)?;
+            copied_identity = Some(live);
         } else {
             eprintln!(
-                "Original slot {} needs sign-in again: its old login was replaced before xswap could snapshot it.",
+                "Original slot {} needs sign-in again: its saved owner could not be matched to the current login. Use xswap login for a known owner; an unknown legacy owner needs xswap add --login --email <owner> --slot <unused-slot>.",
                 legacy.number
             );
         }
@@ -206,6 +203,9 @@ fn migrate_original(store: &mut Store, transaction: &mut Transaction) -> Result<
         .find(|a| a.number == legacy.number)
         .unwrap();
     account.home = home;
+    if let Some(identity) = copied_identity {
+        account.identity = Some(identity);
+    }
     account.managed = true;
     account.share_history = true;
     store.data.original_account.get_or_insert(legacy.number);
@@ -237,16 +237,7 @@ fn capture(
     shared: bool,
 ) -> Result<Account> {
     let (document, identity) = auth::credentials(source)?;
-    let existing = store
-        .data
-        .accounts
-        .iter()
-        .find(|a| {
-            a.identity
-                .as_ref()
-                .is_some_and(|id| same_identity(id, &identity))
-        })
-        .cloned();
+    let existing = store.account_for_identity(&identity)?;
     let number = slot
         .or_else(|| existing.as_ref().map(|a| a.number))
         .unwrap_or(store.data.next_number);
@@ -437,16 +428,26 @@ pub fn select_global(cli: &Cli, identifier: Option<&str>) -> Result<()> {
             capture(&mut store, &mut transaction, &main, None, None, false)?;
         }
         let selected = store.resolve(&selected.number.to_string())?;
-        auth::verify(&selected.home, &selected.identity)?;
-        let (document, _) = auth::credentials(&selected.home)?;
+        let (document, identity) = auth::verified_credentials(&selected.home, &selected.identity)?;
         crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
         if fsutil::optional_bytes(&store.data.main_home.join("auth.json"))? != original_live {
             bail!("the current Codex login changed during switching; stop Codex and retry");
         }
         transaction.write(&store.data.main_home.join("auth.json"), &document)?;
+        store
+            .data
+            .accounts
+            .iter_mut()
+            .find(|account| account.number == selected.number)
+            .context("account was removed")?
+            .identity = Some(identity);
         store.data.default = default;
         store.data.accounts.sort_by_key(|a| a.number);
         transaction.write(&store.root.join("accounts.json"), &store.data)
     })();
     transaction.finish(result)
 }
+
+#[cfg(test)]
+#[path = "identity_tests.rs"]
+mod tests;

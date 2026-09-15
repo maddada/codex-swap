@@ -22,6 +22,12 @@ pub struct Account {
     pub enabled: bool,
 }
 
+pub fn require_registered_identity(number: u32, identity: &Option<Identity>) -> Result<&Identity> {
+    identity
+        .as_ref()
+        .with_context(|| format!("account {number} setup is incomplete; run xswap login {number}"))
+}
+
 #[derive(Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Preferences {
@@ -233,16 +239,27 @@ impl Store {
         let Some(identity) = crate::auth::identity(&self.data.main_home)? else {
             return Ok(None);
         };
-        Ok(self
+        self.account_for_identity(&identity)
+    }
+
+    pub fn account_for_identity(&self, identity: &Identity) -> Result<Option<Account>> {
+        let matches: Vec<_> = self
             .data
             .accounts
             .iter()
-            .find(|a| {
-                a.identity.as_ref().is_some_and(|saved| {
-                    saved.account_id == identity.account_id && saved.email == identity.email
-                })
+            .filter(|a| {
+                a.identity
+                    .as_ref()
+                    .is_some_and(|saved| saved.same_owner(identity))
             })
-            .cloned())
+            .collect();
+        match matches.as_slice() {
+            [account] => Ok(Some((*account).clone())),
+            [] => Ok(None),
+            _ => bail!(
+                "ambiguous saved account identity; resolve conflicting registrations explicitly before retrying (xswap remove retains their credential homes)"
+            ),
+        }
     }
 
     /// Observing an unrelated main login must not prevent using a saved home.
@@ -304,9 +321,9 @@ impl Store {
     pub fn ensure_unique_identity(&self, identity: &Identity, except: u32) -> Result<()> {
         if self.data.accounts.iter().any(|a| {
             a.number != except
-                && a.identity.as_ref().is_some_and(|i| {
-                    i.account_id == identity.account_id && i.email == identity.email
-                })
+                && a.identity
+                    .as_ref()
+                    .is_some_and(|saved| saved.same_owner(identity))
         }) {
             bail!(
                 "this account is already registered; use its existing slot so refreshed credentials have one home"

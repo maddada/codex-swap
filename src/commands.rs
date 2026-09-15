@@ -2,7 +2,7 @@ use crate::{
     auth,
     cli::{Add, Cli, Output},
     fsutil, launch, sharing,
-    store::{Account, Store},
+    store::{Account, Store, require_registered_identity},
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -15,6 +15,7 @@ struct AccountView {
     alias: Option<String>,
     email: Option<String>,
     account_id: Option<String>,
+    user_id: Option<String>,
     plan: Option<String>,
     home: std::path::PathBuf,
     saved_home: std::path::PathBuf,
@@ -27,26 +28,24 @@ struct AccountView {
 
 fn view(store: &Store, account: &Account, live: Option<&Account>) -> AccountView {
     let effective = store.effective_account(account, live);
-    let (identity, login_status) = match auth::identity(&effective.home) {
-        Ok(Some(live)) => {
-            if account
-                .identity
-                .as_ref()
-                .is_some_and(|i| i.account_id != live.account_id || i.email != live.email)
-            {
-                (account.identity.clone(), "identity_changed")
-            } else {
-                (Some(live), "present")
-            }
+    let (identity, login_status) = match (
+        require_registered_identity(account.number, &account.identity),
+        auth::identity(&effective.home),
+    ) {
+        (Err(_), _) => (None, "login_required"),
+        (Ok(saved), Ok(Some(live))) if !saved.same_owner(&live) => {
+            (account.identity.clone(), "identity_changed")
         }
-        Ok(None) => (account.identity.clone(), "login_required"),
-        Err(_) => (account.identity.clone(), "invalid_credentials"),
+        (_, Ok(Some(live))) => (Some(live), "present"),
+        (_, Ok(None)) => (account.identity.clone(), "login_required"),
+        (_, Err(_)) => (account.identity.clone(), "invalid_credentials"),
     };
     AccountView {
         number: account.number,
         alias: account.alias.clone(),
         email: identity.as_ref().and_then(|i| i.email.clone()),
         account_id: identity.as_ref().map(|i| i.account_id.clone()),
+        user_id: identity.as_ref().and_then(|i| i.user_id.clone()),
         plan: identity.as_ref().and_then(|i| i.plan.clone()),
         home: effective.home,
         saved_home: account.home.clone(),
@@ -339,5 +338,60 @@ pub fn remap_number(number: u32, from: u32, to: u32) -> u32 {
         from
     } else {
         number
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    #[test]
+    fn view_requires_a_saved_owner_and_rejects_another_member() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let main = directory.path().join("main");
+        fsutil::private_dir(&main)?;
+        let cli = Cli {
+            data_dir: Some(directory.path().join("registry")),
+            codex_home: Some(main.clone()),
+            codex_bin: None,
+            command: crate::cli::Action::Status(Output { json: false }),
+        };
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"email":"same@example.test","https://api.openai.com/auth":{"chatgpt_user_id":"user-2"}}"#);
+        let document = json!({"tokens": {"account_id": "workspace-1", "access_token": "dummy-access", "refresh_token": "dummy-refresh", "id_token": format!("e30.{payload}.dummy")}});
+        fsutil::atomic_json(&main.join("auth.json"), &document)?;
+        let mut store = Store::open(&cli)?;
+        let owner = auth::Identity {
+            account_id: "workspace-1".into(),
+            user_id: Some("user-1".into()),
+            email: Some("same@example.test".into()),
+            plan: None,
+        };
+        for (identity, status, user) in [
+            (None, "login_required", None),
+            (Some(owner), "identity_changed", Some("user-1")),
+        ] {
+            let account = Account {
+                number: 1,
+                alias: Some("saved".into()),
+                home: main.clone(),
+                managed: false,
+                share_history: false,
+                identity,
+                enabled: true,
+            };
+            store.data.accounts = vec![account.clone()];
+            let live = store.observe_live_account();
+            let result = view(&store, &account, live.as_ref());
+            assert_eq!(result.login_status, status);
+            assert_eq!(result.user_id.as_deref(), user);
+            assert!(!result.is_default);
+            if user.is_none() {
+                assert!(result.email.is_none());
+                assert!(result.account_id.is_none());
+            }
+        }
+        assert_eq!(auth::credentials(&main)?.0, document);
+        Ok(())
     }
 }
