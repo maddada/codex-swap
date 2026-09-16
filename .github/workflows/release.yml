@@ -9,6 +9,9 @@ on:
       - ".github/workflows/release.yml"
       - "scripts/homebrew.py"
       - "scripts/install.ps1"
+      - "scripts/check_notices.py"
+      - "THIRD_PARTY_NOTICES.md"
+      - "LICENSE"
       - "Cargo.toml"
       - "Cargo.lock"
 
@@ -60,6 +63,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release --locked --target "$TARGET"
+          python3 scripts/check_notices.py "$TARGET"
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
             echo "Tag must match Cargo.toml version v$version" >&2
@@ -87,6 +91,8 @@ jobs:
           $env:RUSTFLAGS = "-C target-feature=+crt-static"
           cargo build --release --locked --target $env:TARGET
           if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
+          python scripts/check_notices.py $env:TARGET
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency notice verification failed' }
           $version = python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])'
           if ($env:GITHUB_REF.StartsWith('refs/tags/') -and $env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag must match Cargo.toml version' }
           $binary = "target/$env:TARGET/release/xswap.exe"

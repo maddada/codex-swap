@@ -5,6 +5,7 @@ import argparse
 import hashlib
 from pathlib import Path
 import re
+import stat
 import tarfile
 import zipfile
 
@@ -13,6 +14,12 @@ TARGETS = {
     "macos": ("aarch64-apple-darwin", "x86_64-apple-darwin"),
     "linux": ("aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"),
 }
+
+
+def check_document(name, payload, archive):
+    expected = (Path(__file__).resolve().parents[1] / name).read_text(encoding="utf-8")
+    if payload.decode("utf-8").replace("\r\n", "\n") != expected:
+        raise ValueError(f"Incorrect {name} payload: {archive}")
 
 
 def main():
@@ -53,6 +60,8 @@ def main():
                 binary = contents.getmember("xswap")
                 if not binary.mode & 0o111 or binary.size == 0:
                     raise ValueError(f"Missing executable xswap: {archive}")
+                for document in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
+                    check_document(document, contents.extractfile(document).read(), archive)
             digest = hashlib.sha256(archive.read_bytes()).hexdigest()
             checksums.append(f"{digest}  {name}\n")
             lines.extend([
@@ -71,10 +80,16 @@ def main():
             members = contents.infolist()
             if {m.filename for m in members} != {
                 "xswap.exe", "LICENSE", "README.md", "THIRD_PARTY_NOTICES.md"
-            } or len(members) != 4 or any(m.is_dir() for m in members):
+            } or len(members) != 4 or any(
+                m.is_dir() or m.external_attr & 0x10
+                or stat.S_IFMT(m.external_attr >> 16) not in (0, stat.S_IFREG)
+                for m in members
+            ):
                 raise ValueError(f"Unexpected Windows archive contents: {archive}")
             if contents.getinfo("xswap.exe").file_size == 0:
                 raise ValueError(f"Missing executable xswap.exe: {archive}")
+            for document in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
+                check_document(document, contents.read(document), archive)
         checksums.append(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {name}\n")
     installer = args.archives / "install.ps1"
     if not installer.is_file() or installer.stat().st_size == 0:
@@ -83,7 +98,7 @@ def main():
     lines.extend([
         "  def install",
         '    bin.install "xswap"',
-        '    doc.install "THIRD_PARTY_NOTICES.md"',
+        '    doc.install "LICENSE", "THIRD_PARTY_NOTICES.md"',
         "  end",
         "",
         "  def caveats",

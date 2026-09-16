@@ -22,6 +22,9 @@ jobs:
       - run: cargo build --release --locked
       - run: target/release/xswap --version
       - run: target/release/xswap --help
+      - name: Check release archives and formula
+        if: runner.os == 'Linux'
+        run: python3 scripts/test_homebrew.py
       - name: Validate PowerShell installer syntax
         if: runner.os == 'Windows'
         shell: pwsh
@@ -29,6 +32,12 @@ jobs:
           $parseErrors = $null
           [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts/install.ps1), [ref]$null, [ref]$parseErrors) | Out-Null
           if ($parseErrors) { throw ($parseErrors | Out-String) }
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path scripts/test_install.ps1), [ref]$null, [ref]$parseErrors) | Out-Null
+          if ($parseErrors) { throw ($parseErrors | Out-String) }
+      - name: Check native installer with mocked downloads
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test_install.ps1 -Binary target/release/xswap.exe
       - uses: actions/upload-artifact@v4
         with:
           name: xswap-${{ runner.os }}-${{ runner.arch }}
