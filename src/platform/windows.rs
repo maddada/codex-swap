@@ -1,5 +1,12 @@
 use anyhow::{Context, Result, bail};
-use std::{ffi::OsStr, fs::File, os::windows::ffi::OsStrExt, path::Path, process::Command, ptr};
+use std::{
+    ffi::{OsStr, OsString},
+    fs::File,
+    os::windows::ffi::{OsStrExt, OsStringExt},
+    path::{Path, PathBuf},
+    process::Command,
+    ptr,
+};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, LocalFree},
     Security::{
@@ -14,6 +21,7 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::FILE_ALL_ACCESS,
     System::{
+        Com::CoTaskMemFree,
         Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler},
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -22,7 +30,32 @@ use windows_sys::Win32::{
         },
         Threading::{GetCurrentProcess, OpenProcessToken},
     },
+    UI::Shell::{FOLDERID_Profile, SHGetKnownFolderPath},
 };
+
+/// Codex's `dirs::home_dir` uses the native profile folder, not USERPROFILE.
+pub fn config_user_home() -> Result<PathBuf> {
+    unsafe {
+        let mut wide_home = ptr::null_mut();
+        let result = SHGetKnownFolderPath(&FOLDERID_Profile, 0, ptr::null_mut(), &mut wide_home);
+        if result != 0 {
+            CoTaskMemFree(wide_home.cast());
+            bail!("resolve Windows profile directory failed (HRESULT {result:#x})");
+        }
+        let mut length = 0;
+        while *wide_home.add(length) != 0 {
+            length += 1;
+        }
+        let home = PathBuf::from(OsString::from_wide(std::slice::from_raw_parts(
+            wide_home, length,
+        )));
+        CoTaskMemFree(wide_home.cast());
+        if !home.is_absolute() {
+            bail!("Windows profile directory must be an absolute path");
+        }
+        Ok(home)
+    }
+}
 
 fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()

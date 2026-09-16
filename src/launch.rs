@@ -1,4 +1,4 @@
-use crate::{auth, cli::Cli, fsutil, sharing, store::Store};
+use crate::{auth, cli::Cli, config_assets, fsutil, sharing, store::Store};
 #[cfg(unix)]
 use anyhow::Context;
 use anyhow::{Result, bail};
@@ -66,10 +66,10 @@ pub fn run(
 ) -> Result<()> {
     let mut store = Store::open(cli)?;
     let mut selected = store.selected_for_run(identifier)?;
+    let live = store.observe_live_account();
     let effective = selected
         .as_ref()
-        .map(|a| store.effective_account(a))
-        .transpose()?;
+        .map(|a| store.effective_account(a, live.as_ref()));
     let home = effective
         .as_ref()
         .map(|a| a.home.clone())
@@ -97,6 +97,7 @@ pub fn run(
         auth::verify(&home, &account.identity)?;
         if account.managed && home != store.data.main_home {
             sharing::config(&store.data.main_home, &home)?;
+            config_assets::share(&store.data.main_home, &home, args)?;
         }
         if shared {
             sharing::history(&store.data.main_home, &home)?;
@@ -132,12 +133,15 @@ pub fn run(
 pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
     let store = Store::open(cli)?;
     let account = store.resolve(identifier)?;
-    let effective = store.effective_account(&account)?;
+    let effective = store.effective_account(&account, store.observe_live_account().as_ref());
     let lease = store.lease(&effective.home, true)?;
     let snapshot_lease = (effective.home != account.home)
         .then(|| store.lease(&account.home, true))
         .transpose()?;
     if effective.home == store.data.main_home {
+        // Repairing a separate home may tolerate main observation errors, but
+        // replacing main credentials still requires recognizing their source.
+        auth::identity(&effective.home)?;
         crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
     }
     let mut paths = vec![effective.home.join("auth.json")];
@@ -156,13 +160,11 @@ pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
             .collect::<Result<_>>()?,
     };
     let staging = crate::login_staging::LoginStaging::new(&store, "login-")?;
-    // Copy configuration instead of linking it: login must not update real settings.
-    let config = effective.home.join("config.toml");
-    if config.exists() {
-        let mut copy = tempfile::NamedTempFile::new_in(staging.path())?;
-        copy.write_all(&std::fs::read(config)?)?;
-        copy.persist(staging.path().join("config.toml"))?;
-    }
+    config_assets::copy_for_login(
+        &effective.home,
+        effective.managed.then_some(store.data.main_home.as_path()),
+        staging.path(),
+    )?;
     let mut cmd = command(&store.codex_bin(cli), staging.path(), true)?;
     let sqlite = toml::Value::String(staging.path().to_string_lossy().into_owned()).to_string();
     cmd.args(["-c", &format!("sqlite_home={sqlite}")]);
