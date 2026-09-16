@@ -5,9 +5,9 @@ use std::{fs, io::ErrorKind, path::Path};
 use std::os::unix::fs::{OpenOptionsExt, symlink};
 
 #[cfg(windows)]
-fn symlink(source: &Path, dest: &Path) -> Result<()> {
+fn symlink(source: &Path, dest: &Path, directory: bool) -> Result<()> {
     // Hardlinks detach after atomic replacement, which would split shared settings/history.
-    let result = if source.is_dir() {
+    let result = if directory {
         std::os::windows::fs::symlink_dir(source, dest)
     } else {
         std::os::windows::fs::symlink_file(source, dest)
@@ -38,6 +38,23 @@ const HISTORY_DIRS: &[&str] = &["sessions", "archived_sessions", "thread-writer-
 const HISTORY_FILES: &[&str] = &["history.jsonl", "session_index.jsonl"];
 
 fn link(source: &Path, dest: &Path) -> Result<()> {
+    link_with_kind(source, dest, source.is_dir())
+}
+
+pub(crate) fn link_with_kind(source: &Path, dest: &Path, directory: bool) -> Result<()> {
+    if !check_link(source, dest)? {
+        #[cfg(unix)]
+        symlink(source, dest)?;
+        #[cfg(windows)]
+        symlink(source, dest, directory)?;
+    }
+    #[cfg(unix)]
+    let _ = directory;
+    Ok(())
+}
+
+/// Validate an existing shared link without creating it or replacing private data.
+pub(crate) fn check_link(source: &Path, dest: &Path) -> Result<bool> {
     match fs::symlink_metadata(dest) {
         Ok(meta) if meta.file_type().is_symlink() => {
             let target = fs::read_link(dest)?;
@@ -53,16 +70,16 @@ fn link(source: &Path, dest: &Path) -> Result<()> {
                     dest.display()
                 );
             }
+            Ok(true)
         }
         Ok(_) => bail!(
             "{} contains private data; sharing requires an empty destination. Preserve/merge it into {} first",
             dest.display(),
             source.display()
         ),
-        Err(err) if err.kind() == ErrorKind::NotFound => symlink(source, dest)?,
-        Err(err) => return Err(err.into()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
     }
-    Ok(())
 }
 
 pub fn config(main: &Path, home: &Path) -> Result<()> {
@@ -149,11 +166,11 @@ pub fn sqlite_home(main: &Path) -> Result<std::path::PathBuf> {
                 .as_str()
                 .context("sqlite_home must be a path string")?,
         );
-        return crate::fsutil::absolute(&if path.is_absolute() {
-            path.to_owned()
-        } else {
-            main.join(path)
-        });
+        return Ok(crate::fsutil::resolve_config_path(
+            path,
+            main,
+            &crate::fsutil::config_user_home()?,
+        ));
     }
     Ok(main.to_owned())
 }

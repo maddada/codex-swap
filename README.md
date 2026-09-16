@@ -10,11 +10,13 @@ Supports macOS 11 or newer, Linux, WSL and native Windows on ARM64 and x86-64. I
 
 ### Homebrew (recommended)
 
-Add the tap and [trust the Codex Swap formula](https://docs.brew.sh/Tap-Trust), then install:
+Run this command to install on macOS and linux (requires homebrew to be installed)
 
 ```sh
-brew tap maddada/tap && brew trust --formula maddada/tap/codex-swap && brew install maddada/tap/codex-swap && xswap --version
+brew tap maddada/tap && brew trust --formula maddada/tap/codex-swap && brew install maddada/tap/codex-swap
 ```
+
+This command add the tap, marks it as trusted, then installs codex-swap.
 
 Homebrew installs a prebuilt `xswap` executable. Rust and Cargo are not required. Linux releases are statically linked with musl, so they do not depend on a particular glibc version.
 
@@ -128,6 +130,8 @@ xswap add --home ~/.codex-profiles/work --alias work
 
 Email selection is case-insensitive. If the same email belongs to multiple workspaces, select a slot number or unique alias.
 
+Aliases are 1-64 ASCII letters, digits, dots, hyphens or underscores. They cannot start with a hyphen, be a number or be `default`; aliases are unique regardless of case. To repair an older alias beginning with a hyphen, use its slot number: `xswap rename 2 work-team`.
+
 ## Run, resume and fork
 
 ```sh
@@ -170,6 +174,8 @@ Existing Codex processes cache authentication. Before replacing the global login
 `status` reports the identity currently installed in the main Codex home; `launchDefault` separately reports the saved choice for `xswap run`. Signing into another account directly with `codex login` can change the global login without changing that saved choice. Run `xswap add` to save the new login, or `xswap switch ACCOUNT` to restore a saved account.
 
 Explicit `xswap run work` and directory mappings select an account for that launch without switching the global login. An explicit `xswap run default` selects the saved original account, even when a different account is globally active.
+
+An invalid, incomplete or unsupported login in the main Codex home does not block listing, launching, reconnecting or exporting an account with a separate saved home. xswap reports a main-login diagnostic on stderr and uses the selected account's own credentials unless a valid main identity positively matches it. `status` still reports main-home errors, and global switching refuses to replace an unrecognized main login. Entries whose saved home is the main home still report errors from that source. Home aliases resolve to their physical destinations so leases and main-home replacement checks apply to the same directory.
 
 ## Directory mappings
 
@@ -228,11 +234,21 @@ xswap import accounts-backup.json --remap-slots
 
 Import creates fresh managed account homes and validates all accounts before saving the registry. Imported shared settings/history use the destination computer’s main Codex home. Duplicate identities or aliases are refused. Occupied slots are refused unless `--remap-slots` is provided; remapping allocates free slots and prints the assignments. Failed validation leaves the saved registry unchanged and removes staged credentials. An import restores its backed-up launch default into an empty registry; an established registry keeps its existing launch default. Import does not change the installed global Codex login or redefine the destination’s original account. Use `xswap switch ACCOUNT` when you want to activate an imported account globally.
 
+If saving the registry fails during import or `add --login`, xswap restores the previous registry before removing the new account homes. If that restoration also fails, xswap retains the new homes and reports their paths for recovery.
+
 Export reads the latest main-home credentials for the globally active account and the saved home for inactive accounts. It refuses while a selected account is running under an xswap lease, so finish that launch first. Imported credentials do not invalidate the original copy, but Codex’s refresh-token behavior still applies when using copies on multiple machines.
 
 ## What is shared
 
 New managed homes share existing main-home settings and customizations: `config.toml`, named `*.config.toml` profiles, `AGENTS.md`, `AGENTS.override.md`, `skills`, `hooks`, `hooks.json`, `rules` and `agents`. These are symlinks, so edits are shared. Adopted homes keep their own configuration.
+
+Managed launches also preserve relative `model_instructions_file`, `model_catalog_json`, `experimental_compact_prompt_file` and agent role `config_file` references from the main config and selected profile. Referenced files are linked within the account home; agent role directories are linked so nested references retain the role file's base. Put relative role files in a subdirectory such as `agents/`, or use an absolute path. Active references that require writing outside the managed home, root-level relative role files, account runtime paths and conflicting destination files are refused with guidance. Home references overridden by enabled project config or CLI settings are left to Codex's higher layer. Runtime aliases are checked against the account filesystem, including Codex's default `log` directory. Missing assets keep a link to their source; Codex decides whether the effective settings require them. Source settings remain editable through the existing shared config links.
+
+Asset linking inspects user, selected-profile, project and CLI settings. If a system config, legacy managed config or macOS managed preference contains file paths, runtime locations, project-root markers or trust entries, relative user assets are conservatively refused because those controlled layers can change the projection. Use absolute file references in the shared config or launch Codex directly. xswap does not reproduce Codex's full managed-policy loader.
+
+Help/version requests and `exec --ignore-user-config` skip user-asset inspection, as Codex does; arguments after the forwarded `--` remain literal. On case-insensitive filesystems, new links with non-ASCII relative path components, or non-ASCII runtime locations, are conservatively refused because native Unicode aliases can overlap private account state. Use absolute asset references for those paths. Safe Unicode asset paths remain supported on case-sensitive filesystems.
+
+New login and reauthentication copy configs independently and resolve these file references against their original home. Native login can write its staging config without changing source settings, credentials or conversations. Adopted homes retain their own configuration base.
 
 `--share-history` enables sharing with the main Codex home for:
 
@@ -245,7 +261,7 @@ New managed homes share existing main-home settings and customizations: `config.
 | `thread-writer-locks/` | One active writer per conversation across accounts |
 | SQLite state directory | Thread discovery and related persistent state |
 
-The SQLite directory is selected through Codex's `sqlite_home` configuration, keeping databases and their WAL/SHM files together. If the main `config.toml` specifies `sqlite_home`, xswap uses it; otherwise it uses the main Codex home. An inherited `CODEX_SQLITE_HOME` is not used as the sharing anchor. Account credentials, logs and account-local runtime state remain in their account home. History sharing is remembered once enabled.
+The SQLite directory is selected through Codex's `sqlite_home` configuration, keeping databases and their WAL/SHM files together. If the main `config.toml` specifies `sqlite_home`, xswap uses it; otherwise it uses the main Codex home. Paths expand bare `~` and `~/...` against the user home (`~\...` is also supported on Windows, using its native profile directory); other relative paths resolve against the main Codex home. `.` and `..` are normalized without creating the destination. An inherited `CODEX_SQLITE_HOME` is not used as the sharing anchor. Account credentials, logs and account-local runtime state remain in their account home. History sharing is remembered once enabled.
 
 Enable sharing when adding an account, before it creates private history. If an adopted or previously private home already contains history at these paths, xswap refuses to overwrite it. Preserve and merge that history explicitly before linking it, or keep that home private. Existing links must point to the chosen main home. xswap also refuses divergent config files or links rather than erasing them. If a Codex operation replaces a shared symlink with a real file, preserve/merge that file before the next shared launch; xswap detects the divergence.
 
@@ -310,6 +326,7 @@ Successful JSON operations emit one object to stdout; login messages and diagnos
   "alias": "work",
   "email": "user@example.com",
   "accountId": "account-id",
+  "userId": "chatgpt-user-id",
   "plan": "pro",
   "home": "/path/to/effective/codex/home",
   "savedHome": "/path/to/saved/account/home",
@@ -324,6 +341,8 @@ Successful JSON operations emit one object to stdout; login messages and diagnos
 Every response has `schemaVersion: 1`. `list` contains `accounts`; `add` contains `account`; `status` and `switch` contain `active`, `defaultHome` and `usesOriginalDefault`; `remove` contains `removed` and `retainedHome`. `active` describes a saved account matching the actual main-home login, or is null when that login does not match a registered account. `launchDefault` reports the separately saved launch choice. Each account’s `home` is its effective credential/launch home (the main home when globally active); `savedHome` is its stored snapshot directory. Use `home` when reading current authentication or usage.
 
 `loginStatus` is `present`, `login_required`, `invalid_credentials`, or `identity_changed`. `present` means structurally valid credentials exist locally; it does **not** promise that the server will accept the token or that quota remains. Identity fields can be null before login completes. Console and JSON status output omit tokens; `export` writes credentials only to the requested backup file. No command rotates tokens itself. Integrations must tolerate additional fields in future versions.
+
+xswap follows Codex's authentication-mode precedence: explicit `chatgpt` permits stored credentials for other modes, but a missing/null mode with a non-null API key, personal access token, or Bedrock credential is rejected. Legacy ChatGPT files with missing/null mode and missing/null material for those other modes remain supported. `list` marks incompatible saved snapshots `invalid_credentials`. Incompatible main-home authentication makes `status` and `switch` return an authentication error. Use `xswap login <slot-or-alias>` to sign in with the registered ChatGPT identity. Credentials and account metadata stay in place until a verified login succeeds.
 
 `usage` performs an on-demand request. xswap runs no daemon or proxy and does not automatically switch accounts near quota limits. Continuous polling and automatic switching policy can remain in a consuming application such as gxserver. A consumer switches a session by stopping that session at an appropriate point, then launching the chosen account with `resume` and the same session ID.
 
@@ -341,10 +360,17 @@ On first use, the main home defaults to `CODEX_HOME`, then `~/.codex` (`%USERPRO
 
 xswap manages **file-based ChatGPT logins**. New managed accounts select that backend explicitly through the official login command. It does not import OS-keyring/auto credentials, API-key logins or externally managed tokens. For a keyring-based existing setup, use `xswap add --login` to create an independent login instead of copying a potentially stale `auth.json`. Managed enterprise requirements still apply through Codex itself.
 
+Saved logins match by workspace (`accountId`) and stable ChatGPT member (`userId`); email and plan changes do not create a new account when both user IDs are known. Older logins or registries without a user ID require a shared nonempty email. Registry metadata stays in place, and a safely matched save, login or switch fills in the user ID. Missing owner evidence or multiple legacy matches require repairing the registration; xswap never assigns the current main-home login to an unknown saved owner.
+
+Older registered homes physically separate from the main home resolve their user ID in memory from their saved identity token only when its workspace and known nonempty email match the registry. This includes adopted homes outside the store. Read-only commands leave the registry and credentials unchanged. Missing, unreadable or mismatched hints cannot match an installed main login; matching email-only legacy tokens retain their fallback. Owner labels may survive an unusable authentication mode, but using credentials still requires a complete ChatGPT login.
+
+For an unresolved legacy slot, including one without a matching saved snapshot hint, keep the old slot and register the intended owner with `xswap add --login --email owner@example.com --slot UNUSED_SLOT`. Set its alias and directory mappings explicitly with `rename`, `map` and `unmap`; moving or swapping slots keeps mappings attached to their existing accounts. The old credentials and metadata remain until you explicitly use `remove`. Resolve multiple matching legacy registrations explicitly before retrying; `remove` retains credential homes.
+
 ## Development
 
 ```sh
 cargo fmt --check
+cargo test --locked
 cargo clippy --all-targets -- -D warnings
 cargo build --release --locked
 ```

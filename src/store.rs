@@ -22,6 +22,13 @@ pub struct Account {
     pub enabled: bool,
 }
 
+pub fn require_registered_identity(number: u32, identity: &Option<Identity>) -> Result<&Identity> {
+    identity
+        .as_ref()
+        .filter(|identity| identity.has_owner())
+        .with_context(|| format!("account {number} setup is incomplete; use xswap login {number} for new setup, or xswap add --login --email <owner> --slot <unused-slot> for an unresolved legacy owner"))
+}
+
 #[derive(Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Preferences {
@@ -67,18 +74,11 @@ impl Store {
         let root = root.canonicalize()?;
         let lock = fsutil::lock(&root.join("registry.lock"), true, true)?;
         let saved = fsutil::optional_bytes(&root.join("accounts.json"))?;
-        let data = if let Some(bytes) = saved {
+        let mut data = if let Some(bytes) = saved {
             let registry: Registry =
                 serde_json::from_slice(&bytes).context("invalid xswap registry")?;
             if registry.schema_version != 1 {
                 bail!("unsupported xswap registry version");
-            }
-            if let Some(home) = &cli.codex_home {
-                if fsutil::absolute(home)? != registry.main_home {
-                    bail!(
-                        "this registry already uses a different main Codex home; use a separate --data-dir"
-                    );
-                }
             }
             registry
         } else {
@@ -107,6 +107,19 @@ impl Store {
                 bail!("invalid or duplicate account in xswap registry");
             }
         }
+        // Home aliases must share destination comparisons and leases with their
+        // physical home, including the strict guards for main-home replacement.
+        data.main_home = fsutil::absolute(&data.main_home)?;
+        for account in &mut data.accounts {
+            account.home = fsutil::absolute(&account.home)?;
+        }
+        if let Some(home) = &cli.codex_home {
+            if fsutil::absolute(home)? != data.main_home {
+                bail!(
+                    "this registry already uses a different main Codex home; use a separate --data-dir"
+                );
+            }
+        }
         if data.original_account.is_some_and(|n| !seen.contains(&n)) {
             bail!("original account is missing from registry");
         }
@@ -125,6 +138,11 @@ impl Store {
             .is_some_and(|bin| bin.trim().is_empty() || bin.contains('\0'))
         {
             bail!("invalid configured Codex executable");
+        }
+        for account in &mut data.accounts {
+            if account.home != data.main_home {
+                crate::auth::enrich_legacy_identity(&account.home, &mut account.identity);
+            }
         }
         Ok(Self {
             root,
@@ -227,35 +245,67 @@ impl Store {
         let Some(identity) = crate::auth::identity(&self.data.main_home)? else {
             return Ok(None);
         };
-        Ok(self
-            .data
-            .accounts
-            .iter()
-            .find(|a| {
-                a.identity.as_ref().is_some_and(|saved| {
-                    saved.account_id == identity.account_id && saved.email == identity.email
-                })
-            })
-            .cloned())
+        self.account_for_identity(&identity)
     }
 
-    pub fn effective_account(&self, account: &Account) -> Result<Account> {
+    pub fn account_for_identity(&self, identity: &Identity) -> Result<Option<Account>> {
+        Self::account_for_identity_in(&self.data.accounts, identity)
+    }
+
+    pub fn account_for_identity_in(
+        accounts: &[Account],
+        identity: &Identity,
+    ) -> Result<Option<Account>> {
+        let matches: Vec<_> = accounts
+            .iter()
+            .filter(|a| {
+                a.identity
+                    .as_ref()
+                    .is_some_and(|saved| saved.same_owner(identity))
+            })
+            .collect();
+        match matches.as_slice() {
+            [account] => Ok(Some((*account).clone())),
+            [] => Ok(None),
+            _ => bail!(
+                "ambiguous saved account identity; resolve conflicting registrations explicitly before retrying (xswap remove retains their credential homes)"
+            ),
+        }
+    }
+
+    /// Observing an unrelated main login must not prevent using a saved home.
+    /// Global credential replacement continues to use strict `live_account()`.
+    pub fn observe_live_account(&self) -> Option<Account> {
+        match self.live_account() {
+            Ok(account) => account,
+            Err(_) => {
+                eprintln!(
+                    "xswap: the main Codex login could not be resolved to a saved account; saved accounts use their own homes. Check the main login with xswap status."
+                );
+                None
+            }
+        }
+    }
+
+    pub fn effective_account(&self, account: &Account, live: Option<&Account>) -> Account {
         let mut effective = account.clone();
-        if self
-            .live_account()?
-            .is_some_and(|live| live.number == account.number)
-        {
+        if live.is_some_and(|live| live.number == account.number) {
             effective.home = self.data.main_home.clone();
             effective.managed = false;
             effective.share_history = true;
         }
-        Ok(effective)
+        effective
     }
 
     pub fn validate_alias(&self, alias: &Option<String>) -> Result<()> {
+        self.validate_alias_except(alias, None)
+    }
+
+    pub fn validate_alias_except(&self, alias: &Option<String>, except: Option<u32>) -> Result<()> {
         if let Some(alias) = alias {
             if alias.is_empty()
                 || alias.len() > 64
+                || alias.starts_with('-')
                 || alias.eq_ignore_ascii_case("default")
                 || alias.parse::<u32>().is_ok()
                 || !alias
@@ -263,13 +313,14 @@ impl Store {
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
             {
                 bail!(
-                    "alias must be 1-64 letters, digits, dots, hyphens or underscores, and cannot be a number or 'default'"
+                    "alias must be 1-64 letters, digits, dots, hyphens or underscores, cannot start with a hyphen, and cannot be a number or 'default'"
                 );
             }
             if self.data.accounts.iter().any(|a| {
-                a.alias
-                    .as_deref()
-                    .is_some_and(|s| s.eq_ignore_ascii_case(alias))
+                Some(a.number) != except
+                    && a.alias
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case(alias))
             }) {
                 bail!("alias is already in use");
             }
@@ -287,9 +338,9 @@ impl Store {
     pub fn ensure_unique_identity(&self, identity: &Identity, except: u32) -> Result<()> {
         if self.data.accounts.iter().any(|a| {
             a.number != except
-                && a.identity.as_ref().is_some_and(|i| {
-                    i.account_id == identity.account_id && i.email == identity.email
-                })
+                && a.identity
+                    .as_ref()
+                    .is_some_and(|saved| saved.same_owner(identity))
         }) {
             bail!(
                 "this account is already registered; use its existing slot so refreshed credentials have one home"
@@ -307,5 +358,54 @@ impl Store {
             .context("account was removed")?;
         *entry = account;
         self.save()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{Action, Output};
+
+    #[test]
+    fn alias_validation_preserves_selectable_names_and_uniqueness() {
+        let directory = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            data_dir: Some(directory.path().join("data")),
+            codex_home: Some(directory.path().join("main")),
+            codex_bin: None,
+            command: Action::List(Output { json: false }),
+        };
+        let mut store = Store::open(&cli).unwrap();
+        assert!(store.validate_alias(&None).is_ok());
+        for alias in ["work-team", "_work", "work.team", "WORK", &"a".repeat(64)] {
+            assert!(store.validate_alias(&Some(alias.into())).is_ok(), "{alias}");
+        }
+        for alias in [
+            "-work",
+            "--work",
+            "-",
+            "",
+            "default",
+            "DEFAULT",
+            "123",
+            "work team",
+            "wörk",
+            &"a".repeat(65),
+        ] {
+            assert!(
+                store.validate_alias(&Some(alias.into())).is_err(),
+                "{alias}"
+            );
+        }
+        store.data.accounts.push(Account {
+            number: 1,
+            alias: Some("work-team".into()),
+            home: directory.path().join("account-1"),
+            managed: true,
+            share_history: false,
+            identity: None,
+            enabled: true,
+        });
+        assert!(store.validate_alias(&Some("WORK-TEAM".into())).is_err());
     }
 }

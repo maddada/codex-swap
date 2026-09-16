@@ -1,4 +1,4 @@
-use crate::{auth, fsutil};
+use crate::auth;
 use anyhow::{Context, Result, bail};
 use reqwest::{blocking::Client, header::HeaderMap, redirect::Policy};
 use serde_json::Value;
@@ -30,17 +30,7 @@ pub fn fetch(
     home: &Path,
     expected: &Option<auth::Identity>,
 ) -> Result<(auth::Identity, Response)> {
-    let identity = auth::verify(home, expected)?;
-    let bytes = fsutil::optional_bytes(&home.join("auth.json"))?
-        .context("no Codex login; sign into this account with xswap login")?;
-    let auth: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| anyhow::anyhow!("invalid Codex auth.json (contents omitted)"))?;
-    let account_id = auth["tokens"]["account_id"]
-        .as_str()
-        .context("Codex login has no account ID")?;
-    if account_id != identity.account_id {
-        bail!("Codex login changed while reading usage; retry the command");
-    }
+    let (auth, identity) = auth::verified_credentials(home, expected)?;
     let token = auth["tokens"]["access_token"]
         .as_str()
         .filter(|value| !value.is_empty())
@@ -48,7 +38,7 @@ pub fn fetch(
     let response = client
         .get(USAGE_URL)
         .bearer_auth(token)
-        .header("ChatGPT-Account-Id", account_id)
+        .header("ChatGPT-Account-Id", &identity.account_id)
         .header("Accept", "application/json")
         .send()
         .map_err(|error| {
