@@ -29,9 +29,16 @@ fn credentials(account: &str, access: &str) -> Value {
 }
 
 fn invalid_main_kinds() -> impl Iterator<Item = &'static str> {
-    ["malformed", "api-key", "incomplete", "directory"]
-        .into_iter()
-        .chain(cfg!(unix).then_some("unreadable"))
+    [
+        "malformed",
+        "api-key",
+        "incomplete",
+        "directory",
+        "hybrid-missing-mode",
+        "hybrid-null-mode",
+    ]
+    .into_iter()
+    .chain(cfg!(unix).then_some("unreadable"))
 }
 
 fn write(path: &Path, bytes: impl AsRef<[u8]>) {
@@ -120,6 +127,15 @@ impl Fixture {
             "malformed" => write(&path, b"{\"synthetic-secret-that-must-not-appear\":"),
             "api-key" => write(&path, br#"{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-secret-that-must-not-appear"}"#),
             "incomplete" => write(&path, br#"{"tokens":{"account_id":"synthetic","access_token":"synthetic-secret-that-must-not-appear"}}"#),
+            "hybrid-missing-mode" | "hybrid-null-mode" => {
+                let mut document = credentials("synthetic-account", "synthetic-main");
+                document.as_object_mut().unwrap().remove("auth_mode");
+                if kind == "hybrid-null-mode" {
+                    document["auth_mode"] = Value::Null;
+                }
+                document["OPENAI_API_KEY"] = json!("synthetic-secret-that-must-not-appear");
+                write(&path, serde_json::to_vec(&document).unwrap());
+            }
             "directory" => fs::create_dir(path).unwrap(),
             #[cfg(unix)]
             "unreadable" => {
@@ -369,6 +385,59 @@ fn invalid_main_allows_explicit_run_and_staged_login() {
 
 #[cfg(unix)]
 #[test]
+fn hybrid_main_allows_verified_repair_of_incompatible_saved_credentials() {
+    for kind in ["hybrid-missing-mode", "hybrid-null-mode"] {
+        let fixture = Fixture::new();
+        fixture.main_source(kind);
+        let main_before = fs::read(fixture.main.join("auth.json")).unwrap();
+        write(&fixture.saved.join("auth.json"), &main_before);
+        let registry_path = fixture.data.join("accounts.json");
+        let registry_before = fs::read(&registry_path).unwrap();
+        let (listed, _) = fixture.listed();
+        assert_eq!(listed["accounts"][0]["home"], json!(fixture.saved));
+        assert_eq!(listed["accounts"][0]["loginStatus"], "invalid_credentials");
+
+        write(
+            &fixture.next_auth,
+            serde_json::to_vec(&credentials("wrong-account", "synthetic-wrong")).unwrap(),
+        );
+        assert_failure(&fixture.run(&["login", "1"]), "different account");
+        assert_eq!(
+            fs::read(fixture.saved.join("auth.json")).unwrap(),
+            main_before
+        );
+        assert_eq!(fs::read(&registry_path).unwrap(), registry_before);
+        assert_eq!(
+            fs::read(fixture.main.join("auth.json")).unwrap(),
+            main_before
+        );
+
+        let repaired = credentials("synthetic-account", "synthetic-repaired");
+        write(&fixture.next_auth, serde_json::to_vec(&repaired).unwrap());
+        assert_success(&fixture.run(&["login", "1"]));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(fixture.saved.join("auth.json")).unwrap())
+                .unwrap(),
+            repaired
+        );
+        let registry_after: Value =
+            serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+        let registry_before: Value = serde_json::from_slice(&registry_before).unwrap();
+        for (field, before) in registry_before.as_object().unwrap() {
+            assert_eq!(&registry_after[field], before);
+        }
+        assert_eq!(
+            fs::read(fixture.main.join("auth.json")).unwrap(),
+            main_before
+        );
+        let (listed, _) = fixture.listed();
+        assert_eq!(listed["accounts"][0]["home"], json!(fixture.saved));
+        assert_eq!(listed["accounts"][0]["loginStatus"], "present");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn staged_login_rechecks_destination_and_original_bytes() {
     for changed_main in [true, false] {
         let fixture = Fixture::new();
@@ -435,39 +504,47 @@ fn lease(fixture: &Fixture, home: &Path, exclusive: bool) -> fs::File {
 
 #[cfg(unix)]
 #[test]
-fn matching_main_uses_live_credentials_and_preserves_both_launch_leases() {
-    let fixture = Fixture::new();
-    fixture.main_source("matching");
-    write(&fixture.saved.join("auth.json"), b"{");
-    let (listed, _) = fixture.listed();
-    assert_eq!(listed["accounts"][0]["home"], json!(fixture.main));
-    assert_eq!(listed["accounts"][0]["isDefault"], true);
-    assert_eq!(listed["accounts"][0]["loginStatus"], "present");
-    for home in [&fixture.main, &fixture.saved] {
-        let held = lease(&fixture, home, true);
-        assert_failure(&fixture.run(&["run", "1", "--", "--version"]), "busy");
-        assert!(!fixture.marker.exists());
-        drop(held);
+fn explicit_chatgpt_variants_use_live_credentials_and_preserve_launch_leases() {
+    for mode in [json!("chatgpt"), json!({"chatgpt": null})] {
+        let fixture = Fixture::new();
+        let mut document = credentials("synthetic-account", "synthetic-new");
+        document["auth_mode"] = mode;
+        document["OPENAI_API_KEY"] = json!("synthetic-stale-api-key");
+        document["personal_access_token"] = json!("synthetic-stale-personal-token");
+        document["bedrock_api_key"] =
+            json!({"api_key": "synthetic-stale-bedrock", "region": "synthetic-region"});
+        document["bedrock_access_keys"] = json!({"access_key_id": "synthetic-stale-id", "secret_access_key": "synthetic-stale-secret"});
+        let original = serde_json::to_vec(&document).unwrap();
+        write(&fixture.main.join("auth.json"), &original);
+        write(&fixture.saved.join("auth.json"), b"{");
+        let (listed, _) = fixture.listed();
+        assert_eq!(listed["accounts"][0]["home"], json!(fixture.main));
+        assert_eq!(listed["accounts"][0]["isDefault"], true);
+        assert_eq!(listed["accounts"][0]["loginStatus"], "present");
+        for home in [&fixture.main, &fixture.saved] {
+            let held = lease(&fixture, home, true);
+            assert_failure(&fixture.run(&["run", "1", "--", "--version"]), "busy");
+            assert!(!fixture.marker.exists());
+            drop(held);
+        }
+        assert_success(&fixture.run(&["run", "1", "--", "--version"]));
+        assert_eq!(
+            fs::read_to_string(&fixture.marker).unwrap(),
+            fixture.main.to_str().unwrap()
+        );
+        let backup = fixture.data.join("backup.json");
+        assert_success(
+            &fixture
+                .command(&["export"])
+                .arg(&backup)
+                .args(["--account", "1"])
+                .output()
+                .unwrap(),
+        );
+        let exported: Value = serde_json::from_slice(&fs::read(backup).unwrap()).unwrap();
+        assert_eq!(exported["accounts"][0]["auth"], document);
+        assert_eq!(fs::read(fixture.main.join("auth.json")).unwrap(), original);
     }
-    assert_success(&fixture.run(&["run", "1", "--", "--version"]));
-    assert_eq!(
-        fs::read_to_string(&fixture.marker).unwrap(),
-        fixture.main.to_str().unwrap()
-    );
-    let backup = fixture.data.join("backup.json");
-    assert_success(
-        &fixture
-            .command(&["export"])
-            .arg(&backup)
-            .args(["--account", "1"])
-            .output()
-            .unwrap(),
-    );
-    let exported: Value = serde_json::from_slice(&fs::read(backup).unwrap()).unwrap();
-    assert_eq!(
-        exported["accounts"][0]["auth"],
-        credentials("synthetic-account", "synthetic-new")
-    );
 }
 
 #[cfg(unix)]
