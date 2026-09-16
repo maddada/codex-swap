@@ -159,7 +159,7 @@ pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
             })
             .collect::<Result<_>>()?,
     };
-    let staging = fsutil::private_tempdir(&store.root, "login-")?;
+    let staging = crate::login_staging::LoginStaging::new(&store, "login-")?;
     config_assets::copy_for_login(
         &effective.home,
         effective.managed.then_some(store.data.main_home.as_path()),

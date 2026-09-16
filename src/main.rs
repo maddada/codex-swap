@@ -6,6 +6,7 @@ mod commands;
 mod config_assets;
 mod fsutil;
 mod launch;
+mod login_staging;
 mod maintenance;
 mod mappings;
 mod platform;
