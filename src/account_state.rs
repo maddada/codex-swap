@@ -120,7 +120,10 @@ pub(crate) fn commit_login(
     let mut account = store.resolve(&destination.account.number.to_string())?;
     if account.home != destination.account.home
         || account.identity != destination.account.identity
-        || store.effective_account(&account)?.home != destination.effective_home
+        || store
+            .effective_account(&account, store.observe_live_account().as_ref())
+            .home
+            != destination.effective_home
     {
         bail!(
             "account selection changed during login; retry xswap login {}",

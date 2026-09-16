@@ -66,10 +66,10 @@ pub fn run(
 ) -> Result<()> {
     let mut store = Store::open(cli)?;
     let mut selected = store.selected_for_run(identifier)?;
+    let live = store.observe_live_account();
     let effective = selected
         .as_ref()
-        .map(|a| store.effective_account(a))
-        .transpose()?;
+        .map(|a| store.effective_account(a, live.as_ref()));
     let home = effective
         .as_ref()
         .map(|a| a.home.clone())
@@ -132,12 +132,15 @@ pub fn run(
 pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
     let store = Store::open(cli)?;
     let account = store.resolve(identifier)?;
-    let effective = store.effective_account(&account)?;
+    let effective = store.effective_account(&account, store.observe_live_account().as_ref());
     let lease = store.lease(&effective.home, true)?;
     let snapshot_lease = (effective.home != account.home)
         .then(|| store.lease(&account.home, true))
         .transpose()?;
     if effective.home == store.data.main_home {
+        // Repairing a separate home may tolerate main observation errors, but
+        // replacing main credentials still requires recognizing their source.
+        auth::identity(&effective.home)?;
         crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
     }
     let mut paths = vec![effective.home.join("auth.json")];
