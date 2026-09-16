@@ -12,6 +12,8 @@ pub struct Usage {
     pub limit_reached: Option<bool>,
     pub windows: Vec<Window>,
     pub credits: Option<Credits>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -178,29 +180,38 @@ pub fn parse(response: &Response, now: DateTime<Utc>) -> Result<Usage> {
     let body = &response.body;
     let rate = &body["rate_limit"];
     let mut all = windows("codex", rate, Some(response), now)?;
-    for key in ["additional_rate_limits", "code_review_rate_limit"] {
-        if key == "code_review_rate_limit" {
-            all.extend(windows("code_review", &body[key], None, now)?);
-            continue;
-        }
-        if body[key].is_null() {
-            continue;
-        }
-        let limits = body[key]
-            .as_array()
-            .context("Codex usage contains invalid additional limits")?;
+    let mut warnings = Vec::new();
+    if let Some(limits) = body["additional_rate_limits"].as_array() {
         for (index, limit) in limits.iter().enumerate() {
-            if !limit.is_object() {
-                bail!("Codex usage contains an invalid additional limit");
+            if !limit.is_object() || limit["rate_limit"].is_null() {
+                warnings.push(format!(
+                    "Skipped additional_rate_limits entry {}: missing or invalid rate limit",
+                    index + 1
+                ));
+                continue;
             }
             let scope = limit["limit_name"]
                 .as_str()
                 .or_else(|| limit["metered_feature"].as_str())
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("additional_{}", index + 1));
-            all.extend(windows(&scope, &limit["rate_limit"], None, now)?);
+            match windows(&scope, &limit["rate_limit"], None, now) {
+                Ok(windows) => all.extend(windows),
+                Err(error) => warnings.push(format!(
+                    "Skipped additional_rate_limits entry {}: {error}",
+                    index + 1
+                )),
+            }
         }
+    } else if !body["additional_rate_limits"].is_null() {
+        warnings.push("Skipped additional_rate_limits: expected an array".into());
     }
+    all.extend(windows(
+        "code_review",
+        &body["code_review_rate_limit"],
+        None,
+        now,
+    )?);
     let has_credits = body["credits"]["has_credits"].as_bool();
     let unlimited = body["credits"]["unlimited"].as_bool();
     let balance = number(&body["credits"]["balance"])
@@ -228,7 +239,215 @@ pub fn parse(response: &Response, now: DateTime<Utc>) -> Result<Usage> {
         limit_reached: rate["limit_reached"].as_bool(),
         windows: all,
         credits,
+        warnings,
     })
+}
+
+#[cfg(test)]
+mod additional_limit_regressions {
+    use super::*;
+    use reqwest::header::HeaderMap;
+    use serde_json::json;
+
+    fn rate(used: f64) -> Value {
+        json!({"primary_window": {
+            "used_percent": used,
+            "limit_window_seconds": 18_000,
+            "reset_after_seconds": 9_000
+        }})
+    }
+
+    fn limit(scope: &str, used: f64) -> Value {
+        json!({"limit_name": scope, "rate_limit": rate(used)})
+    }
+
+    fn parse_body(body: Value) -> Result<Usage> {
+        parse(
+            &Response {
+                headers: HeaderMap::new(),
+                body,
+            },
+            DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+        )
+    }
+
+    fn invalid_rates() -> Vec<Value> {
+        let mut invalid = vec![
+            json!("invalid"),
+            json!({"primary_window": "invalid"}),
+            json!({"primary_window": rate(30.0)["primary_window"], "secondary_window": false}),
+        ];
+        for (field, value) in [
+            ("used_percent", json!("NaN")),
+            ("used_percent", json!("Infinity")),
+            ("used_percent", json!("SYNTHETIC_PRIVATE_MARKER\n")),
+            ("used_percent", json!(-1)),
+            ("limit_window_seconds", json!(0)),
+            ("limit_window_seconds", json!(-1)),
+            ("limit_window_seconds", json!(1.5)),
+            ("reset_after_seconds", json!(9_223_372_036_854_774_784_u64)),
+            ("reset_at", json!(300_000_000_000_000_i64)),
+        ] {
+            let mut bad = rate(30.0);
+            bad["primary_window"][field] = value;
+            invalid.push(bad);
+        }
+        invalid
+    }
+
+    #[test]
+    fn additional_limits_skip_null_and_nonobject_entries_around_healthy_siblings() {
+        let usage = parse_body(json!({
+            "rate_limit": rate(20.0),
+            "additional_rate_limits": [
+                null,
+                limit("GPT-5.3-Codex-Spark", 30.0),
+                "invalid",
+                12,
+                false,
+                limit("other-model", 40.0)
+            ]
+        }))
+        .unwrap();
+        assert_eq!(usage.windows.len(), 3);
+        assert_eq!(usage.warnings.len(), 4);
+        for (window, (scope, used)) in usage.windows.iter().zip([
+            ("codex", 20.0),
+            ("GPT-5.3-Codex-Spark", 30.0),
+            ("other-model", 40.0),
+        ]) {
+            assert_eq!(window.scope, scope);
+            assert_eq!(window.used_percent, used);
+            assert_eq!(window.window_seconds, Some(18_000));
+            assert_eq!(window.resets_at_epoch_seconds, Some(1_800_009_000));
+            assert_eq!(window.reset_after_seconds, Some(9_000));
+        }
+    }
+
+    #[test]
+    fn additional_limits_bound_nested_validation_errors_to_each_entry() {
+        let mut bad_entries = vec![json!({}), json!({"rate_limit": null})];
+        bad_entries.extend(
+            invalid_rates().into_iter().map(
+                |rate| json!({"limit_name": "SYNTHETIC_PRIVATE_MARKER\n", "rate_limit": rate}),
+            ),
+        );
+        for bad in bad_entries {
+            let usage = parse_body(json!({
+                "rate_limit": rate(20.0),
+                "additional_rate_limits": [
+                    bad.clone(), limit("healthy-one", 30.0), bad, limit("healthy-two", 40.0)
+                ]
+            }))
+            .unwrap();
+            assert_eq!(usage.windows.len(), 3);
+            assert_eq!(usage.windows[0].used_percent, 20.0);
+            assert_eq!(usage.windows[1].scope, "healthy-one");
+            assert_eq!(usage.windows[1].used_percent, 30.0);
+            assert_eq!(usage.windows[2].scope, "healthy-two");
+            assert_eq!(usage.windows[2].used_percent, 40.0);
+            assert_eq!(usage.warnings.len(), 2);
+            assert!(usage.warnings[0].contains("entry 1"));
+            assert!(usage.warnings[1].contains("entry 3"));
+            assert!(
+                !usage
+                    .warnings
+                    .join(" ")
+                    .contains("SYNTHETIC_PRIVATE_MARKER")
+            );
+        }
+    }
+
+    #[test]
+    fn additional_limits_optional_field_shapes_preserve_core_and_code_review() {
+        for optional in [
+            None,
+            Some(Value::Null),
+            Some(json!({})),
+            Some(json!("invalid")),
+            Some(json!(false)),
+        ] {
+            let warns = optional.as_ref().is_some_and(|value| !value.is_null());
+            let mut body = json!({"rate_limit": rate(20.0), "code_review_rate_limit": rate(50.0)});
+            if let Some(optional) = optional {
+                body["additional_rate_limits"] = optional;
+            }
+            let usage = parse_body(body).unwrap();
+            assert_eq!(usage.windows.len(), 2);
+            assert_eq!(usage.windows[0].scope, "codex");
+            assert_eq!(usage.windows[1].scope, "code_review");
+            assert_eq!(usage.warnings.len(), usize::from(warns));
+        }
+    }
+
+    #[test]
+    fn additional_limits_keep_scope_precedence_and_original_ordinals() {
+        let usage = parse_body(json!({"additional_rate_limits": [
+            null,
+            {"rate_limit": rate(20.0)},
+            {"metered_feature": "feature", "rate_limit": rate(30.0)},
+            {"limit_name": "named", "metered_feature": "feature", "rate_limit": rate(40.0)}
+        ]}))
+        .unwrap();
+        let scopes: Vec<_> = usage
+            .windows
+            .iter()
+            .map(|window| window.scope.as_str())
+            .collect();
+        assert_eq!(scopes, ["additional_2", "feature", "named"]);
+    }
+
+    #[test]
+    fn additional_limits_do_not_hide_malformed_core_or_code_review() {
+        for bad in invalid_rates() {
+            for key in ["rate_limit", "code_review_rate_limit"] {
+                let mut body = json!({
+                    "rate_limit": rate(20.0),
+                    "additional_rate_limits": [limit("healthy", 30.0)]
+                });
+                body[key] = bad.clone();
+                assert!(parse_body(body).is_err(), "malformed {key} must fail");
+            }
+        }
+    }
+
+    #[test]
+    fn additional_limits_unusable_response_still_has_no_recognized_data() {
+        for optional in [
+            json!("invalid"),
+            json!([null, "invalid", {}, {"rate_limit": null}]),
+            json!([{ "rate_limit": {"primary_window": {"used_percent": "NaN"}} }]),
+            json!([{ "rate_limit": {"primary_window": null} }]),
+        ] {
+            let error = parse_body(json!({"additional_rate_limits": optional}))
+                .err()
+                .expect("no usable windows or account data must fail");
+            assert!(error.to_string().contains("no recognized usage data"));
+        }
+    }
+
+    #[test]
+    fn additional_limits_absent_windows_do_not_invent_usage_or_warnings() {
+        let usage = parse_body(json!({
+            "rate_limit": rate(20.0),
+            "additional_rate_limits": [
+                {"rate_limit": {}},
+                {"rate_limit": {"primary_window": null}},
+                {"rate_limit": {"primary_window": {"used_percent": null}}},
+                {"rate_limit": {"primary_window": {"limit_window_seconds": 18_000}}}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows[0].used_percent, 20.0);
+        assert!(usage.warnings.is_empty());
+        assert!(
+            serde_json::to_value(usage)
+                .unwrap()
+                .get("warnings")
+                .is_none()
+        );
+    }
 }
 
 #[cfg(test)]

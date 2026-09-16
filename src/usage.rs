@@ -110,6 +110,9 @@ fn human(report: &AccountUsage) {
         return;
     }
     let Some(usage) = &report.usage else { return };
+    for warning in &usage.warnings {
+        println!("  Warning: {}", warning.escape_default());
+    }
     if let Some(plan) = &usage.plan {
         println!("  Plan: {}", plan.escape_default());
     }
@@ -309,6 +312,52 @@ mod tests {
         );
         assert!(reports[4].error.is_none());
         assert!(reports[4].usage.is_some());
+    }
+}
+
+#[cfg(test)]
+mod additional_limit_json_regressions {
+    use super::*;
+    use chrono::DateTime;
+    use reqwest::header::HeaderMap;
+
+    #[test]
+    fn additional_limits_account_json_keeps_windows_and_sanitized_warnings() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let usage = usage_model::parse(
+            &usage_client::Response {
+                headers: HeaderMap::new(),
+                body: json!({
+                    "rate_limit": {"primary_window": {"used_percent": 20}},
+                    "additional_rate_limits": [
+                        null,
+                        {"limit_name": "healthy", "rate_limit": {"primary_window": {"used_percent": 30}}},
+                        {"limit_name": "SYNTHETIC_PRIVATE_MARKER\n", "rate_limit": {"primary_window": {"used_percent": "SYNTHETIC_PRIVATE_MARKER\n"}}}
+                    ]
+                }),
+            },
+            now,
+        )
+        .unwrap();
+        let report = AccountUsage {
+            number: Some(1),
+            alias: None,
+            email: None,
+            account_id: None,
+            fetched_at: usage_model::timestamp(now),
+            usage: Some(usage),
+            error: None,
+        };
+        let json = json!({"schemaVersion": 1, "accounts": [report]});
+        let account = &json["accounts"][0];
+        assert!(account["error"].is_null());
+        assert_eq!(account["usage"]["windows"][0]["usedPercent"], 20.0);
+        assert_eq!(account["usage"]["windows"][1]["usedPercent"], 30.0);
+        let warnings = account["usage"]["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].as_str().unwrap().contains("entry 1"));
+        assert!(warnings[1].as_str().unwrap().contains("entry 3"));
+        assert!(!json.to_string().contains("SYNTHETIC_PRIVATE_MARKER"));
     }
 }
 
