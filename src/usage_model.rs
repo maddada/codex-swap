@@ -201,12 +201,25 @@ pub fn parse(response: &Response, now: DateTime<Utc>) -> Result<Usage> {
             all.extend(windows(&scope, &limit["rate_limit"], None, now)?);
         }
     }
-    let credits = body["credits"].as_object().map(|credits| Credits {
-        balance: credits.get("balance").and_then(number),
-        has_credits: credits.get("has_credits").and_then(Value::as_bool),
-        unlimited: credits.get("unlimited").and_then(Value::as_bool),
+    let has_credits = body["credits"]["has_credits"].as_bool();
+    let unlimited = body["credits"]["unlimited"].as_bool();
+    let balance = number(&body["credits"]["balance"])
+        .or_else(|| (has_credits == Some(false)).then_some(0.0))
+        .or_else(|| {
+            let header = response
+                .headers
+                .get("x-codex-credits-balance")?
+                .to_str()
+                .ok()?;
+            number(&Value::String(header.to_owned()))
+        });
+    let has_credit_data = balance.is_some() || has_credits.is_some() || unlimited.is_some();
+    let credits = (body["credits"].is_object() || has_credit_data).then_some(Credits {
+        balance,
+        has_credits,
+        unlimited,
     });
-    if all.is_empty() && credits.is_none() && !rate.is_object() {
+    if all.is_empty() && !has_credit_data && !rate.is_object() {
         bail!("Codex usage API returned no recognized usage data");
     }
     Ok(Usage {
@@ -216,4 +229,216 @@ pub fn parse(response: &Response, now: DateTime<Utc>) -> Result<Usage> {
         windows: all,
         credits,
     })
+}
+
+#[cfg(test)]
+mod credit_header_regressions {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use serde_json::json;
+
+    const INVALID_HEADERS: [Option<&str>; 9] = [
+        None,
+        Some(""),
+        Some(" "),
+        Some("invalid"),
+        Some("NaN"),
+        Some("inf"),
+        Some("-inf"),
+        Some("Infinity"),
+        Some("1e999"),
+    ];
+
+    fn response(body: Value, header: Option<&str>) -> Response {
+        let mut headers = HeaderMap::new();
+        if let Some(header) = header {
+            headers.insert("x-codex-credits-balance", header.parse().unwrap());
+        }
+        Response { body, headers }
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000, 0).unwrap()
+    }
+
+    #[test]
+    fn credit_header_is_retained_beside_core_quota() {
+        let usage = parse(
+            &response(
+                json!({"rate_limit": {"primary_window": {
+                    "used_percent": 20,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 9000
+                }}}),
+                Some("12.5"),
+            ),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows[0].kind, "session");
+        assert_eq!(usage.windows[0].remaining_percent, 80.0);
+        let credits = usage.credits.unwrap();
+        assert_eq!(credits.balance, Some(12.5));
+        assert_eq!(credits.has_credits, None);
+        assert_eq!(credits.unlimited, None);
+    }
+
+    #[test]
+    fn credit_header_counts_as_recognized_usage() {
+        let usage = parse(&response(json!({}), Some("12.5")), now()).unwrap();
+        assert!(usage.windows.is_empty());
+        assert_eq!(usage.credits.unwrap().balance, Some(12.5));
+    }
+
+    #[test]
+    fn valid_body_balance_wins_over_header_and_false_flag() {
+        for (balance, expected) in [
+            (json!(0), 0.0),
+            (json!(12.75), 12.75),
+            (json!("-12.75"), -12.75),
+            (json!("1e20"), 1e20),
+        ] {
+            let usage = parse(
+                &response(
+                    json!({"credits": {
+                        "balance": balance,
+                        "has_credits": false,
+                        "unlimited": true
+                    }}),
+                    Some("99"),
+                ),
+                now(),
+            )
+            .unwrap();
+            let credits = usage.credits.unwrap();
+            assert_eq!(credits.balance, Some(expected));
+            assert_eq!(credits.has_credits, Some(false));
+            assert_eq!(credits.unlimited, Some(true));
+        }
+    }
+
+    #[test]
+    fn credit_header_preserves_body_flags() {
+        let usage = parse(
+            &response(
+                json!({"credits": {"has_credits": true, "unlimited": false}}),
+                Some("12.5"),
+            ),
+            now(),
+        )
+        .unwrap();
+        let credits = usage.credits.unwrap();
+        assert_eq!(credits.balance, Some(12.5));
+        assert_eq!(credits.has_credits, Some(true));
+        assert_eq!(credits.unlimited, Some(false));
+    }
+
+    #[test]
+    fn credit_header_fills_missing_or_unusable_body_balance() {
+        for body in [
+            json!({}),
+            json!({"credits": null}),
+            json!({"credits": {}}),
+            json!({"credits": {"balance": null}}),
+            json!({"credits": {"balance": false}}),
+            json!({"credits": {"balance": {}}}),
+            json!({"credits": {"balance": "invalid"}}),
+            json!({"credits": {"balance": "NaN"}}),
+            json!({"credits": {"balance": "Infinity"}}),
+            json!({"credits": {"balance": "1e999"}}),
+        ] {
+            let usage = parse(&response(body, Some("12.5")), now()).unwrap();
+            assert_eq!(usage.credits.unwrap().balance, Some(12.5));
+        }
+    }
+
+    #[test]
+    fn explicit_false_supplies_zero_before_credit_header() {
+        for balance in [json!(null), json!("invalid"), json!("NaN")] {
+            let usage = parse(
+                &response(
+                    json!({"credits": {
+                        "balance": balance,
+                        "has_credits": false,
+                        "unlimited": false
+                    }}),
+                    Some("99"),
+                ),
+                now(),
+            )
+            .unwrap();
+            let credits = usage.credits.unwrap();
+            assert_eq!(credits.balance, Some(0.0));
+            assert_eq!(credits.has_credits, Some(false));
+            assert_eq!(credits.unlimited, Some(false));
+        }
+    }
+
+    #[test]
+    fn meaningful_flags_preserve_unknown_balance() {
+        for (body, has_credits, unlimited) in [
+            (json!({"credits": {"has_credits": true}}), Some(true), None),
+            (json!({"credits": {"unlimited": true}}), None, Some(true)),
+            (json!({"credits": {"unlimited": false}}), None, Some(false)),
+        ] {
+            let usage = parse(&response(body, Some("NaN")), now()).unwrap();
+            let credits = usage.credits.unwrap();
+            assert_eq!(credits.balance, None);
+            assert_eq!(credits.has_credits, has_credits);
+            assert_eq!(credits.unlimited, unlimited);
+        }
+    }
+
+    #[test]
+    fn header_balances_preserve_raw_decimal_values() {
+        for (header, expected) in [("12.75", 12.75), ("-12.75", -12.75), ("1e20", 1e20)] {
+            let usage = parse(&response(json!({}), Some(header)), now()).unwrap();
+            assert_eq!(usage.credits.unwrap().balance, Some(expected));
+        }
+    }
+
+    #[test]
+    fn invalid_headers_do_not_invent_credit_balance() {
+        for header in INVALID_HEADERS {
+            let usage = parse(
+                &response(
+                    json!({"rate_limit": {"primary_window": {"used_percent": 20}}}),
+                    header,
+                ),
+                now(),
+            )
+            .unwrap();
+            assert!(usage.credits.is_none(), "header {header:?}");
+        }
+    }
+
+    #[test]
+    fn missing_or_invalid_header_without_meaningful_data_is_rejected() {
+        for header in INVALID_HEADERS {
+            for body in [
+                json!({}),
+                json!({"credits": {}}),
+                json!({"credits": {"balance": "NaN", "has_credits": "false", "unlimited": 1}}),
+            ] {
+                let error = parse(&response(body, header), now())
+                    .err()
+                    .expect("no recognized data");
+                assert_eq!(
+                    error.to_string(),
+                    "Codex usage API returned no recognized usage data"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_text_credit_header_is_not_recognized() {
+        let mut response = response(json!({}), None);
+        response.headers.insert(
+            "x-codex-credits-balance",
+            HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert!(parse(&response, now()).is_err());
+    }
 }
