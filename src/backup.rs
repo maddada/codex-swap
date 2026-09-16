@@ -2,7 +2,7 @@ use crate::{
     auth,
     cli::{Cli, Output},
     fsutil, launch, sharing,
-    store::{Account, Store},
+    store::{Account, Store, require_registered_identity},
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -47,14 +47,11 @@ pub fn export(cli: &Cli, file: &Path, identifier: Option<&str>, output: &Output)
         Some(identifier) => vec![store.resolve(identifier)?],
         None => store.data.accounts.clone(),
     };
-    let sources = accounts
+    let live = store.observe_live_account();
+    let sources: Vec<_> = accounts
         .iter()
-        .map(|account| {
-            store
-                .effective_account(account)
-                .map(|effective| effective.home)
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .map(|account| store.effective_account(account, live.as_ref()).home)
+        .collect();
     if accounts.is_empty() {
         bail!("no accounts to export");
     }
@@ -64,10 +61,9 @@ pub fn export(cli: &Cli, file: &Path, identifier: Option<&str>, output: &Output)
         .collect::<Result<_>>()?;
     let mut exported = Vec::new();
     for (account, home) in accounts.into_iter().zip(sources) {
+        let saved = require_registered_identity(account.number, &account.identity)?;
         let (auth, identity) = auth::credentials(&home)?;
-        if account.identity.as_ref().is_some_and(|saved| {
-            saved.account_id != identity.account_id || saved.email != identity.email
-        }) {
+        if !saved.same_owner(&identity) {
             bail!(
                 "account credentials changed identity; save the intended login with xswap add before exporting"
             );
@@ -200,11 +196,8 @@ pub fn import(cli: &Cli, file: &Path, remap_slots: bool, output: &Output) -> Res
         store.data.default = imported_default;
     }
     store.data.accounts.sort_by_key(|a| a.number);
-    store.save()?;
     let count = staged.len();
-    for dir in staged {
-        let _ = dir.keep();
-    }
+    crate::account_state::commit_new_accounts(&store, staged)?;
     emit(
         json!({"schemaVersion": 1, "imported": count, "slots": mappings}),
         output,

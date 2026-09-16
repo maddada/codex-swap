@@ -1,7 +1,7 @@
 use crate::{
     auth::Identity,
     cli::{Cli, Output},
-    store::{Account, Store},
+    store::{Account, Store, require_registered_identity},
     usage_client,
     usage_model::{self, Usage},
 };
@@ -39,6 +39,47 @@ impl From<Account> for Target {
             identity: account.identity,
         }
     }
+}
+
+fn reports(
+    targets: Vec<Target>,
+    mut fetch: impl FnMut(&Target) -> Result<(Identity, usage_client::Response)>,
+) -> Vec<AccountUsage> {
+    let mut reports = Vec::new();
+    for target in targets {
+        let result = match target.number {
+            Some(number) => {
+                require_registered_identity(number, &target.identity).and_then(|_| fetch(&target))
+            }
+            None => fetch(&target),
+        };
+        let fetched = Utc::now();
+        let (identity, usage, error) = match result {
+            Ok((identity, response)) => match usage_model::parse(&response, fetched) {
+                Ok(usage) => (Some(identity), Some(usage), None),
+                Err(error) => (Some(identity), None, Some(format!("{error:#}"))),
+            },
+            Err(error) => (
+                target
+                    .identity
+                    .clone()
+                    .filter(|identity| identity.has_owner()),
+                None,
+                Some(format!("{error:#}")),
+            ),
+        };
+        let labels = identity.as_ref().or(target.identity.as_ref());
+        reports.push(AccountUsage {
+            number: target.number,
+            alias: target.alias,
+            email: labels.and_then(|identity| identity.email.clone()),
+            account_id: identity.map(|identity| identity.account_id),
+            fetched_at: usage_model::timestamp(fetched),
+            usage,
+            error,
+        });
+    }
+    reports
 }
 
 fn duration(seconds: i64) -> String {
@@ -137,16 +178,17 @@ fn human(report: &AccountUsage) {
 /// User: implement standalone Codex usage percentages, quota windows, reset times and pacing using OpenUsage's Codex integration as the reference.
 pub fn show(cli: &Cli, identifier: Option<&str>, all: bool, output: &Output) -> Result<()> {
     let store = Store::open(cli)?;
+    let live = store.observe_live_account();
     let targets: Vec<Target> = if all {
         store
             .data
             .accounts
             .iter()
-            .map(|account| store.effective_account(account).map(Into::into))
-            .collect::<Result<_>>()?
+            .map(|account| store.effective_account(account, live.as_ref()).into())
+            .collect()
     } else {
         vec![match store.selected(identifier)? {
-            Some(account) => store.effective_account(&account)?.into(),
+            Some(account) => store.effective_account(&account, live.as_ref()).into(),
             None => Target {
                 number: None,
                 alias: None,
@@ -161,29 +203,9 @@ pub fn show(cli: &Cli, identifier: Option<&str>, all: bool, output: &Output) -> 
         .collect::<Result<_>>()?;
     drop(store);
     let client = usage_client::client()?;
-    let mut reports = Vec::new();
-    for target in targets {
-        let result = usage_client::fetch(&client, &target.home, &target.identity);
-        let fetched = Utc::now();
-        let (identity, usage, error) = match result {
-            Ok((identity, response)) => match usage_model::parse(&response, fetched) {
-                Ok(usage) => (Some(identity), Some(usage), None),
-                Err(error) => (Some(identity), None, Some(format!("{error:#}"))),
-            },
-            Err(error) => (target.identity, None, Some(format!("{error:#}"))),
-        };
-        reports.push(AccountUsage {
-            number: target.number,
-            alias: target.alias,
-            email: identity
-                .as_ref()
-                .and_then(|identity| identity.email.clone()),
-            account_id: identity.map(|identity| identity.account_id),
-            fetched_at: usage_model::timestamp(fetched),
-            usage,
-            error,
-        });
-    }
+    let reports = reports(targets, |target| {
+        usage_client::fetch(&client, &target.home, &target.identity)
+    });
     drop(leases);
     let failures = reports
         .iter()
@@ -206,6 +228,91 @@ pub fn show(cli: &Cli, identifier: Option<&str>, all: bool, output: &Output) -> 
         bail!("usage unavailable for {failures} account(s)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_usage_batch_reports_incomplete_setup_and_keeps_healthy_results() {
+        let identity = Identity {
+            account_id: "workspace-1".into(),
+            user_id: Some("user-1".into()),
+            email: Some("first@example.test".into()),
+            plan: None,
+            legacy_hint_unusable: false,
+        };
+        let mut ownerless = identity.clone();
+        ownerless.user_id = None;
+        ownerless.email = None;
+        let mut unresolved = ownerless.clone();
+        unresolved.email = Some("stored-label@example.test".into());
+        unresolved.legacy_hint_unusable = true;
+        let mut targets = Vec::new();
+        for (number, owner) in [
+            (1, Some(identity.clone())),
+            (2, None),
+            (3, Some(ownerless)),
+            (4, Some(unresolved)),
+        ] {
+            targets.push(
+                Account {
+                    number,
+                    alias: Some(format!("slot-{number}")),
+                    home: PathBuf::from("unused-synthetic-home"),
+                    managed: true,
+                    share_history: false,
+                    identity: owner,
+                    enabled: true,
+                }
+                .into(),
+            );
+        }
+        targets.push(Target {
+            number: None,
+            alias: None,
+            home: PathBuf::from("unused-main-home"),
+            identity: None,
+        });
+        let mut fetched = Vec::new();
+        let reports = reports(targets, |target| {
+            fetched.push(target.number);
+            Ok((
+                identity.clone(),
+                usage_client::Response {
+                    body: json!({"rate_limit": {"allowed": true, "primary_window": {"used_percent": 12.0, "limit_window_seconds": 18000}}}),
+                    headers: Default::default(),
+                },
+            ))
+        });
+        assert_eq!(fetched, vec![Some(1), None]);
+        assert_eq!(reports.len(), 5);
+        assert!(reports[0].error.is_none());
+        assert_eq!(
+            reports[0].usage.as_ref().unwrap().windows[0].used_percent,
+            12.0
+        );
+        for report in &reports[1..4] {
+            assert!(
+                report
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("setup is incomplete")
+            );
+            assert!(report.usage.is_none());
+            assert!(report.account_id.is_none());
+        }
+        assert!(reports[1].email.is_none());
+        assert!(reports[2].email.is_none());
+        assert_eq!(
+            reports[3].email.as_deref(),
+            Some("stored-label@example.test")
+        );
+        assert!(reports[4].error.is_none());
+        assert!(reports[4].usage.is_some());
+    }
 }
 
 #[cfg(test)]

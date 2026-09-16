@@ -3,8 +3,11 @@ use fs2::FileExt;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
+
+#[cfg(test)]
+pub(crate) mod test_faults;
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -22,6 +25,11 @@ pub fn user_home() -> Result<PathBuf> {
     }
     Ok(home)
 }
+
+#[cfg(windows)]
+pub use crate::platform::config_user_home;
+#[cfg(unix)]
+pub use user_home as config_user_home;
 
 pub fn default_data_dir(home: &Path) -> Result<PathBuf> {
     #[cfg(unix)]
@@ -51,6 +59,93 @@ pub fn absolute(path: &Path) -> Result<PathBuf> {
     }
     let parent = path.parent().context("directory has no parent")?;
     Ok(absolute(parent)?.join(path.file_name().context("directory has no name")?))
+}
+
+/// Resolve a Codex config path against its original directory, without touching
+/// the filesystem. The base and user home must already be absolute.
+/// Matches Codex's `utils/absolute-path` home expansion and lexical resolution;
+/// Windows drive-relative and namespace paths need the same platform handling.
+pub fn resolve_config_path(path: &Path, base: &Path, home: &Path) -> PathBuf {
+    let expanded = match path.to_str().and_then(|path| path.strip_prefix('~')) {
+        Some("") => home.to_owned(),
+        Some(rest) if rest.starts_with('/') => home.join(rest.trim_start_matches('/')),
+        Some(rest) if cfg!(windows) && rest.starts_with('\\') => {
+            home.join(rest.trim_start_matches('\\'))
+        }
+        _ => path.to_owned(),
+    };
+    let joined = config_path_with_base(&expanded, base);
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => (),
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+#[cfg(not(windows))]
+fn config_path_with_base(path: &Path, base: &Path) -> PathBuf {
+    base.join(path)
+}
+
+#[cfg(windows)]
+fn config_path_with_base(path: &Path, base: &Path) -> PathBuf {
+    let path = normalize_windows_config_path(path);
+    let base = normalize_windows_config_path(base);
+    if path.is_absolute() || path.has_root() {
+        return base.join(path);
+    }
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return base.join(path);
+    };
+    let mut joined = PathBuf::from(prefix.as_os_str());
+    if components.clone().next().is_none() {
+        joined.push(std::path::MAIN_SEPARATOR_STR);
+        return joined;
+    }
+    let skip_prefix = matches!(base.components().next(), Some(Component::Prefix(_)));
+    for component in base
+        .components()
+        .skip(usize::from(skip_prefix))
+        .chain(components)
+    {
+        joined.push(component.as_os_str());
+    }
+    joined
+}
+
+#[cfg(windows)]
+fn normalize_windows_config_path(path: &Path) -> PathBuf {
+    if let Some(text) = path.to_str() {
+        if let Some(unc) = text
+            .strip_prefix(r"\\?\UNC\")
+            .or_else(|| text.strip_prefix(r"\\.\UNC\"))
+        {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(drive) = text
+            .strip_prefix(r"\\?\")
+            .or_else(|| text.strip_prefix(r"\\.\"))
+        {
+            let bytes = drive.as_bytes();
+            if bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'\\' | b'/')
+            {
+                return PathBuf::from(drive);
+            }
+        }
+    }
+    path.to_owned()
 }
 
 pub fn private_dir(path: &Path) -> Result<()> {
@@ -138,12 +233,16 @@ fn write_json(path: &Path, value: &impl serde::Serialize, no_clobber: bool) -> R
     serde_json::to_writer_pretty(&mut temp, value)?;
     temp.write_all(b"\n")?;
     temp.as_file().sync_all()?;
+    #[cfg(test)]
+    test_faults::check(path, test_faults::Point::BeforeCommit)?;
     if no_clobber {
         temp.persist_noclobber(path)
             .context("create private JSON file; destination must not exist")?;
     } else {
         temp.persist(path).context("commit private JSON file")?;
     }
+    #[cfg(test)]
+    test_faults::check(path, test_faults::Point::AfterCommit)?;
     #[cfg(unix)]
     File::open(parent)?.sync_all()?;
     #[cfg(windows)]
@@ -227,4 +326,122 @@ pub fn private_tempdir(parent: &Path, prefix: &str) -> Result<tempfile::TempDir>
     crate::platform::own_new(dir.path())?;
     private_dir(dir.path())?;
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_paths_expand_home_and_normalize_without_creating_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("missing/main");
+        let home = root.path().join("missing/user");
+        for (value, expected) in [
+            ("~", home.clone()),
+            ("~/state", home.join("state")),
+            (
+                "~///state/./missing/../数据库 with spaces",
+                home.join("state/数据库 with spaces"),
+            ),
+            ("~someone/state", base.join("~someone/state")),
+            (
+                "state/./missing/../数据库 with spaces",
+                base.join("state/数据库 with spaces"),
+            ),
+            ("../state", root.path().join("missing/state")),
+            ("", base.clone()),
+            (".", base.clone()),
+        ] {
+            assert_eq!(
+                resolve_config_path(Path::new(value), &base, &home),
+                expected
+            );
+        }
+        let absolute = root.path().join("absolute/missing/../state");
+        assert_eq!(
+            resolve_config_path(&absolute, &base, &home),
+            root.path().join("absolute/state")
+        );
+        assert!(!root.path().join("missing").exists());
+        assert!(!root.path().join("absolute").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_paths_preserve_symlinks_and_unix_backslashes() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("main");
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &base).unwrap();
+        assert_eq!(
+            resolve_config_path(Path::new("state"), &base, root.path()),
+            base.join("state")
+        );
+        assert_eq!(
+            resolve_config_path(Path::new(r"~\state"), &base, root.path()),
+            base.join(r"~\state")
+        );
+        assert_eq!(
+            resolve_config_path(Path::new("../../state"), Path::new("/"), root.path()),
+            PathBuf::from("/state")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn config_home_uses_native_profile_when_userprofile_differs() {
+        if let Some(expected) = std::env::var_os("XSWAP_TEST_NATIVE_CONFIG_HOME") {
+            let home = config_user_home().unwrap();
+            assert_eq!(home, PathBuf::from(expected));
+            assert_ne!(home, user_home().unwrap());
+            assert_eq!(resolve_config_path(Path::new("~"), &home, &home), home);
+            return;
+        }
+        let home = config_user_home().unwrap();
+        let spoofed = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "fsutil::tests::config_home_uses_native_profile_when_userprofile_differs",
+                "--exact",
+            ])
+            .env("XSWAP_TEST_NATIVE_CONFIG_HOME", home)
+            .env("USERPROFILE", spoofed.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn config_paths_follow_windows_home_drive_and_namespace_semantics() {
+        let base = Path::new(r"\\?\C:\base\cwd");
+        let home = Path::new(r"C:\Users\fixture");
+        for (value, expected) in [
+            (
+                r"~\\state\missing\..\数据库 with spaces",
+                r"C:\Users\fixture\state\数据库 with spaces",
+            ),
+            (r"\state", r"C:\state"),
+            (r"D:state", r"D:\base\cwd\state"),
+            (r"D:", r"D:\"),
+            (r"state\missing\..\final", r"C:\base\cwd\state\final"),
+            (r"\\?\D:\missing\..\state", r"D:\state"),
+            (r"\\.\D:\missing\..\state", r"D:\state"),
+            (
+                r"\\?\UNC\server\share\missing\..\state",
+                r"\\server\share\state",
+            ),
+            (
+                r"\\.\UNC\server\share\missing\..\state",
+                r"\\server\share\state",
+            ),
+        ] {
+            assert_eq!(
+                resolve_config_path(Path::new(value), base, home),
+                PathBuf::from(expected)
+            );
+        }
+    }
 }

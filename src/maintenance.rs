@@ -34,7 +34,7 @@ fn real_directory(path: &Path) -> Result<()> {
 
 /// CDXC:AgentProviders 2026-09-06 WHY:
 /// Removing the registry lock file would allow a concurrent process to lock a new inode while purge still holds the old one.
-/// Purge retains lock files and removes only the registry and managed account tree; shared links are unlinked without following their targets.
+/// Purge retains lock files and removes the registry, managed account tree and abandoned login homes; shared links are unlinked without following their targets.
 pub fn purge(cli: &Cli, yes: bool, output: &Output) -> Result<()> {
     let store = Store::open(cli)?;
     let profiles = store.root.join("accounts");
@@ -47,6 +47,7 @@ pub fn purge(cli: &Cli, yes: bool, output: &Output) -> Result<()> {
                 .filter(|a| !a.managed)
                 .map(|a| &a.home),
         )
+        .map(|home| home.as_path())
         .collect();
     for home in &protected {
         let home = fsutil::absolute(home)?;
@@ -81,7 +82,9 @@ pub fn purge(cli: &Cli, yes: bool, output: &Output) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
         Err(error) => return Err(error.into()),
     }
-    // Lock forgotten managed homes too, because remove intentionally retains their data.
+    let staging = crate::login_staging::directories(&store, &protected)?;
+    homes.extend(staging.iter().map(|directory| directory.path().to_owned()));
+    // Lock forgotten managed homes and staging too: remove retains data, and login releases Store.
     let _leases: Vec<_> = homes
         .iter()
         .map(|home| store.lease(home, true))
@@ -93,8 +96,9 @@ pub fn purge(cli: &Cli, yes: bool, output: &Output) -> Result<()> {
             );
         }
         eprintln!(
-            "Delete the xswap registry and {} managed account home(s) under {}? Original/adopted homes and shared data will remain.",
+            "Delete the xswap registry, {} managed account home(s) and {} login staging home(s) under {}? Original/adopted homes and shared data will remain.",
             managed_homes.len(),
+            staging.len(),
             store.root.display()
         );
         eprint!("Type purge to confirm: ");
@@ -106,6 +110,10 @@ pub fn purge(cli: &Cli, yes: bool, output: &Output) -> Result<()> {
         }
     }
     // std::fs::remove_dir_all does not follow symbolic links, including shared history/config.
+    let mut staging_removed = 0;
+    for directory in staging {
+        staging_removed += usize::from(directory.remove(&store.root)?);
+    }
     for home in &managed_homes {
         fs::remove_dir_all(home)
             .with_context(|| format!("remove managed home {}", home.display()))?;
@@ -121,13 +129,14 @@ pub fn purge(cli: &Cli, yes: bool, output: &Output) -> Result<()> {
     if output.json {
         serde_json::to_writer_pretty(
             std::io::stdout().lock(),
-            &json!({"schemaVersion": 1, "purged": true, "managedHomesRemoved": managed_homes.len(), "retainedHomes": protected, "retainedLockDirectory": store.root}),
+            &json!({"schemaVersion": 1, "purged": true, "managedHomesRemoved": managed_homes.len(), "loginStagingHomesRemoved": staging_removed, "retainedHomes": protected, "retainedLockDirectory": store.root}),
         )?;
         println!();
     } else {
         println!(
-            "Purged xswap registry and {} managed account home(s). Original/adopted homes and lock files retained.",
-            managed_homes.len()
+            "Purged xswap registry, {} managed account home(s) and {} login staging home(s). Original/adopted homes and lock files retained.",
+            managed_homes.len(),
+            staging_removed
         );
     }
     Ok(())

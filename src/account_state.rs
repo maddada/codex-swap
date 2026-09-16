@@ -8,6 +8,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+mod tests;
+
 struct Transaction {
     previous: Vec<(PathBuf, Option<Value>)>,
     directories: Vec<tempfile::TempDir>,
@@ -32,6 +35,37 @@ impl Transaction {
         fsutil::atomic_json(path, value)
     }
 
+    fn restore(path: &Path, previous: Option<Value>) -> Result<()> {
+        match previous {
+            Some(value) => fsutil::atomic_json(path, &value),
+            None => {
+                #[cfg(test)]
+                fsutil::test_faults::check(path, fsutil::test_faults::Point::RollbackRemove)?;
+                match std::fs::remove_file(path) {
+                    Ok(()) => {
+                        #[cfg(unix)]
+                        {
+                            // Make removal durable before staged homes can be deleted.
+                            #[cfg(test)]
+                            fsutil::test_faults::check(
+                                path,
+                                fsutil::test_faults::Point::RollbackSync,
+                            )?;
+                            let parent = path
+                                .parent()
+                                .filter(|p| !p.as_os_str().is_empty())
+                                .unwrap_or(Path::new("."));
+                            std::fs::File::open(parent)?.sync_all()?;
+                        }
+                        Ok(())
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error.into()),
+                }
+            }
+        }
+    }
+
     fn finish(mut self, result: Result<()>) -> Result<()> {
         match result {
             Ok(()) => {
@@ -51,15 +85,7 @@ impl Transaction {
                         // TempDir removes these only after every existing file was restored.
                         continue;
                     }
-                    let restored = match previous {
-                        Some(value) => fsutil::atomic_json(&path, &value),
-                        None => match std::fs::remove_file(&path) {
-                            Ok(()) => Ok(()),
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                            Err(error) => Err(error.into()),
-                        },
-                    };
-                    if let Err(restore) = restored {
+                    if let Err(restore) = Self::restore(&path, previous) {
                         failures.push(format!("{}: {restore:#}", path.display()));
                     }
                 }
@@ -68,17 +94,31 @@ impl Transaction {
                 } else {
                     // A failed registry restore may still refer to newly created homes.
                     // Retain them for recovery rather than deleting their credentials.
-                    for directory in self.directories {
-                        let _ = directory.keep();
-                    }
+                    let homes: Vec<_> = self
+                        .directories
+                        .into_iter()
+                        .map(|directory| directory.keep().display().to_string())
+                        .collect();
                     Err(error.context(format!(
-                        "account rollback also failed; new account homes retained for recovery: {}",
+                        "account rollback also failed; retained new account homes for recovery: [{}]; restore errors: {}",
+                        homes.join(", "),
                         failures.join("; ")
                     )))
                 }
             }
         }
     }
+}
+
+/// Keep staged credentials owned until the registry commit or its rollback is resolved.
+pub(crate) fn commit_new_accounts(
+    store: &Store,
+    directories: Vec<tempfile::TempDir>,
+) -> Result<()> {
+    let mut transaction = Transaction::new();
+    transaction.directories = directories;
+    let result = transaction.write(&store.root.join("accounts.json"), &store.data);
+    transaction.finish(result)
 }
 
 fn profile(
@@ -100,10 +140,6 @@ fn profile(
     Ok(path)
 }
 
-fn same_identity(a: &auth::Identity, b: &auth::Identity) -> bool {
-    a.account_id == b.account_id && a.email == b.email
-}
-
 pub(crate) struct LoginDestination {
     pub account: Account,
     pub effective_home: PathBuf,
@@ -120,7 +156,10 @@ pub(crate) fn commit_login(
     let mut account = store.resolve(&destination.account.number.to_string())?;
     if account.home != destination.account.home
         || account.identity != destination.account.identity
-        || store.effective_account(&account)?.home != destination.effective_home
+        || store
+            .effective_account(&account, store.observe_live_account().as_ref())
+            .home
+            != destination.effective_home
     {
         bail!(
             "account selection changed during login; retry xswap login {}",
@@ -130,10 +169,10 @@ pub(crate) fn commit_login(
     if account
         .identity
         .as_ref()
-        .is_some_and(|expected| !same_identity(expected, &identity))
+        .is_some_and(|expected| !expected.same_owner(&identity))
     {
         bail!(
-            "Codex signed into a different account; saved credentials were unchanged. Retry xswap login {} and choose the registered account",
+            "Codex signed into a different account or its saved owner is unresolved; saved credentials were unchanged. Retry xswap login {} for a known owner. An unresolved legacy owner needs xswap add --login --email <owner> --slot <unused-slot>",
             account.number
         );
     }
@@ -167,10 +206,13 @@ pub(crate) fn commit_login(
     transaction.finish(result)
 }
 
-/// CDXC:AgentProviders 2026-09-06 WHY:
-/// Older registries registered the mutable original home in place, so its login must be preserved before global activation replaces that file.
-/// A legacy identity already overwritten outside xswap cannot be recovered; retain its slot as requiring login instead of assigning another account's credentials.
-fn migrate_original(store: &mut Store, transaction: &mut Transaction) -> Result<()> {
+struct OriginalProjection {
+    account: Account,
+    credentials: Option<Value>,
+    needs_login: bool,
+}
+
+fn project_original(store: &Store) -> Result<Option<OriginalProjection>> {
     let Some(legacy) = store
         .data
         .accounts
@@ -178,34 +220,57 @@ fn migrate_original(store: &mut Store, transaction: &mut Transaction) -> Result<
         .find(|a| a.home == store.data.main_home)
         .cloned()
     else {
-        return Ok(());
+        return Ok(None);
     };
-    let home = profile(store, transaction, legacy.number, true)?;
-    if let Some(live) = auth::identity(&store.data.main_home)? {
-        if legacy
+    let mut projection = OriginalProjection {
+        account: legacy,
+        credentials: None,
+        needs_login: false,
+    };
+    if let Some((document, live)) = auth::optional_credentials(&store.data.main_home)? {
+        if projection
+            .account
             .identity
             .as_ref()
-            .is_none_or(|saved| same_identity(saved, &live))
+            .is_some_and(|saved| saved.same_owner(&live))
         {
-            let (document, _) = auth::credentials(&store.data.main_home)?;
-            transaction.write(&home.join("auth.json"), &document)?;
+            projection.account.identity = Some(live);
+            projection.credentials = Some(document);
         } else {
-            eprintln!(
-                "Original slot {} needs sign-in again: its old login was replaced before xswap could snapshot it.",
-                legacy.number
-            );
+            projection.needs_login = true;
         }
     }
-    let account = store
+    Ok(Some(projection))
+}
+
+/// CDXC:AgentProviders 2026-09-06 WHY:
+/// Older registries registered the mutable original home in place, so its login must be preserved before global activation replaces that file.
+/// A legacy identity already overwritten outside xswap cannot be recovered; retain its slot as requiring login instead of assigning another account's credentials.
+fn migrate_original(store: &mut Store, transaction: &mut Transaction) -> Result<()> {
+    let Some(mut original) = project_original(store)? else {
+        return Ok(());
+    };
+    let home = profile(store, transaction, original.account.number, true)?;
+    if let Some(document) = original.credentials {
+        transaction.write(&home.join("auth.json"), &document)?;
+    }
+    if original.needs_login {
+        eprintln!(
+            "Original slot {} needs sign-in again: its saved owner could not be matched to the current login. Use xswap login for a known owner; an unknown legacy owner needs xswap add --login --email <owner> --slot <unused-slot>.",
+            original.account.number
+        );
+    }
+    original.account.home = home;
+    original.account.managed = true;
+    original.account.share_history = true;
+    let number = original.account.number;
+    *store
         .data
         .accounts
         .iter_mut()
-        .find(|a| a.number == legacy.number)
-        .unwrap();
-    account.home = home;
-    account.managed = true;
-    account.share_history = true;
-    store.data.original_account.get_or_insert(legacy.number);
+        .find(|a| a.number == number)
+        .unwrap() = original.account;
+    store.data.original_account.get_or_insert(number);
     Ok(())
 }
 
@@ -234,16 +299,7 @@ fn capture(
     shared: bool,
 ) -> Result<Account> {
     let (document, identity) = auth::credentials(source)?;
-    let existing = store
-        .data
-        .accounts
-        .iter()
-        .find(|a| {
-            a.identity
-                .as_ref()
-                .is_some_and(|id| same_identity(id, &identity))
-        })
-        .cloned();
+    let existing = store.account_for_identity(&identity)?;
     let number = slot
         .or_else(|| existing.as_ref().map(|a| a.number))
         .unwrap_or(store.data.next_number);
@@ -262,14 +318,7 @@ fn capture(
     }
     let account = if let Some(mut account) = existing {
         if let Some(alias) = alias {
-            store
-                .data
-                .accounts
-                .iter_mut()
-                .find(|a| a.number == account.number)
-                .unwrap()
-                .alias = None;
-            store.validate_alias(&Some(alias.clone()))?;
+            store.validate_alias_except(&Some(alias.clone()), Some(account.number))?;
             account.alias = Some(alias);
         }
         if !account.managed {
@@ -318,6 +367,17 @@ fn capture(
     Ok(account)
 }
 
+fn validate_snapshot_alias(store: &Store, source: &Path, alias: &Option<String>) -> Result<()> {
+    let identity = auth::require(source)?;
+    let mut accounts = store.data.accounts.clone();
+    if let Some(original) = project_original(store)? {
+        let number = original.account.number;
+        *accounts.iter_mut().find(|a| a.number == number).unwrap() = original.account;
+    }
+    let existing = Store::account_for_identity_in(&accounts, &identity)?.map(|a| a.number);
+    store.validate_alias_except(alias, existing)
+}
+
 /// CDXC:AgentProviders 2026-09-06 DECISION:
 /// The user requested claude-swap registration and global switching: add snapshots the current login, and switch activates credentials for bare Codex launches.
 /// Re-registering the same identity refreshes its existing slot and preserves its alias unless an alias is supplied.
@@ -331,6 +391,7 @@ pub fn snapshot(
     let mut store = Store::open(cli)?;
     let source = fsutil::absolute(source.unwrap_or(&store.data.main_home))?;
     launch::validate_file_store(&source)?;
+    validate_snapshot_alias(&store, &source, &alias)?;
     crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
     let mut homes: std::collections::BTreeSet<_> =
         store.data.accounts.iter().map(|a| a.home.clone()).collect();
@@ -434,16 +495,246 @@ pub fn select_global(cli: &Cli, identifier: Option<&str>) -> Result<()> {
             capture(&mut store, &mut transaction, &main, None, None, false)?;
         }
         let selected = store.resolve(&selected.number.to_string())?;
-        auth::verify(&selected.home, &selected.identity)?;
-        let (document, _) = auth::credentials(&selected.home)?;
+        let (document, identity) = auth::verified_credentials(&selected.home, &selected.identity)?;
         crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
         if fsutil::optional_bytes(&store.data.main_home.join("auth.json"))? != original_live {
             bail!("the current Codex login changed during switching; stop Codex and retry");
         }
         transaction.write(&store.data.main_home.join("auth.json"), &document)?;
+        store
+            .data
+            .accounts
+            .iter_mut()
+            .find(|account| account.number == selected.number)
+            .context("account was removed")?
+            .identity = Some(identity);
         store.data.default = default;
         store.data.accounts.sort_by_key(|a| a.number);
         transaction.write(&store.root.join("accounts.json"), &store.data)
     })();
     transaction.finish(result)
+}
+
+#[cfg(test)]
+#[path = "identity_tests.rs"]
+mod identity_tests;
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde_json::json;
+
+    fn shared_workspace_login(uid: &str) -> Value {
+        let payload = URL_SAFE_NO_PAD.encode(format!(
+            r#"{{"email":"shared@example.invalid","https://api.openai.com/auth":{{"chatgpt_user_id":"{uid}"}}}}"#,
+        ));
+        json!({"auth_mode": "chatgpt", "tokens": {
+            "account_id": "synthetic-shared-workspace", "access_token": "synthetic-access",
+            "refresh_token": "synthetic-refresh", "id_token": format!("e30.{payload}.synthetic")
+        }})
+    }
+
+    fn legacy_fixture(saved_source: bool) -> (tempfile::TempDir, Store, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            data_dir: Some(directory.path().join("data")),
+            codex_home: Some(directory.path().join("main")),
+            codex_bin: None,
+            command: crate::cli::Action::List(crate::cli::Output { json: false }),
+        };
+        let source = directory.path().join("source");
+        fsutil::private_dir(&source).unwrap();
+        let mut store = Store::open(&cli).unwrap();
+        fsutil::private_dir(&store.data.main_home).unwrap();
+        fsutil::atomic_json(
+            &store.data.main_home.join("auth.json"),
+            &shared_workspace_login("synthetic-user-1"),
+        )
+        .unwrap();
+        fsutil::atomic_json(
+            &source.join("auth.json"),
+            &shared_workspace_login("synthetic-user-2"),
+        )
+        .unwrap();
+        let mut legacy_identity = auth::require(&store.data.main_home).unwrap();
+        legacy_identity.user_id = None;
+        store.data.accounts.push(Account {
+            number: 1,
+            alias: Some("work".into()),
+            home: store.data.main_home.clone(),
+            managed: false,
+            share_history: false,
+            identity: Some(legacy_identity),
+            enabled: true,
+        });
+        if saved_source {
+            store.data.accounts.push(Account {
+                number: 2,
+                alias: Some("personal".into()),
+                home: source.clone(),
+                managed: false,
+                share_history: false,
+                identity: Some(auth::require(&source).unwrap()),
+                enabled: true,
+            });
+        }
+        store.data.next_number = if saved_source { 3 } else { 2 };
+        store.save().unwrap();
+        drop(store);
+        (directory, Store::open(&cli).unwrap(), source)
+    }
+
+    #[test]
+    fn legacy_alias_collision_is_rejected_before_migration() {
+        let (_directory, store, source) = legacy_fixture(false);
+        let paths = [
+            store.root.join("accounts.json"),
+            store.data.main_home.join("auth.json"),
+            source.join("auth.json"),
+        ];
+        let before: Vec<_> = paths
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        let error = validate_snapshot_alias(&store, &source, &Some("work".into())).unwrap_err();
+        assert!(error.to_string().contains("alias is already in use"));
+        for (path, bytes) in paths.iter().zip(before) {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        assert_eq!(std::fs::read_dir(&store.data.main_home).unwrap().count(), 1);
+        assert!(!store.root.join("accounts").exists());
+        assert!(
+            store.data.accounts[0]
+                .identity
+                .as_ref()
+                .unwrap()
+                .user_id
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_alias_refresh_matches_the_projected_owner() {
+        let (_directory, mut store, source) = legacy_fixture(true);
+        let alias = Some("personal".to_string());
+        validate_snapshot_alias(&store, &source, &alias).unwrap();
+        assert!(
+            store.data.accounts[0]
+                .identity
+                .as_ref()
+                .unwrap()
+                .user_id
+                .is_none()
+        );
+        let mut transaction = Transaction::new();
+        migrate_original(&mut store, &mut transaction).unwrap();
+        let captured = capture(&mut store, &mut transaction, &source, alias, None, false).unwrap();
+        transaction.finish(Ok(())).unwrap();
+        assert_eq!(captured.number, 2);
+        assert_eq!(captured.alias.as_deref(), Some("personal"));
+        assert_eq!(store.data.accounts.len(), 2);
+        assert_eq!(store.data.next_number, 3);
+        assert_eq!(
+            store.data.accounts[0]
+                .identity
+                .as_ref()
+                .unwrap()
+                .user_id
+                .as_deref(),
+            Some("synthetic-user-1")
+        );
+        assert_eq!(
+            captured.identity.as_ref().unwrap().user_id.as_deref(),
+            Some("synthetic-user-2")
+        );
+    }
+
+    #[test]
+    fn snapshot_alias_preflight_preserves_own_slot_refreshes() {
+        let directory = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            data_dir: Some(directory.path().join("data")),
+            codex_home: Some(directory.path().join("main")),
+            codex_bin: None,
+            command: crate::cli::Action::List(crate::cli::Output { json: false }),
+        };
+        let mut store = Store::open(&cli).unwrap();
+        let source = store.data.main_home.clone();
+        let saved_home = store.root.join("saved-home");
+        fsutil::private_dir(&source).unwrap();
+        fsutil::private_dir(&saved_home).unwrap();
+        let payload = URL_SAFE_NO_PAD.encode(
+            r#"{"email":"user@example.invalid","https://api.openai.com/auth":{"chatgpt_user_id":"synthetic-user-1"}}"#,
+        );
+        let document = json!({"auth_mode": "chatgpt", "tokens": {
+            "account_id": "synthetic-workspace", "access_token": "synthetic-refreshed",
+            "refresh_token": "synthetic-refresh", "id_token": format!("e30.{payload}.synthetic")
+        }});
+        fsutil::atomic_json(&source.join("auth.json"), &document).unwrap();
+        let mut previous = document.clone();
+        previous["tokens"]["access_token"] = json!("synthetic-previous");
+        fsutil::atomic_json(&saved_home.join("auth.json"), &previous).unwrap();
+        store.data.accounts.push(Account {
+            number: 1,
+            alias: Some("work-team".into()),
+            home: saved_home.clone(),
+            managed: true,
+            share_history: false,
+            identity: Some(auth::require(&source).unwrap()),
+            enabled: true,
+        });
+        store.data.accounts.push(Account {
+            number: 2,
+            alias: Some("personal".into()),
+            home: store.root.join("other-home"),
+            managed: true,
+            share_history: false,
+            identity: None,
+            enabled: true,
+        });
+        store.data.next_number = 3;
+        for alias in [None, Some("WORK-TEAM"), Some("work.team"), Some("_work")] {
+            validate_snapshot_alias(&store, &source, &alias.map(String::from)).unwrap();
+        }
+        assert!(validate_snapshot_alias(&store, &source, &Some("-work".into())).is_err());
+        assert!(validate_snapshot_alias(&store, &source, &Some("PERSONAL".into())).is_err());
+
+        let mut transaction = Transaction::new();
+        let account = capture(
+            &mut store,
+            &mut transaction,
+            &source,
+            Some("WORK-TEAM".into()),
+            None,
+            false,
+        )
+        .unwrap();
+        transaction.finish(Ok(())).unwrap();
+        assert_eq!(account.number, 1);
+        assert_eq!(account.alias.as_deref(), Some("WORK-TEAM"));
+        assert_eq!(account.home, saved_home);
+        assert_eq!(store.data.accounts.len(), 2);
+        assert_eq!(store.data.next_number, 3);
+        assert_eq!(auth::credentials(&saved_home).unwrap().0, document);
+        store.data.accounts[0].identity.as_mut().unwrap().user_id = Some("synthetic-user-2".into());
+        assert!(
+            validate_snapshot_alias(&store, &source, &Some("WORK-TEAM".into()))
+                .unwrap_err()
+                .to_string()
+                .contains("alias is already in use")
+        );
+        validate_snapshot_alias(&store, &source, &Some("another-team".into())).unwrap();
+
+        store.data.accounts[0].identity.as_mut().unwrap().user_id = None;
+        store.data.accounts[1].identity = store.data.accounts[0].identity.clone();
+        for alias in [None, Some("WORK-TEAM"), Some("another-team")] {
+            assert!(
+                validate_snapshot_alias(&store, &source, &alias.map(String::from))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ambiguous saved account identity")
+            );
+        }
+    }
 }
