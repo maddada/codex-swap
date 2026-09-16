@@ -8,6 +8,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+mod tests;
+
 struct Transaction {
     previous: Vec<(PathBuf, Option<Value>)>,
     directories: Vec<tempfile::TempDir>,
@@ -32,6 +35,37 @@ impl Transaction {
         fsutil::atomic_json(path, value)
     }
 
+    fn restore(path: &Path, previous: Option<Value>) -> Result<()> {
+        match previous {
+            Some(value) => fsutil::atomic_json(path, &value),
+            None => {
+                #[cfg(test)]
+                fsutil::test_faults::check(path, fsutil::test_faults::Point::RollbackRemove)?;
+                match std::fs::remove_file(path) {
+                    Ok(()) => {
+                        #[cfg(unix)]
+                        {
+                            // Make removal durable before staged homes can be deleted.
+                            #[cfg(test)]
+                            fsutil::test_faults::check(
+                                path,
+                                fsutil::test_faults::Point::RollbackSync,
+                            )?;
+                            let parent = path
+                                .parent()
+                                .filter(|p| !p.as_os_str().is_empty())
+                                .unwrap_or(Path::new("."));
+                            std::fs::File::open(parent)?.sync_all()?;
+                        }
+                        Ok(())
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error.into()),
+                }
+            }
+        }
+    }
+
     fn finish(mut self, result: Result<()>) -> Result<()> {
         match result {
             Ok(()) => {
@@ -51,15 +85,7 @@ impl Transaction {
                         // TempDir removes these only after every existing file was restored.
                         continue;
                     }
-                    let restored = match previous {
-                        Some(value) => fsutil::atomic_json(&path, &value),
-                        None => match std::fs::remove_file(&path) {
-                            Ok(()) => Ok(()),
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                            Err(error) => Err(error.into()),
-                        },
-                    };
-                    if let Err(restore) = restored {
+                    if let Err(restore) = Self::restore(&path, previous) {
                         failures.push(format!("{}: {restore:#}", path.display()));
                     }
                 }
@@ -68,17 +94,31 @@ impl Transaction {
                 } else {
                     // A failed registry restore may still refer to newly created homes.
                     // Retain them for recovery rather than deleting their credentials.
-                    for directory in self.directories {
-                        let _ = directory.keep();
-                    }
+                    let homes: Vec<_> = self
+                        .directories
+                        .into_iter()
+                        .map(|directory| directory.keep().display().to_string())
+                        .collect();
                     Err(error.context(format!(
-                        "account rollback also failed; new account homes retained for recovery: {}",
+                        "account rollback also failed; retained new account homes for recovery: [{}]; restore errors: {}",
+                        homes.join(", "),
                         failures.join("; ")
                     )))
                 }
             }
         }
     }
+}
+
+/// Keep staged credentials owned until the registry commit or its rollback is resolved.
+pub(crate) fn commit_new_accounts(
+    store: &Store,
+    directories: Vec<tempfile::TempDir>,
+) -> Result<()> {
+    let mut transaction = Transaction::new();
+    transaction.directories = directories;
+    let result = transaction.write(&store.root.join("accounts.json"), &store.data);
+    transaction.finish(result)
 }
 
 fn profile(

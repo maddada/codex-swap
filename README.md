@@ -232,6 +232,8 @@ xswap import accounts-backup.json --remap-slots
 
 Import creates fresh managed account homes and validates all accounts before saving the registry. Imported shared settings/history use the destination computer’s main Codex home. Duplicate identities or aliases are refused. Occupied slots are refused unless `--remap-slots` is provided; remapping allocates free slots and prints the assignments. Failed validation leaves the saved registry unchanged and removes staged credentials. An import restores its backed-up launch default into an empty registry; an established registry keeps its existing launch default. Import does not change the installed global Codex login or redefine the destination’s original account. Use `xswap switch ACCOUNT` when you want to activate an imported account globally.
 
+If saving the registry fails during import or `add --login`, xswap restores the previous registry before removing the new account homes. If that restoration also fails, xswap retains the new homes and reports their paths for recovery.
+
 Export reads the latest main-home credentials for the globally active account and the saved home for inactive accounts. It refuses while a selected account is running under an xswap lease, so finish that launch first. Imported credentials do not invalidate the original copy, but Codex’s refresh-token behavior still applies when using copies on multiple machines.
 
 ## What is shared

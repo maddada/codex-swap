@@ -196,11 +196,8 @@ pub fn import(cli: &Cli, file: &Path, remap_slots: bool, output: &Output) -> Res
         store.data.default = imported_default;
     }
     store.data.accounts.sort_by_key(|a| a.number);
-    store.save()?;
     let count = staged.len();
-    for dir in staged {
-        let _ = dir.keep();
-    }
+    crate::account_state::commit_new_accounts(&store, staged)?;
     emit(
         json!({"schemaVersion": 1, "imported": count, "slots": mappings}),
         output,

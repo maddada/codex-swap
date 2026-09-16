@@ -6,6 +6,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+#[cfg(test)]
+pub(crate) mod test_faults;
+
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -230,12 +233,16 @@ fn write_json(path: &Path, value: &impl serde::Serialize, no_clobber: bool) -> R
     serde_json::to_writer_pretty(&mut temp, value)?;
     temp.write_all(b"\n")?;
     temp.as_file().sync_all()?;
+    #[cfg(test)]
+    test_faults::check(path, test_faults::Point::BeforeCommit)?;
     if no_clobber {
         temp.persist_noclobber(path)
             .context("create private JSON file; destination must not exist")?;
     } else {
         temp.persist(path).context("commit private JSON file")?;
     }
+    #[cfg(test)]
+    test_faults::check(path, test_faults::Point::AfterCommit)?;
     #[cfg(unix)]
     File::open(parent)?.sync_all()?;
     #[cfg(windows)]

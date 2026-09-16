@@ -17,6 +17,9 @@ mod usage;
 mod usage_client;
 mod usage_model;
 
+#[cfg(all(test, unix))]
+mod new_account_tests;
+
 use clap::Parser;
 use cli::{Action, Cli};
 
