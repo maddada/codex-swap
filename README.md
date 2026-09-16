@@ -10,11 +10,13 @@ Supports macOS 11 or newer, Linux, WSL and native Windows on ARM64 and x86-64. I
 
 ### Homebrew (recommended)
 
-Add the tap and [trust the Codex Swap formula](https://docs.brew.sh/Tap-Trust), then install:
+Run this command to install on macOS and linux (requires homebrew to be installed)
 
 ```sh
-brew tap maddada/tap && brew trust --formula maddada/tap/codex-swap && brew install maddada/tap/codex-swap && xswap --version
+brew tap maddada/tap && brew trust --formula maddada/tap/codex-swap && brew install maddada/tap/codex-swap
 ```
+
+This command add the tap, marks it as trusted, then installs codex-swap.
 
 Homebrew installs a prebuilt `xswap` executable. Rust and Cargo are not required. Linux releases are statically linked with musl, so they do not depend on a particular glibc version.
 
