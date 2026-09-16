@@ -20,8 +20,13 @@ struct Fixture {
 }
 
 fn credentials(account: &str, access: &str) -> Value {
-    let payload = URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&json!({"email": "synthetic@example.test"})).unwrap());
+    let payload = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "email": "synthetic@example.test",
+            "https://api.openai.com/auth": {"chatgpt_user_id": "synthetic-user"}
+        }))
+        .unwrap(),
+    );
     json!({"auth_mode": "chatgpt", "tokens": {
         "account_id": account, "id_token": format!("synthetic.{payload}.sig"),
         "access_token": access, "refresh_token": "synthetic-refresh"
@@ -79,7 +84,7 @@ impl Fixture {
                 "nextNumber": 2, "default": 1, "directoryMappings": {}, "accounts": [{
                     "number": 1, "alias": "synthetic", "home": fixture.saved,
                     "managed": false, "shareHistory": false, "enabled": true,
-                    "identity": {"accountId": "synthetic-account", "email": "synthetic@example.test", "plan": null}
+                    "identity": {"accountId": "synthetic-account", "userId": "synthetic-user", "email": "synthetic@example.test", "plan": null}
                 }]})).unwrap(),
         );
         #[cfg(unix)]
@@ -321,7 +326,9 @@ fn legacy_main_errors_do_not_hide_separate_accounts() {
     write(&registry_path, serde_json::to_vec(&registry).unwrap());
     let (listed, _) = fixture.listed();
     assert_eq!(listed["accounts"][0]["loginStatus"], "present");
-    assert_eq!(listed["accounts"][1]["loginStatus"], "invalid_credentials");
+    assert_eq!(listed["accounts"][1]["loginStatus"], "login_required");
+    assert!(listed["accounts"][1]["accountId"].is_null());
+    assert!(listed["accounts"][1]["userId"].is_null());
     #[cfg(unix)]
     {
         assert_failure(
