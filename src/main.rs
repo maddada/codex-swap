@@ -3,8 +3,10 @@ mod auth;
 mod backup;
 mod cli;
 mod commands;
+mod config_assets;
 mod fsutil;
 mod launch;
+mod login_staging;
 mod maintenance;
 mod mappings;
 mod platform;
@@ -15,6 +17,9 @@ mod upgrade;
 mod usage;
 mod usage_client;
 mod usage_model;
+
+#[cfg(all(test, unix))]
+mod new_account_tests;
 
 use clap::Parser;
 use cli::{Action, Cli};

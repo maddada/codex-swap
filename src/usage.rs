@@ -1,7 +1,7 @@
 use crate::{
     auth::Identity,
     cli::{Cli, Output},
-    store::{Account, Store},
+    store::{Account, Store, require_registered_identity},
     usage_client,
     usage_model::{self, Usage},
 };
@@ -41,6 +41,47 @@ impl From<Account> for Target {
     }
 }
 
+fn reports(
+    targets: Vec<Target>,
+    mut fetch: impl FnMut(&Target) -> Result<(Identity, usage_client::Response)>,
+) -> Vec<AccountUsage> {
+    let mut reports = Vec::new();
+    for target in targets {
+        let result = match target.number {
+            Some(number) => {
+                require_registered_identity(number, &target.identity).and_then(|_| fetch(&target))
+            }
+            None => fetch(&target),
+        };
+        let fetched = Utc::now();
+        let (identity, usage, error) = match result {
+            Ok((identity, response)) => match usage_model::parse(&response, fetched) {
+                Ok(usage) => (Some(identity), Some(usage), None),
+                Err(error) => (Some(identity), None, Some(format!("{error:#}"))),
+            },
+            Err(error) => (
+                target
+                    .identity
+                    .clone()
+                    .filter(|identity| identity.has_owner()),
+                None,
+                Some(format!("{error:#}")),
+            ),
+        };
+        let labels = identity.as_ref().or(target.identity.as_ref());
+        reports.push(AccountUsage {
+            number: target.number,
+            alias: target.alias,
+            email: labels.and_then(|identity| identity.email.clone()),
+            account_id: identity.map(|identity| identity.account_id),
+            fetched_at: usage_model::timestamp(fetched),
+            usage,
+            error,
+        });
+    }
+    reports
+}
+
 fn duration(seconds: i64) -> String {
     if seconds >= 86_400 {
         format!("{}d {}h", seconds / 86_400, seconds % 86_400 / 3600)
@@ -69,6 +110,9 @@ fn human(report: &AccountUsage) {
         return;
     }
     let Some(usage) = &report.usage else { return };
+    for warning in &usage.warnings {
+        println!("  Warning: {}", warning.escape_default());
+    }
     if let Some(plan) = &usage.plan {
         println!("  Plan: {}", plan.escape_default());
     }
@@ -134,16 +178,17 @@ fn human(report: &AccountUsage) {
 /// User: implement standalone Codex usage percentages, quota windows, reset times and pacing using OpenUsage's Codex integration as the reference.
 pub fn show(cli: &Cli, identifier: Option<&str>, all: bool, output: &Output) -> Result<()> {
     let store = Store::open(cli)?;
+    let live = store.observe_live_account();
     let targets: Vec<Target> = if all {
         store
             .data
             .accounts
             .iter()
-            .map(|account| store.effective_account(account).map(Into::into))
-            .collect::<Result<_>>()?
+            .map(|account| store.effective_account(account, live.as_ref()).into())
+            .collect()
     } else {
         vec![match store.selected(identifier)? {
-            Some(account) => store.effective_account(&account)?.into(),
+            Some(account) => store.effective_account(&account, live.as_ref()).into(),
             None => Target {
                 number: None,
                 alias: None,
@@ -158,29 +203,9 @@ pub fn show(cli: &Cli, identifier: Option<&str>, all: bool, output: &Output) -> 
         .collect::<Result<_>>()?;
     drop(store);
     let client = usage_client::client()?;
-    let mut reports = Vec::new();
-    for target in targets {
-        let result = usage_client::fetch(&client, &target.home, &target.identity);
-        let fetched = Utc::now();
-        let (identity, usage, error) = match result {
-            Ok((identity, response)) => match usage_model::parse(&response, fetched) {
-                Ok(usage) => (Some(identity), Some(usage), None),
-                Err(error) => (Some(identity), None, Some(format!("{error:#}"))),
-            },
-            Err(error) => (target.identity, None, Some(format!("{error:#}"))),
-        };
-        reports.push(AccountUsage {
-            number: target.number,
-            alias: target.alias,
-            email: identity
-                .as_ref()
-                .and_then(|identity| identity.email.clone()),
-            account_id: identity.map(|identity| identity.account_id),
-            fetched_at: usage_model::timestamp(fetched),
-            usage,
-            error,
-        });
-    }
+    let reports = reports(targets, |target| {
+        usage_client::fetch(&client, &target.home, &target.identity)
+    });
     drop(leases);
     let failures = reports
         .iter()
@@ -203,4 +228,201 @@ pub fn show(cli: &Cli, identifier: Option<&str>, all: bool, output: &Output) -> 
         bail!("usage unavailable for {failures} account(s)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mixed_usage_batch_reports_incomplete_setup_and_keeps_healthy_results() {
+        let identity = Identity {
+            account_id: "workspace-1".into(),
+            user_id: Some("user-1".into()),
+            email: Some("first@example.test".into()),
+            plan: None,
+            legacy_hint_unusable: false,
+        };
+        let mut ownerless = identity.clone();
+        ownerless.user_id = None;
+        ownerless.email = None;
+        let mut unresolved = ownerless.clone();
+        unresolved.email = Some("stored-label@example.test".into());
+        unresolved.legacy_hint_unusable = true;
+        let mut targets = Vec::new();
+        for (number, owner) in [
+            (1, Some(identity.clone())),
+            (2, None),
+            (3, Some(ownerless)),
+            (4, Some(unresolved)),
+        ] {
+            targets.push(
+                Account {
+                    number,
+                    alias: Some(format!("slot-{number}")),
+                    home: PathBuf::from("unused-synthetic-home"),
+                    managed: true,
+                    share_history: false,
+                    identity: owner,
+                    enabled: true,
+                }
+                .into(),
+            );
+        }
+        targets.push(Target {
+            number: None,
+            alias: None,
+            home: PathBuf::from("unused-main-home"),
+            identity: None,
+        });
+        let mut fetched = Vec::new();
+        let reports = reports(targets, |target| {
+            fetched.push(target.number);
+            Ok((
+                identity.clone(),
+                usage_client::Response {
+                    body: json!({"rate_limit": {"allowed": true, "primary_window": {"used_percent": 12.0, "limit_window_seconds": 18000}}}),
+                    headers: Default::default(),
+                },
+            ))
+        });
+        assert_eq!(fetched, vec![Some(1), None]);
+        assert_eq!(reports.len(), 5);
+        assert!(reports[0].error.is_none());
+        assert_eq!(
+            reports[0].usage.as_ref().unwrap().windows[0].used_percent,
+            12.0
+        );
+        for report in &reports[1..4] {
+            assert!(
+                report
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("setup is incomplete")
+            );
+            assert!(report.usage.is_none());
+            assert!(report.account_id.is_none());
+        }
+        assert!(reports[1].email.is_none());
+        assert!(reports[2].email.is_none());
+        assert_eq!(
+            reports[3].email.as_deref(),
+            Some("stored-label@example.test")
+        );
+        assert!(reports[4].error.is_none());
+        assert!(reports[4].usage.is_some());
+    }
+}
+
+#[cfg(test)]
+mod additional_limit_json_regressions {
+    use super::*;
+    use chrono::DateTime;
+    use reqwest::header::HeaderMap;
+
+    #[test]
+    fn additional_limits_account_json_keeps_windows_and_sanitized_warnings() {
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let usage = usage_model::parse(
+            &usage_client::Response {
+                headers: HeaderMap::new(),
+                body: json!({
+                    "rate_limit": {"primary_window": {"used_percent": 20}},
+                    "additional_rate_limits": [
+                        null,
+                        {"limit_name": "healthy", "rate_limit": {"primary_window": {"used_percent": 30}}},
+                        {"limit_name": "SYNTHETIC_PRIVATE_MARKER\n", "rate_limit": {"primary_window": {"used_percent": "SYNTHETIC_PRIVATE_MARKER\n"}}}
+                    ]
+                }),
+            },
+            now,
+        )
+        .unwrap();
+        let report = AccountUsage {
+            number: Some(1),
+            alias: None,
+            email: None,
+            account_id: None,
+            fetched_at: usage_model::timestamp(now),
+            usage: Some(usage),
+            error: None,
+        };
+        let json = json!({"schemaVersion": 1, "accounts": [report]});
+        let account = &json["accounts"][0];
+        assert!(account["error"].is_null());
+        assert_eq!(account["usage"]["windows"][0]["usedPercent"], 20.0);
+        assert_eq!(account["usage"]["windows"][1]["usedPercent"], 30.0);
+        let warnings = account["usage"]["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].as_str().unwrap().contains("entry 1"));
+        assert!(warnings[1].as_str().unwrap().contains("entry 3"));
+        assert!(!json.to_string().contains("SYNTHETIC_PRIVATE_MARKER"));
+    }
+}
+
+#[cfg(test)]
+mod credit_header_output_regressions {
+    use super::*;
+    use reqwest::header::HeaderMap;
+    use std::process::Command;
+
+    #[test]
+    fn credit_header_reaches_json_and_human_output() {
+        const CHILD: &str = "XSWAP_TEST_CREDIT_HEADER_OUTPUT";
+        if std::env::var_os(CHILD).is_some() {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-codex-credits-balance", "12.5".parse().unwrap());
+            let fetched = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+            let report = AccountUsage {
+                number: None,
+                alias: Some("offline fixture".into()),
+                email: None,
+                account_id: None,
+                fetched_at: usage_model::timestamp(fetched),
+                usage: Some(
+                    usage_model::parse(
+                        &usage_client::Response {
+                            body: json!({}),
+                            headers,
+                        },
+                        fetched,
+                    )
+                    .unwrap(),
+                ),
+                error: None,
+            };
+            human(&report);
+            println!(
+                "CREDIT_HEADER_JSON:{}",
+                serde_json::to_string(&json!({"schemaVersion": 1, "accounts": [report]})).unwrap()
+            );
+            return;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "usage::credit_header_output_regressions::credit_header_reaches_json_and_human_output", "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("  Extra usage credits: 12.5"), "{stdout}");
+        let json = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("CREDIT_HEADER_JSON:"))
+            .unwrap();
+        let output: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(output["schemaVersion"], 1);
+        assert_eq!(output["accounts"][0]["usage"]["credits"]["balance"], 12.5);
+        assert!(output["accounts"][0]["usage"]["credits"]["hasCredits"].is_null());
+        assert!(output["accounts"][0]["usage"]["credits"]["unlimited"].is_null());
+        assert_eq!(
+            output["accounts"][0]["fetchedAt"],
+            usage_model::timestamp(chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap())
+        );
+    }
 }

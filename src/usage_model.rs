@@ -12,6 +12,8 @@ pub struct Usage {
     pub limit_reached: Option<bool>,
     pub windows: Vec<Window>,
     pub credits: Option<Credits>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -178,35 +180,57 @@ pub fn parse(response: &Response, now: DateTime<Utc>) -> Result<Usage> {
     let body = &response.body;
     let rate = &body["rate_limit"];
     let mut all = windows("codex", rate, Some(response), now)?;
-    for key in ["additional_rate_limits", "code_review_rate_limit"] {
-        if key == "code_review_rate_limit" {
-            all.extend(windows("code_review", &body[key], None, now)?);
-            continue;
-        }
-        if body[key].is_null() {
-            continue;
-        }
-        let limits = body[key]
-            .as_array()
-            .context("Codex usage contains invalid additional limits")?;
+    let mut warnings = Vec::new();
+    if let Some(limits) = body["additional_rate_limits"].as_array() {
         for (index, limit) in limits.iter().enumerate() {
-            if !limit.is_object() {
-                bail!("Codex usage contains an invalid additional limit");
+            if !limit.is_object() || limit["rate_limit"].is_null() {
+                warnings.push(format!(
+                    "Skipped additional_rate_limits entry {}: missing or invalid rate limit",
+                    index + 1
+                ));
+                continue;
             }
             let scope = limit["limit_name"]
                 .as_str()
                 .or_else(|| limit["metered_feature"].as_str())
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("additional_{}", index + 1));
-            all.extend(windows(&scope, &limit["rate_limit"], None, now)?);
+            match windows(&scope, &limit["rate_limit"], None, now) {
+                Ok(windows) => all.extend(windows),
+                Err(error) => warnings.push(format!(
+                    "Skipped additional_rate_limits entry {}: {error}",
+                    index + 1
+                )),
+            }
         }
+    } else if !body["additional_rate_limits"].is_null() {
+        warnings.push("Skipped additional_rate_limits: expected an array".into());
     }
-    let credits = body["credits"].as_object().map(|credits| Credits {
-        balance: credits.get("balance").and_then(number),
-        has_credits: credits.get("has_credits").and_then(Value::as_bool),
-        unlimited: credits.get("unlimited").and_then(Value::as_bool),
+    all.extend(windows(
+        "code_review",
+        &body["code_review_rate_limit"],
+        None,
+        now,
+    )?);
+    let has_credits = body["credits"]["has_credits"].as_bool();
+    let unlimited = body["credits"]["unlimited"].as_bool();
+    let balance = number(&body["credits"]["balance"])
+        .or_else(|| (has_credits == Some(false)).then_some(0.0))
+        .or_else(|| {
+            let header = response
+                .headers
+                .get("x-codex-credits-balance")?
+                .to_str()
+                .ok()?;
+            number(&Value::String(header.to_owned()))
+        });
+    let has_credit_data = balance.is_some() || has_credits.is_some() || unlimited.is_some();
+    let credits = (body["credits"].is_object() || has_credit_data).then_some(Credits {
+        balance,
+        has_credits,
+        unlimited,
     });
-    if all.is_empty() && credits.is_none() && !rate.is_object() {
+    if all.is_empty() && !has_credit_data && !rate.is_object() {
         bail!("Codex usage API returned no recognized usage data");
     }
     Ok(Usage {
@@ -215,5 +239,425 @@ pub fn parse(response: &Response, now: DateTime<Utc>) -> Result<Usage> {
         limit_reached: rate["limit_reached"].as_bool(),
         windows: all,
         credits,
+        warnings,
     })
+}
+
+#[cfg(test)]
+mod additional_limit_regressions {
+    use super::*;
+    use reqwest::header::HeaderMap;
+    use serde_json::json;
+
+    fn rate(used: f64) -> Value {
+        json!({"primary_window": {
+            "used_percent": used,
+            "limit_window_seconds": 18_000,
+            "reset_after_seconds": 9_000
+        }})
+    }
+
+    fn limit(scope: &str, used: f64) -> Value {
+        json!({"limit_name": scope, "rate_limit": rate(used)})
+    }
+
+    fn parse_body(body: Value) -> Result<Usage> {
+        parse(
+            &Response {
+                headers: HeaderMap::new(),
+                body,
+            },
+            DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+        )
+    }
+
+    fn invalid_rates() -> Vec<Value> {
+        let mut invalid = vec![
+            json!("invalid"),
+            json!({"primary_window": "invalid"}),
+            json!({"primary_window": rate(30.0)["primary_window"], "secondary_window": false}),
+        ];
+        for (field, value) in [
+            ("used_percent", json!("NaN")),
+            ("used_percent", json!("Infinity")),
+            ("used_percent", json!("SYNTHETIC_PRIVATE_MARKER\n")),
+            ("used_percent", json!(-1)),
+            ("limit_window_seconds", json!(0)),
+            ("limit_window_seconds", json!(-1)),
+            ("limit_window_seconds", json!(1.5)),
+            ("reset_after_seconds", json!(9_223_372_036_854_774_784_u64)),
+            ("reset_at", json!(300_000_000_000_000_i64)),
+        ] {
+            let mut bad = rate(30.0);
+            bad["primary_window"][field] = value;
+            invalid.push(bad);
+        }
+        invalid
+    }
+
+    #[test]
+    fn additional_limits_skip_null_and_nonobject_entries_around_healthy_siblings() {
+        let usage = parse_body(json!({
+            "rate_limit": rate(20.0),
+            "additional_rate_limits": [
+                null,
+                limit("GPT-5.3-Codex-Spark", 30.0),
+                "invalid",
+                12,
+                false,
+                limit("other-model", 40.0)
+            ]
+        }))
+        .unwrap();
+        assert_eq!(usage.windows.len(), 3);
+        assert_eq!(usage.warnings.len(), 4);
+        for (window, (scope, used)) in usage.windows.iter().zip([
+            ("codex", 20.0),
+            ("GPT-5.3-Codex-Spark", 30.0),
+            ("other-model", 40.0),
+        ]) {
+            assert_eq!(window.scope, scope);
+            assert_eq!(window.used_percent, used);
+            assert_eq!(window.window_seconds, Some(18_000));
+            assert_eq!(window.resets_at_epoch_seconds, Some(1_800_009_000));
+            assert_eq!(window.reset_after_seconds, Some(9_000));
+        }
+    }
+
+    #[test]
+    fn additional_limits_bound_nested_validation_errors_to_each_entry() {
+        let mut bad_entries = vec![json!({}), json!({"rate_limit": null})];
+        bad_entries.extend(
+            invalid_rates().into_iter().map(
+                |rate| json!({"limit_name": "SYNTHETIC_PRIVATE_MARKER\n", "rate_limit": rate}),
+            ),
+        );
+        for bad in bad_entries {
+            let usage = parse_body(json!({
+                "rate_limit": rate(20.0),
+                "additional_rate_limits": [
+                    bad.clone(), limit("healthy-one", 30.0), bad, limit("healthy-two", 40.0)
+                ]
+            }))
+            .unwrap();
+            assert_eq!(usage.windows.len(), 3);
+            assert_eq!(usage.windows[0].used_percent, 20.0);
+            assert_eq!(usage.windows[1].scope, "healthy-one");
+            assert_eq!(usage.windows[1].used_percent, 30.0);
+            assert_eq!(usage.windows[2].scope, "healthy-two");
+            assert_eq!(usage.windows[2].used_percent, 40.0);
+            assert_eq!(usage.warnings.len(), 2);
+            assert!(usage.warnings[0].contains("entry 1"));
+            assert!(usage.warnings[1].contains("entry 3"));
+            assert!(
+                !usage
+                    .warnings
+                    .join(" ")
+                    .contains("SYNTHETIC_PRIVATE_MARKER")
+            );
+        }
+    }
+
+    #[test]
+    fn additional_limits_optional_field_shapes_preserve_core_and_code_review() {
+        for optional in [
+            None,
+            Some(Value::Null),
+            Some(json!({})),
+            Some(json!("invalid")),
+            Some(json!(false)),
+        ] {
+            let warns = optional.as_ref().is_some_and(|value| !value.is_null());
+            let mut body = json!({"rate_limit": rate(20.0), "code_review_rate_limit": rate(50.0)});
+            if let Some(optional) = optional {
+                body["additional_rate_limits"] = optional;
+            }
+            let usage = parse_body(body).unwrap();
+            assert_eq!(usage.windows.len(), 2);
+            assert_eq!(usage.windows[0].scope, "codex");
+            assert_eq!(usage.windows[1].scope, "code_review");
+            assert_eq!(usage.warnings.len(), usize::from(warns));
+        }
+    }
+
+    #[test]
+    fn additional_limits_keep_scope_precedence_and_original_ordinals() {
+        let usage = parse_body(json!({"additional_rate_limits": [
+            null,
+            {"rate_limit": rate(20.0)},
+            {"metered_feature": "feature", "rate_limit": rate(30.0)},
+            {"limit_name": "named", "metered_feature": "feature", "rate_limit": rate(40.0)}
+        ]}))
+        .unwrap();
+        let scopes: Vec<_> = usage
+            .windows
+            .iter()
+            .map(|window| window.scope.as_str())
+            .collect();
+        assert_eq!(scopes, ["additional_2", "feature", "named"]);
+    }
+
+    #[test]
+    fn additional_limits_do_not_hide_malformed_core_or_code_review() {
+        for bad in invalid_rates() {
+            for key in ["rate_limit", "code_review_rate_limit"] {
+                let mut body = json!({
+                    "rate_limit": rate(20.0),
+                    "additional_rate_limits": [limit("healthy", 30.0)]
+                });
+                body[key] = bad.clone();
+                assert!(parse_body(body).is_err(), "malformed {key} must fail");
+            }
+        }
+    }
+
+    #[test]
+    fn additional_limits_unusable_response_still_has_no_recognized_data() {
+        for optional in [
+            json!("invalid"),
+            json!([null, "invalid", {}, {"rate_limit": null}]),
+            json!([{ "rate_limit": {"primary_window": {"used_percent": "NaN"}} }]),
+            json!([{ "rate_limit": {"primary_window": null} }]),
+        ] {
+            let error = parse_body(json!({"additional_rate_limits": optional}))
+                .err()
+                .expect("no usable windows or account data must fail");
+            assert!(error.to_string().contains("no recognized usage data"));
+        }
+    }
+
+    #[test]
+    fn additional_limits_absent_windows_do_not_invent_usage_or_warnings() {
+        let usage = parse_body(json!({
+            "rate_limit": rate(20.0),
+            "additional_rate_limits": [
+                {"rate_limit": {}},
+                {"rate_limit": {"primary_window": null}},
+                {"rate_limit": {"primary_window": {"used_percent": null}}},
+                {"rate_limit": {"primary_window": {"limit_window_seconds": 18_000}}}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows[0].used_percent, 20.0);
+        assert!(usage.warnings.is_empty());
+        assert!(
+            serde_json::to_value(usage)
+                .unwrap()
+                .get("warnings")
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod credit_header_regressions {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use serde_json::json;
+
+    const INVALID_HEADERS: [Option<&str>; 9] = [
+        None,
+        Some(""),
+        Some(" "),
+        Some("invalid"),
+        Some("NaN"),
+        Some("inf"),
+        Some("-inf"),
+        Some("Infinity"),
+        Some("1e999"),
+    ];
+
+    fn response(body: Value, header: Option<&str>) -> Response {
+        let mut headers = HeaderMap::new();
+        if let Some(header) = header {
+            headers.insert("x-codex-credits-balance", header.parse().unwrap());
+        }
+        Response { body, headers }
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000, 0).unwrap()
+    }
+
+    #[test]
+    fn credit_header_is_retained_beside_core_quota() {
+        let usage = parse(
+            &response(
+                json!({"rate_limit": {"primary_window": {
+                    "used_percent": 20,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 9000
+                }}}),
+                Some("12.5"),
+            ),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows[0].kind, "session");
+        assert_eq!(usage.windows[0].remaining_percent, 80.0);
+        let credits = usage.credits.unwrap();
+        assert_eq!(credits.balance, Some(12.5));
+        assert_eq!(credits.has_credits, None);
+        assert_eq!(credits.unlimited, None);
+    }
+
+    #[test]
+    fn credit_header_counts_as_recognized_usage() {
+        let usage = parse(&response(json!({}), Some("12.5")), now()).unwrap();
+        assert!(usage.windows.is_empty());
+        assert_eq!(usage.credits.unwrap().balance, Some(12.5));
+    }
+
+    #[test]
+    fn valid_body_balance_wins_over_header_and_false_flag() {
+        for (balance, expected) in [
+            (json!(0), 0.0),
+            (json!(12.75), 12.75),
+            (json!("-12.75"), -12.75),
+            (json!("1e20"), 1e20),
+        ] {
+            let usage = parse(
+                &response(
+                    json!({"credits": {
+                        "balance": balance,
+                        "has_credits": false,
+                        "unlimited": true
+                    }}),
+                    Some("99"),
+                ),
+                now(),
+            )
+            .unwrap();
+            let credits = usage.credits.unwrap();
+            assert_eq!(credits.balance, Some(expected));
+            assert_eq!(credits.has_credits, Some(false));
+            assert_eq!(credits.unlimited, Some(true));
+        }
+    }
+
+    #[test]
+    fn credit_header_preserves_body_flags() {
+        let usage = parse(
+            &response(
+                json!({"credits": {"has_credits": true, "unlimited": false}}),
+                Some("12.5"),
+            ),
+            now(),
+        )
+        .unwrap();
+        let credits = usage.credits.unwrap();
+        assert_eq!(credits.balance, Some(12.5));
+        assert_eq!(credits.has_credits, Some(true));
+        assert_eq!(credits.unlimited, Some(false));
+    }
+
+    #[test]
+    fn credit_header_fills_missing_or_unusable_body_balance() {
+        for body in [
+            json!({}),
+            json!({"credits": null}),
+            json!({"credits": {}}),
+            json!({"credits": {"balance": null}}),
+            json!({"credits": {"balance": false}}),
+            json!({"credits": {"balance": {}}}),
+            json!({"credits": {"balance": "invalid"}}),
+            json!({"credits": {"balance": "NaN"}}),
+            json!({"credits": {"balance": "Infinity"}}),
+            json!({"credits": {"balance": "1e999"}}),
+        ] {
+            let usage = parse(&response(body, Some("12.5")), now()).unwrap();
+            assert_eq!(usage.credits.unwrap().balance, Some(12.5));
+        }
+    }
+
+    #[test]
+    fn explicit_false_supplies_zero_before_credit_header() {
+        for balance in [json!(null), json!("invalid"), json!("NaN")] {
+            let usage = parse(
+                &response(
+                    json!({"credits": {
+                        "balance": balance,
+                        "has_credits": false,
+                        "unlimited": false
+                    }}),
+                    Some("99"),
+                ),
+                now(),
+            )
+            .unwrap();
+            let credits = usage.credits.unwrap();
+            assert_eq!(credits.balance, Some(0.0));
+            assert_eq!(credits.has_credits, Some(false));
+            assert_eq!(credits.unlimited, Some(false));
+        }
+    }
+
+    #[test]
+    fn meaningful_flags_preserve_unknown_balance() {
+        for (body, has_credits, unlimited) in [
+            (json!({"credits": {"has_credits": true}}), Some(true), None),
+            (json!({"credits": {"unlimited": true}}), None, Some(true)),
+            (json!({"credits": {"unlimited": false}}), None, Some(false)),
+        ] {
+            let usage = parse(&response(body, Some("NaN")), now()).unwrap();
+            let credits = usage.credits.unwrap();
+            assert_eq!(credits.balance, None);
+            assert_eq!(credits.has_credits, has_credits);
+            assert_eq!(credits.unlimited, unlimited);
+        }
+    }
+
+    #[test]
+    fn header_balances_preserve_raw_decimal_values() {
+        for (header, expected) in [("12.75", 12.75), ("-12.75", -12.75), ("1e20", 1e20)] {
+            let usage = parse(&response(json!({}), Some(header)), now()).unwrap();
+            assert_eq!(usage.credits.unwrap().balance, Some(expected));
+        }
+    }
+
+    #[test]
+    fn invalid_headers_do_not_invent_credit_balance() {
+        for header in INVALID_HEADERS {
+            let usage = parse(
+                &response(
+                    json!({"rate_limit": {"primary_window": {"used_percent": 20}}}),
+                    header,
+                ),
+                now(),
+            )
+            .unwrap();
+            assert!(usage.credits.is_none(), "header {header:?}");
+        }
+    }
+
+    #[test]
+    fn missing_or_invalid_header_without_meaningful_data_is_rejected() {
+        for header in INVALID_HEADERS {
+            for body in [
+                json!({}),
+                json!({"credits": {}}),
+                json!({"credits": {"balance": "NaN", "has_credits": "false", "unlimited": 1}}),
+            ] {
+                let error = parse(&response(body, header), now())
+                    .err()
+                    .expect("no recognized data");
+                assert_eq!(
+                    error.to_string(),
+                    "Codex usage API returned no recognized usage data"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_text_credit_header_is_not_recognized() {
+        let mut response = response(json!({}), None);
+        response.headers.insert(
+            "x-codex-credits-balance",
+            HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert!(parse(&response, now()).is_err());
+    }
 }
