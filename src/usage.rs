@@ -328,7 +328,6 @@ mod credit_header_output_regressions {
             let report = AccountUsage {
                 number: None,
                 alias: Some("offline fixture".into()),
-                user_id: None,
                 email: None,
                 account_id: None,
                 fetched_at: usage_model::timestamp(fetched),
