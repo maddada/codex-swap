@@ -318,6 +318,7 @@ fn staged_login_rejects_another_member_and_refreshes_the_registered_owner() -> R
     let destination = LoginDestination {
         account: account.clone(),
         effective_home: account.home.clone(),
+        concurrent: true,
         previous: vec![(path.clone(), previous.clone())],
     };
     drop(store);

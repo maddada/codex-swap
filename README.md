@@ -279,7 +279,7 @@ xswap remove work
 
 Reauthentication shows the expected saved account and opens a fresh Codex sign-in. Choosing the wrong browser account or cancelling leaves existing credentials unchanged. Retry the same `xswap login ACCOUNT` command and select the intended account; this also repairs a saved home left with another account’s credentials by an older version. A successful sign-in preserves the slot, alias and mappings.
 
-Reauthentication and removal refuse while that account has a live xswap launch lease. Reauthenticating the globally active account also requires existing Codex processes to be closed before its main-home credentials are replaced. Other accounts remain available during login.
+Reauthentication works while Codex sessions on that account keep running: the new login replaces the same account's credentials, and running sessions pick it up the next time they refresh their token. Replacing a main-home login that belongs to a different account still requires existing Codex processes to be closed first. Removal refuses while that account has a live xswap launch lease. Other accounts remain available during login.
 
 `remove` unregisters the account and prints its retained directory. It does **not** delete credentials or history, and does not log out Codex. Removing the selected launch default returns future launches to the saved original account when available. Removal does not rewrite the installed global login. Slot numbers are not automatically reused.
 

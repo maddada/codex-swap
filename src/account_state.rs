@@ -143,6 +143,8 @@ fn profile(
 pub(crate) struct LoginDestination {
     pub account: Account,
     pub effective_home: PathBuf,
+    /// Running launches may share this account, so their token refreshes can change its credentials during login.
+    pub concurrent: bool,
     pub previous: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
 
@@ -177,11 +179,13 @@ pub(crate) fn commit_login(
         );
     }
     store.ensure_unique_identity(&identity, account.number)?;
-    if destination.effective_home == store.data.main_home {
+    if !destination.concurrent {
         crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
     }
     for (path, previous) in &destination.previous {
-        if fsutil::optional_bytes(path)? != *previous {
+        if fsutil::optional_bytes(path)? != *previous
+            && !(destination.concurrent && refreshed_by_owner(path, &identity)?)
+        {
             bail!(
                 "account credentials changed during login; saved credentials were unchanged. Retry xswap login {}",
                 account.number
@@ -204,6 +208,15 @@ pub(crate) fn commit_login(
         transaction.write(&store.root.join("accounts.json"), &store.data)
     })();
     transaction.finish(result)
+}
+
+/// A running launch of the same owner may refresh its tokens while the login is open; any other change is still a conflict.
+fn refreshed_by_owner(path: &Path, identity: &auth::Identity) -> Result<bool> {
+    let home = path.parent().context("credential path has no parent")?;
+    Ok(auth::identity(home)
+        .ok()
+        .flatten()
+        .is_some_and(|current| identity.same_owner(&current)))
 }
 
 struct OriginalProjection {

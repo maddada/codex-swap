@@ -89,7 +89,7 @@ impl Fixture {
         );
         #[cfg(unix)]
         {
-            write(&fixture.fake, b"#!/bin/sh\nset -eu\nprintf '%s' \"$CODEX_HOME\" > \"$SYNTHETIC_MARKER\"\nif [ \"${SYNTHETIC_HOLD:-}\" = 1 ]; then sleep 5; exit 0; fi\ncase \" $* \" in\n  *' login '*)\n    cp \"$SYNTHETIC_NEXT_AUTH\" \"$CODEX_HOME/auth.json\"\n    if [ -n \"${SYNTHETIC_CHANGED_PATH:-}\" ]; then\n      cp \"$SYNTHETIC_NEXT_AUTH\" \"$SYNTHETIC_CHANGED_PATH\"\n    fi\n    if [ -n \"${SYNTHETIC_CHANGED_HOME:-}\" ]; then\n      rm \"$SYNTHETIC_CHANGED_HOME\"\n      ln -s \"$SYNTHETIC_HOME_TARGET\" \"$SYNTHETIC_CHANGED_HOME\"\n    fi\n    ;;\nesac\n");
+            write(&fixture.fake, b"#!/bin/sh\nset -eu\nprintf '%s' \"$CODEX_HOME\" > \"$SYNTHETIC_MARKER\"\nif [ \"${SYNTHETIC_HOLD:-}\" = 1 ]; then sleep 5; exit 0; fi\ncase \" $* \" in\n  *' login '*)\n    cp \"$SYNTHETIC_NEXT_AUTH\" \"$CODEX_HOME/auth.json\"\n    if [ -n \"${SYNTHETIC_CHANGED_PATH:-}\" ]; then\n      cp \"${SYNTHETIC_CHANGED_SOURCE:-$SYNTHETIC_NEXT_AUTH}\" \"$SYNTHETIC_CHANGED_PATH\"\n    fi\n    if [ -n \"${SYNTHETIC_CHANGED_HOME:-}\" ]; then\n      rm \"$SYNTHETIC_CHANGED_HOME\"\n      ln -s \"$SYNTHETIC_HOME_TARGET\" \"$SYNTHETIC_CHANGED_HOME\"\n    fi\n    ;;\nesac\n");
             fs::set_permissions(&fixture.fake, fs::Permissions::from_mode(0o700)).unwrap();
         }
         fixture
@@ -451,14 +451,20 @@ fn staged_login_rechecks_destination_and_original_bytes() {
         fixture.main_source("malformed");
         let saved_before = fs::read(fixture.saved.join("auth.json")).unwrap();
         let registry_before = fs::read(fixture.data.join("accounts.json")).unwrap();
-        let changed_path = if changed_main {
-            fixture.main.join("auth.json")
+        let (changed_path, changed_source) = if changed_main {
+            (fixture.main.join("auth.json"), fixture.next_auth.clone())
         } else {
-            fixture.saved.join("auth.json")
+            let foreign = fixture.data.join("foreign-auth.json");
+            write(
+                &foreign,
+                serde_json::to_vec(&credentials("foreign-account", "foreign")).unwrap(),
+            );
+            (fixture.saved.join("auth.json"), foreign)
         };
         let result = fixture
             .command(&["login", "1"])
             .env("SYNTHETIC_CHANGED_PATH", &changed_path)
+            .env("SYNTHETIC_CHANGED_SOURCE", &changed_source)
             .output()
             .unwrap();
         assert_failure(
@@ -471,7 +477,7 @@ fn staged_login_rechecks_destination_and_original_bytes() {
         );
         assert_eq!(
             fs::read(&changed_path).unwrap(),
-            fs::read(&fixture.next_auth).unwrap()
+            fs::read(&changed_source).unwrap()
         );
         if changed_main {
             assert_eq!(
@@ -484,6 +490,30 @@ fn staged_login_rechecks_destination_and_original_bytes() {
             registry_before
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn login_accepts_same_owner_refresh_from_running_launch() {
+    let fixture = Fixture::new();
+    fixture.main_source("malformed");
+    let refreshed = fixture.data.join("refreshed-auth.json");
+    write(
+        &refreshed,
+        serde_json::to_vec(&credentials("synthetic-account", "synthetic-refreshed")).unwrap(),
+    );
+    let result = fixture
+        .command(&["login", "1"])
+        .env("SYNTHETIC_CHANGED_PATH", fixture.saved.join("auth.json"))
+        .env("SYNTHETIC_CHANGED_SOURCE", &refreshed)
+        .output()
+        .unwrap();
+    assert_success(&result);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(fixture.saved.join("auth.json")).unwrap())
+            .unwrap(),
+        serde_json::from_slice::<Value>(&fs::read(&fixture.next_auth).unwrap()).unwrap()
+    );
 }
 
 #[cfg(unix)]
@@ -556,13 +586,19 @@ fn explicit_chatgpt_variants_use_live_credentials_and_preserve_launch_leases() {
 
 #[cfg(unix)]
 #[test]
-fn busy_independent_account_refuses_login_and_export() {
+fn running_launch_allows_login_but_refuses_export() {
     let fixture = Fixture::new();
     fixture.main_source("malformed");
     let saved_before = fs::read(fixture.saved.join("auth.json")).unwrap();
-    let _held = lease(&fixture, &fixture.saved, false);
+    let held = lease(&fixture, &fixture.saved, true);
     assert_failure(&fixture.run(&["login", "1"]), "busy");
     assert!(!fixture.marker.exists());
+    drop(held);
+    assert_eq!(
+        fs::read(fixture.saved.join("auth.json")).unwrap(),
+        saved_before
+    );
+    let _held = lease(&fixture, &fixture.saved, false);
     let backup = fixture.data.join("backup.json");
     assert_failure(
         &fixture
@@ -574,9 +610,11 @@ fn busy_independent_account_refuses_login_and_export() {
         "busy",
     );
     assert!(!backup.exists());
+    assert_success(&fixture.run(&["login", "1"]));
     assert_eq!(
-        fs::read(fixture.saved.join("auth.json")).unwrap(),
-        saved_before
+        serde_json::from_slice::<Value>(&fs::read(fixture.saved.join("auth.json")).unwrap())
+            .unwrap(),
+        serde_json::from_slice::<Value>(&fs::read(&fixture.next_auth).unwrap()).unwrap()
     );
 }
 

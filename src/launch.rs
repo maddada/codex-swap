@@ -130,18 +130,34 @@ pub fn run(
 
 /// CDXC:AgentProviders 2026-09-06 WHY:
 /// Browser SSO can authenticate the wrong account; logging into a fresh home lets us check the registered identity before replacing credentials and keeps the same login command retryable.
+///
+/// CDXC:AgentProviders 2026-09-28 DECISION:
+/// The user rejected login refusing while that account's Codex sessions run ("i dont like this block"). Re-login writes the same verified owner and Codex reloads a changed auth.json before refreshing, so it shares the launch lease and skips the process check. Only replacing a main-home login that belongs to someone else keeps both guards.
 pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
     let store = Store::open(cli)?;
     let account = store.resolve(identifier)?;
     let effective = store.effective_account(&account, store.observe_live_account().as_ref());
-    let lease = store.lease(&effective.home, true)?;
+    let main = effective.home == store.data.main_home;
+    // Repairing a separate home may tolerate main observation errors, but
+    // replacing main credentials still requires recognizing their source.
+    let main_identity = main.then(|| auth::identity(&effective.home));
+    let concurrent = match &main_identity {
+        None => true,
+        Some(live) => live
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .zip(account.identity.as_ref())
+            .is_some_and(|(live, expected)| expected.same_owner(live)),
+    };
+    let lease = store.lease(&effective.home, !concurrent)?;
     let snapshot_lease = (effective.home != account.home)
-        .then(|| store.lease(&account.home, true))
+        .then(|| store.lease(&account.home, !concurrent))
         .transpose()?;
-    if effective.home == store.data.main_home {
-        // Repairing a separate home may tolerate main observation errors, but
-        // replacing main credentials still requires recognizing their source.
-        auth::identity(&effective.home)?;
+    if let Some(live) = main_identity {
+        live?;
+    }
+    if !concurrent {
         crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
     }
     let mut paths = vec![effective.home.join("auth.json")];
@@ -151,6 +167,7 @@ pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
     let destination = crate::account_state::LoginDestination {
         account: account.clone(),
         effective_home: effective.home.clone(),
+        concurrent,
         previous: paths
             .into_iter()
             .map(|path| {
