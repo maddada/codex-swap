@@ -171,6 +171,17 @@ xswap --switch-to 1            # cswap-compatible spelling
 
 Existing Codex processes cache authentication. Before replacing the global login, xswap conservatively refuses while it detects a running Codex process for your user, including independently launched Codex sessions and sessions using another account home. In a terminal xswap lists those processes and offers to end them; `--stop-codex` ends them without asking, and `XSWAP_STOP_CODEX=never` always refuses instead. Restart Codex after switching. The check detects existing processes, but a new external launch does not share xswap’s lock. Keep Codex closed until `add` or `switch` finishes so it cannot write cached credentials during the operation.
 
+On Windows, the Codex desktop app must also exit completely before a global switch. Recent Microsoft Store builds run as `ChatGPT.exe` inside the `OpenAI.Codex` package; xswap checks that package path to distinguish Codex from the separate ChatGPT app. Run the switch from an external PowerShell window, then reopen Codex desktop and start new CLI sessions:
+
+```powershell
+xswap switch 2
+codex login status
+```
+
+`xswap run 2` selects account 2 only for that CLI launch; it does not change the desktop account. `list` showing `present` means that local credentials exist, not that the server accepts them. Check a saved account with `xswap usage 2`. If its credentials are rejected, reconnect that account with `xswap login 2`, complete the browser sign-in for the matching email, and retry. Avoid `codex logout` when switching: use the saved accounts instead.
+
+If Windows denies process inspection, xswap reports the blocking PID and leaves the global login unchanged. Close that process, or run the external PowerShell window with the same privileges as that process. This can happen when an elevated terminal is open alongside a normal terminal.
+
 `status` reports the identity currently installed in the main Codex home; `launchDefault` separately reports the saved choice for `xswap run`. Signing into another account directly with `codex login` can change the global login without changing that saved choice. Run `xswap add` to save the new login, or `xswap switch ACCOUNT` to restore a saved account.
 
 Explicit `xswap run work` and directory mappings select an account for that launch without switching the global login. An explicit `xswap run default` selects the saved original account, even when a different account is globally active.
