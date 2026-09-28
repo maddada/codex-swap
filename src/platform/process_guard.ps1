@@ -7,6 +7,7 @@ function Test-CodexName([string]$Name, [string]$Configured) {
     $configuredLeaf = $Configured.ToLowerInvariant() -replace '\.exe$', ''
     return $leaf -eq 'codex' -or $leaf -match '^codex-(aarch64|x86_64|arm64|amd64|x64|[0-9])' -or $leaf -in @('codex.js', 'codex.cmd', 'codex.bat', 'codex.ps1') -or $leaf -eq $configuredLeaf
 }
+$candidatePid = $null
 try {
     $configured = $env:XSWAP_PROCESS_EXECUTABLE
     $parentPid = [uint32]$env:XSWAP_PROCESS_PARENT
@@ -18,8 +19,11 @@ try {
         $candidatePid = [uint32]$candidate.ProcessId
         if ($candidatePid -eq $PID -or $candidatePid -eq $parentPid) { continue }
         $native = Test-CodexName $candidate.Name $configured
+        # Current Windows Store Codex builds run their desktop shell as ChatGPT.exe.
+        # Match its package path below so the separate ChatGPT app is not stopped.
+        $desktop = $candidate.Name -ieq 'ChatGPT.exe'
         $launcher = $candidate.Name.ToLowerInvariant() -in @('node.exe', 'nodejs.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe', 'bash.exe', 'sh.exe')
-        if (-not $native -and -not $launcher) { continue }
+        if (-not $native -and -not $launcher -and -not $desktop) { continue }
         try {
             $owner = Invoke-CimMethod -InputObject $candidate -MethodName GetOwnerSid -OperationTimeoutSec 5
             if ($owner.ReturnValue -ne 0 -or -not $owner.Sid) { throw 'Process owner is unavailable' }
@@ -32,6 +36,15 @@ try {
         if ($owner.Sid -ne $currentSid) { continue }
         if ($native) {
             $matchedPids.Add($candidatePid)
+            continue
+        }
+        if ($desktop) {
+            $details = Get-CimInstance Win32_Process -Filter "ProcessId = $candidatePid" -Property ExecutablePath -OperationTimeoutSec 5
+            if (-not $details) { continue }
+            if (-not $details.ExecutablePath) { throw 'Desktop executable path is unavailable' }
+            if ($details.ExecutablePath -match '(?i)[\\/]OpenAI\.Codex_[^\\/]+[\\/]app[\\/]ChatGPT\.exe$') {
+                $matchedPids.Add($candidatePid)
+            }
             continue
         }
         $details = Get-CimInstance Win32_Process -Filter "ProcessId = $candidatePid" -Property CommandLine -OperationTimeoutSec 5
@@ -66,6 +79,7 @@ try {
     }
     ConvertTo-Json -InputObject @($matchedPids.ToArray()) -Compress
 } catch {
-    # Caller reports a fixed actionable error, without leaking command lines or CIM data.
+    # Only a numeric PID may leave a failed query; CIM errors can contain command lines.
+    if ($candidatePid) { ConvertTo-Json -InputObject $candidatePid -Compress }
     exit 1
 }

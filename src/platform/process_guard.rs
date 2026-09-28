@@ -217,6 +217,11 @@ fn running_codex(configured: &str) -> Result<Vec<u32>> {
         .context("cannot inspect Windows processes; PowerShell and local CIM process queries are required before global account changes")?;
     if !output.status.success() {
         // Never render command lines or CIM error payloads, which may include credentials.
+        if let Ok(pid) = serde_json::from_slice::<u32>(&output.stdout) {
+            bail!(
+                "cannot inspect Windows process PID {pid}; close that process or run xswap with the same Windows privileges, then retry. No global login was changed"
+            );
+        }
         bail!(
             "cannot inspect Windows process ownership or launcher arguments; close Codex and restore PowerShell/CIM process-query access before retrying"
         );
@@ -224,4 +229,62 @@ fn running_codex(configured: &str) -> Result<Vec<u32>> {
     serde_json::from_slice(&output.stdout).context(
         "Windows process query returned invalid PID data; global account changes were refused",
     )
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_guard_includes_codex_desktop_without_matching_chatgpt() {
+        // Exercise the actual CIM script without relying on applications running on the host.
+        let fixtures = r#"
+function Get-CimInstance {
+    param($ClassName, $Property, $OperationTimeoutSec, $Filter)
+    $items = @(
+        [pscustomobject]@{ Name = 'codex.exe'; ProcessId = 41001 },
+        [pscustomobject]@{ Name = 'ChatGPT.exe'; ProcessId = 41002; ExecutablePath = 'C:\Program Files\WindowsApps\OpenAI.Codex_26.924.2738.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe' },
+        [pscustomobject]@{ Name = 'ChatGPT.exe'; ProcessId = 41003; ExecutablePath = 'C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe' },
+        [pscustomobject]@{ Name = 'ChatGPT.exe'; ProcessId = 41004; ExecutablePath = 'C:\Program Files\WindowsApps\OpenAI.Codex_26.924.2738.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe' },
+        [pscustomobject]@{ Name = 'node.exe'; ProcessId = 41005; CommandLine = 'node.exe C:\tools\codex.js' },
+        [pscustomobject]@{ Name = 'node.exe'; ProcessId = 41006; CommandLine = 'node.exe -e "console.log(''codex.js'')"' }
+    )
+    if ($Filter) { return $items | Where-Object { "ProcessId = $($_.ProcessId)" -eq $Filter } }
+    return $items
+}
+function Invoke-CimMethod {
+    param($InputObject, $MethodName, $OperationTimeoutSec)
+    $sid = if ($InputObject.ProcessId -eq 41004) { 'another-user' } else { [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
+    return [pscustomobject]@{ ReturnValue = 0; Sid = $sid }
+}
+"#;
+        let query = |fixtures: &str| {
+            Command::new("powershell.exe")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &format!("{fixtures}\n{}", include_str!("process_guard.ps1")),
+                ])
+                .env("XSWAP_PROCESS_EXECUTABLE", "codex")
+                .env("XSWAP_PROCESS_PARENT", "0")
+                .output()
+                .unwrap()
+        };
+        let output = query(fixtures);
+        assert!(output.status.success(), "Windows process query failed");
+        let pids: Vec<u32> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(pids, [41001, 41002, 41005]);
+
+        // Inaccessible elevated shells must block the switch with an actionable PID.
+        let inaccessible = fixtures.replace("node.exe C:\\tools\\codex.js", "");
+        let output = query(&inaccessible);
+        assert!(!output.status.success());
+        assert_eq!(
+            serde_json::from_slice::<u32>(&output.stdout).unwrap(),
+            41005
+        );
+        assert!(output.stderr.is_empty());
+    }
 }
