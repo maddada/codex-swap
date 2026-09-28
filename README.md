@@ -8,6 +8,18 @@ Save your current Codex login with `xswap add`, then use `xswap switch` to chang
 
 Supports macOS 11 or newer, Linux, WSL and native Windows on ARM64 and x86-64. Install the official Codex CLI separately and make sure `codex` is on PATH.
 
+### macOS and Linux (install script)
+
+Install or upgrade the native executable with one command, without Homebrew, Rust or administrator access:
+
+```sh
+curl -fsSL https://github.com/maddada/codex-swap/releases/latest/download/install.sh | sh
+```
+
+The script selects the build for your computer (native Apple Silicon even from a Rosetta shell; static musl on Linux), verifies the archive against the release’s SHA-256 checksums and checks `xswap --version` before installing `xswap` to `~/.local/bin`. `LICENSE` and `THIRD_PARTY_NOTICES.md` go to `~/.local/share/doc/codex-swap` (or `$XDG_DATA_HOME/doc/codex-swap`). It uses `curl` or `wget`, needs no terminal input and never edits shell profiles; it prints a note when the directory is not on PATH. Set `XSWAP_VERSION=0.3.4` for a specific release or `XSWAP_INSTALL_DIR=/path/to/bin` for another directory.
+
+The script writes `.xswap-install-receipt.json` beside the executable, recording the method, directory, version and the executable’s SHA-256. `xswap upgrade` reruns the same installer for that directory when the receipt matches the running executable.
+
 ### Homebrew (recommended)
 
 Run this command to install on macOS and linux (requires homebrew to be installed)
@@ -26,7 +38,7 @@ To update:
 xswap upgrade
 ```
 
-For Homebrew installations on macOS and Linux this runs `brew upgrade maddada/tap/codex-swap`. `xswap update` and `xswap --upgrade` are also accepted, matching cswap.
+For Homebrew installations on macOS and Linux this runs `brew upgrade maddada/tap/codex-swap`; install-script installations rerun the install script for the same directory. `xswap update` and `xswap --upgrade` are also accepted, matching cswap.
 
 ### Windows (PowerShell)
 
@@ -81,7 +93,7 @@ cargo install --path . --locked
 
 Cargo installs the `xswap` executable into `~/.cargo/bin`. To use `~/.local/bin` instead, add `--root ~/.local` to the install command.
 
-On macOS and Linux, `xswap upgrade` detects Cargo installations and runs `cargo install --git https://github.com/maddada/codex-swap --locked --force --root <original-root>`, including for installations originally built with `--path`. Detection follows executable symlinks and preserves custom install roots. Homebrew installations use Homebrew without requiring Cargo. An unrecognized Unix installation prints manual upgrade instructions and exits with status 1; a missing package manager also exits with status 1. Package-manager output and exit status are preserved, and upgrading does not initialize accounts or launch Codex.
+On macOS and Linux, `xswap upgrade` first recognises install-script installations by their receipt, then detects Cargo installations and runs `cargo install --git https://github.com/maddada/codex-swap --locked --force --root <original-root>`, including for installations originally built with `--path`. Detection follows executable symlinks and preserves custom install roots. Homebrew installations use Homebrew without requiring Cargo. An unrecognized Unix installation prints manual upgrade instructions and exits with status 1; a missing package manager also exits with status 1. Package-manager output and exit status are preserved, and upgrading does not initialize accounts or launch Codex.
 
 ## Set up accounts
 

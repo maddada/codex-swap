@@ -91,10 +91,11 @@ def main():
             for document in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
                 check_document(document, contents.read(document), archive)
         checksums.append(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {name}\n")
-    installer = args.archives / "install.ps1"
-    if not installer.is_file() or installer.stat().st_size == 0:
-        raise ValueError("Missing Windows installer: install.ps1")
-    checksums.append(f"{hashlib.sha256(installer.read_bytes()).hexdigest()}  install.ps1\n")
+    for installer_name in ("install.ps1", "install.sh"):
+        installer = args.archives / installer_name
+        if not installer.is_file() or installer.stat().st_size == 0:
+            raise ValueError(f"Missing installer: {installer_name}")
+        checksums.append(f"{hashlib.sha256(installer.read_bytes()).hexdigest()}  {installer_name}\n")
     lines.extend([
         "  def install",
         '    bin.install "xswap"',

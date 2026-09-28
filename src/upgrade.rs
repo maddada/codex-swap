@@ -1,12 +1,68 @@
 use anyhow::{Context, Result, bail};
 use std::process::Command;
 #[cfg(unix)]
-use std::{fs, io::ErrorKind, os::unix::process::CommandExt, path::Path};
+use std::{
+    fs,
+    io::ErrorKind,
+    os::unix::process::CommandExt,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 #[cfg(unix)]
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 #[cfg(unix)]
 const FORMULA: &str = "maddada/tap/codex-swap";
+/// Written beside the executable by scripts/install.sh.
+#[cfg(unix)]
+const RECEIPT: &str = ".xswap-install-receipt.json";
+#[cfg(unix)]
+const INSTALLER: &str = include_str!("../scripts/install.sh");
+
+/// CDXC:Release 2026-09-29 DECISION:
+/// User: macOS and Linux get a one-command installer like Windows' install.ps1 (`curl -fsSL …/install.sh | sh`), and `xswap upgrade` must recognise it.
+/// The receipt counts only when its recorded SHA-256 matches the running executable, which proves this exact file came from the script. That makes it safe to check first: a Cargo root such as `~/.local` can hold both a `.crates.toml` entry and a later script install of the same binary name, and only the receipt knows which one wrote the file.
+#[cfg(unix)]
+fn script_install_dir(executable: &Path) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let directory = executable.parent()?;
+    let receipt: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(directory.join(RECEIPT)).ok()?).ok()?;
+    if receipt.get("method")?.as_str()? != "script" {
+        return None;
+    }
+    let recorded = Path::new(receipt.get("installDir")?.as_str()?)
+        .canonicalize()
+        .ok()?;
+    if recorded != directory {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut fs::File::open(executable).ok()?, &mut hasher).ok()?;
+    let actual = format!("{:x}", hasher.finalize());
+    actual
+        .eq_ignore_ascii_case(receipt.get("sha256")?.as_str()?)
+        .then(|| directory.to_path_buf())
+}
+
+/// Reruns the bundled installer for the directory holding the current executable, as the Windows
+/// upgrade reruns install.ps1.
+#[cfg(unix)]
+fn run_installer(directory: &Path) -> Result<()> {
+    let scratch = crate::fsutil::private_tempdir(&std::env::temp_dir(), "xswap-upgrade-")?;
+    let script = scratch.path().join("install.sh");
+    fs::write(&script, INSTALLER)?;
+    let status = Command::new("/bin/sh")
+        .arg(&script)
+        .env("XSWAP_INSTALL_DIR", directory)
+        .stdin(Stdio::null())
+        .status()
+        .context("could not start the xswap installer")?;
+    if !status.success() {
+        bail!("upgrade failed ({status})");
+    }
+    Ok(())
+}
 
 #[cfg(unix)]
 fn install_command(executable: &Path) -> Result<Option<Command>> {
@@ -70,11 +126,15 @@ pub fn run() -> Result<()> {
         .context("locate xswap executable")?
         .canonicalize()
         .context("resolve xswap executable")?;
+    if let Some(directory) = script_install_dir(&executable) {
+        return run_installer(&directory);
+    }
     let Some(mut command) = install_command(&executable)? else {
         bail!(
-            "Could not detect install method (looked for Cargo / Homebrew).\n\
+            "Could not detect install method (looked for the install script / Cargo / Homebrew).\n\
              Executable: {}\n\
              To upgrade manually, run one of:\n  \
+             curl -fsSL {REPOSITORY}/releases/latest/download/install.sh | sh\n  \
              cargo install --git {REPOSITORY} --locked --force\n  \
              brew upgrade {FORMULA}\n\
              For a source checkout, use `git pull` then `cargo install --path . --locked --force`.\n\

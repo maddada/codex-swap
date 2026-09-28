@@ -9,6 +9,7 @@ on:
       - ".github/workflows/release.yml"
       - "scripts/homebrew.py"
       - "scripts/install.ps1"
+      - "scripts/install.sh"
       - "scripts/check_notices.py"
       - "THIRD_PARTY_NOTICES.md"
       - "LICENSE"
@@ -134,6 +135,7 @@ jobs:
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           cp scripts/install.ps1 release/install.ps1
+          cp scripts/install.sh release/install.sh
           python3 scripts/homebrew.py "$version" release release/codex-swap.rb
           ruby -c release/codex-swap.rb
           (cd release && sha256sum --check SHA256SUMS)

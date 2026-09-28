@@ -25,6 +25,11 @@ jobs:
       - name: Check release archives and formula
         if: runner.os == 'Linux'
         run: python3 scripts/test_homebrew.py
+      - name: Validate POSIX installer
+        if: runner.os == 'Linux'
+        run: |
+          sh -n scripts/install.sh
+          shellcheck -s sh scripts/install.sh
       - name: Validate PowerShell installer syntax
         if: runner.os == 'Windows'
         shell: pwsh

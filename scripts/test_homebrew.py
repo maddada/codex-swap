@@ -34,7 +34,8 @@ class ReleaseArchives(unittest.TestCase):
             archive = self.directory / name
             self.archives.append(archive)
             self.write_archive(archive, self.entries(windows))
-        (self.directory / "install.ps1").write_bytes((ROOT / "scripts/install.ps1").read_bytes())
+        for installer in ("install.ps1", "install.sh"):
+            (self.directory / installer).write_bytes((ROOT / "scripts" / installer).read_bytes())
 
     def entries(self, windows):
         return [("xswap.exe" if windows else "xswap", b"executable fixture", "file")] + [
@@ -75,11 +76,11 @@ class ReleaseArchives(unittest.TestCase):
         formula = (self.directory / "codex-swap.rb").read_text()
         self.assertIn('doc.install "LICENSE", "THIRD_PARTY_NOTICES.md"', formula)
         lines = (self.directory / "SHA256SUMS").read_text().splitlines()
-        self.assertEqual(len(lines), 7)
-        for archive in self.archives + [self.directory / "install.ps1"]:
+        self.assertEqual(len(lines), 8)
+        for archive in self.archives + [self.directory / "install.ps1", self.directory / "install.sh"]:
             digest = hashlib.sha256(archive.read_bytes()).hexdigest()
             self.assertIn(f"{digest}  {archive.name}", lines)
-            if archive.suffix != ".zip" and archive.name != "install.ps1":
+            if archive.suffix != ".zip" and archive.name not in ("install.ps1", "install.sh"):
                 self.assertIn(f'sha256 "{digest}"', formula)
         syntax = subprocess.run(["ruby", "-c", str(self.directory / "codex-swap.rb")], capture_output=True, text=True)
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
