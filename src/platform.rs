@@ -1,6 +1,9 @@
 //! Operating-system boundaries for account privacy and child execution.
+mod codex_blockers;
 mod process_guard;
-pub use process_guard::ensure_codex_stopped;
+pub(crate) use codex_blockers::clear as clear_codex_blockers;
+pub use codex_blockers::lease_holders;
+pub use process_guard::{codex_pids, ensure_codex_stopped};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

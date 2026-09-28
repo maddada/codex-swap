@@ -171,8 +171,11 @@ fn assert_success(output: &Output) {
 
 fn assert_failure(output: &Output, message: &str) {
     assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Unix names the processes holding a lease; other platforms keep the plain "busy" refusal.
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains(message),
+        stderr.contains(message)
+            || (message == "busy" && stderr.contains("Codex is running (PID ")),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -586,7 +589,7 @@ fn explicit_chatgpt_variants_use_live_credentials_and_preserve_launch_leases() {
 
 #[cfg(unix)]
 #[test]
-fn running_launch_allows_login_but_refuses_export() {
+fn running_launch_allows_login_and_export() {
     let fixture = Fixture::new();
     fixture.main_source("malformed");
     let saved_before = fs::read(fixture.saved.join("auth.json")).unwrap();
@@ -600,16 +603,15 @@ fn running_launch_allows_login_but_refuses_export() {
     );
     let _held = lease(&fixture, &fixture.saved, false);
     let backup = fixture.data.join("backup.json");
-    assert_failure(
+    assert_success(
         &fixture
             .command(&["export"])
             .arg(&backup)
             .args(["--account", "1"])
             .output()
             .unwrap(),
-        "busy",
     );
-    assert!(!backup.exists());
+    assert!(backup.exists());
     assert_success(&fixture.run(&["login", "1"]));
     assert_eq!(
         serde_json::from_slice::<Value>(&fs::read(fixture.saved.join("auth.json")).unwrap())
@@ -681,7 +683,7 @@ fn main_home_alias_keeps_strict_source_process_and_lease_guards() {
         assert!(!result.status.success());
         let diagnostic = String::from_utf8_lossy(&result.stderr);
         assert!(
-            ["Codex is still running", "cannot enumerate processes"]
+            ["Codex is running (PID ", "cannot enumerate processes"]
                 .iter()
                 .any(|message| diagnostic.contains(message)),
             "{diagnostic}"

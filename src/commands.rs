@@ -142,7 +142,7 @@ pub fn switch(cli: &Cli, identifier: Option<&str>, output: &Output) -> Result<()
 pub fn remove(cli: &Cli, identifier: &str, output: &Output) -> Result<()> {
     let mut store = Store::open(cli)?;
     let account = store.resolve(identifier)?;
-    let _lease = store.lease(&account.home, true)?;
+    let _lease = store.lease(&account.home, false)?;
     store.data.accounts.retain(|a| a.number != account.number);
     store
         .data
@@ -243,7 +243,7 @@ pub fn add(cli: &Cli, args: &Add) -> Result<()> {
 pub fn rename(cli: &Cli, identifier: &str, alias: Option<String>, output: &Output) -> Result<()> {
     let mut store = Store::open(cli)?;
     let mut account = store.resolve(identifier)?;
-    let _lease = store.lease(&account.home, true)?;
+    let _lease = store.lease(&account.home, false)?;
     // Ignore this account when checking whether its replacement alias is occupied.
     store
         .data
@@ -261,7 +261,7 @@ pub fn rename(cli: &Cli, identifier: &str, alias: Option<String>, output: &Outpu
 pub fn set_enabled(cli: &Cli, identifier: &str, enabled: bool, output: &Output) -> Result<()> {
     let mut store = Store::open(cli)?;
     let mut account = store.resolve(identifier)?;
-    let _lease = store.lease(&account.home, true)?;
+    let _lease = store.lease(&account.home, false)?;
     account.enabled = enabled;
     store.replace(account.clone())?;
     account_result(&store, &account, output)
@@ -294,14 +294,13 @@ fn renumber(store: &mut Store, from: u32, to: u32, output: &Output) -> Result<()
     if to == 0 || to == u32::MAX {
         bail!("slot must be positive and less than {}", u32::MAX);
     }
-    // An interactive login commits using its slot after releasing the registry lock.
-    // Keep slot identities stable until every affected account lease is free.
+    // Running launches and open logins are keyed by home, not slot, so they may continue.
     let _leases: Vec<_> = store
         .data
         .accounts
         .iter()
         .filter(|a| a.number == from || a.number == to)
-        .map(|a| store.lease(&a.home, true))
+        .map(|a| store.lease(&a.home, false))
         .collect::<Result<_>>()?;
     for account in &mut store.data.accounts {
         if account.number == from {
@@ -352,6 +351,7 @@ mod tests {
             data_dir: Some(directory.path().join("registry")),
             codex_home: Some(main.clone()),
             codex_bin: None,
+            stop_codex: false,
             command: crate::cli::Action::Status(Output { json: false }),
         };
         let payload = URL_SAFE_NO_PAD.encode(br#"{"email":"same@example.test","https://api.openai.com/auth":{"chatgpt_user_id":"user-2"}}"#);

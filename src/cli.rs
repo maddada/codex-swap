@@ -20,8 +20,34 @@ pub struct Cli {
     /// Official Codex executable, resolved on PATH by default.
     #[arg(long, env = "XSWAP_CODEX_BIN", global = true)]
     pub codex_bin: Option<OsString>,
+    /// End Codex processes that block this command instead of asking (XSWAP_STOP_CODEX=ask|always|never sets the default).
+    #[arg(long, global = true)]
+    pub stop_codex: bool,
     #[command(subcommand)]
     pub command: Action,
+}
+
+/// CDXC:AgentProviders 2026-09-28 DECISION:
+/// The user asked for a clear error that offers to end the running Codex sessions when a command cannot safely run beside them (purge, switch, add, and a login that replaces another account's main-home login). Terminals ask first; `--stop-codex` ends them without asking; Ghostex passes `XSWAP_STOP_CODEX=never` and offers its own "sleep sessions" button instead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StopCodex {
+    Ask,
+    Always,
+    Never,
+}
+
+impl Cli {
+    /// An optional-value flag would swallow the following subcommand, so the modes live in the environment.
+    pub fn stop_policy(&self) -> StopCodex {
+        if self.stop_codex {
+            return StopCodex::Always;
+        }
+        match std::env::var("XSWAP_STOP_CODEX").as_deref() {
+            Ok("always") => StopCodex::Always,
+            Ok("never") => StopCodex::Never,
+            _ => StopCodex::Ask,
+        }
+    }
 }
 
 #[derive(Subcommand)]

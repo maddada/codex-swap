@@ -333,7 +333,7 @@ fn active_new_sign_in_refuses_purge_and_keeps_its_credentials_until_commit() {
     );
     let output = fixture.purge();
     assert!(!output.status.success(), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("busy"));
+    assert!(refused_as_in_use(&output));
     assert!(sign_in.staging.join("auth.json").exists());
     assert!(!fixture.data.join("accounts.json").exists());
     fixture.release();
@@ -411,7 +411,7 @@ fn terminated_launcher_leaves_child_staging_leased_until_the_child_exits() {
     sign_in.process.wait().unwrap();
     let output = fixture.purge();
     assert!(!output.status.success(), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("busy"));
+    assert!(refused_as_in_use(&output));
     assert!(sign_in.staging.join("auth.json").exists());
     fixture.release();
     let hash = format!(
@@ -570,4 +570,10 @@ fn purge_never_deletes_unrelated_prefix_collisions_and_checks_before_confirmatio
             assert!(fixture.data.join("accounts.json").exists());
         }
     }
+}
+
+/// Unix names the processes holding the lease; other platforms keep the plain "busy" refusal.
+fn refused_as_in_use(output: &std::process::Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr.contains("busy") || stderr.contains("Codex is running (PID ")
 }

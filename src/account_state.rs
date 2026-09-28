@@ -155,9 +155,20 @@ pub(crate) fn commit_login(
     identity: auth::Identity,
 ) -> Result<()> {
     let mut store = Store::open(cli)?;
-    let mut account = store.resolve(&destination.account.number.to_string())?;
-    if account.home != destination.account.home
-        || account.identity != destination.account.identity
+    // Slots may be moved or swapped while the browser login is open; the home names the account.
+    let mut account = store
+        .data
+        .accounts
+        .iter()
+        .find(|a| a.home == destination.account.home)
+        .cloned()
+        .with_context(|| {
+            format!(
+                "account selection changed during login; retry xswap login {}",
+                destination.account.number
+            )
+        })?;
+    if account.identity != destination.account.identity
         || store
             .effective_account(&account, store.observe_live_account().as_ref())
             .home
@@ -180,7 +191,7 @@ pub(crate) fn commit_login(
     }
     store.ensure_unique_identity(&identity, account.number)?;
     if !destination.concurrent {
-        crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
+        crate::platform::ensure_codex_stopped(&store.codex_bin(cli), cli.stop_policy())?;
     }
     for (path, previous) in &destination.previous {
         if fsutil::optional_bytes(path)? != *previous
@@ -405,7 +416,7 @@ pub fn snapshot(
     let source = fsutil::absolute(source.unwrap_or(&store.data.main_home))?;
     launch::validate_file_store(&source)?;
     validate_snapshot_alias(&store, &source, &alias)?;
-    crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
+    crate::platform::ensure_codex_stopped(&store.codex_bin(cli), cli.stop_policy())?;
     let mut homes: std::collections::BTreeSet<_> =
         store.data.accounts.iter().map(|a| a.home.clone()).collect();
     homes.insert(store.data.main_home.clone());
@@ -424,7 +435,7 @@ pub fn snapshot(
         if source == store.data.main_home {
             store.data.default = Some(number);
         }
-        crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
+        crate::platform::ensure_codex_stopped(&store.codex_bin(cli), cli.stop_policy())?;
         if fsutil::optional_bytes(&source.join("auth.json"))? != source_before
             || fsutil::optional_bytes(&store.data.main_home.join("auth.json"))? != main_before
         {
@@ -491,7 +502,7 @@ pub fn select_global(cli: &Cli, identifier: Option<&str>) -> Result<()> {
             selected.number
         );
     }
-    crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
+    crate::platform::ensure_codex_stopped(&store.codex_bin(cli), cli.stop_policy())?;
     let mut homes: std::collections::BTreeSet<_> =
         store.data.accounts.iter().map(|a| a.home.clone()).collect();
     homes.insert(store.data.main_home.clone());
@@ -509,7 +520,7 @@ pub fn select_global(cli: &Cli, identifier: Option<&str>) -> Result<()> {
         }
         let selected = store.resolve(&selected.number.to_string())?;
         let (document, identity) = auth::verified_credentials(&selected.home, &selected.identity)?;
-        crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
+        crate::platform::ensure_codex_stopped(&store.codex_bin(cli), cli.stop_policy())?;
         if fsutil::optional_bytes(&store.data.main_home.join("auth.json"))? != original_live {
             bail!("the current Codex login changed during switching; stop Codex and retry");
         }
@@ -554,6 +565,7 @@ mod alias_tests {
             data_dir: Some(directory.path().join("data")),
             codex_home: Some(directory.path().join("main")),
             codex_bin: None,
+            stop_codex: false,
             command: crate::cli::Action::List(crate::cli::Output { json: false }),
         };
         let source = directory.path().join("source");
@@ -670,6 +682,7 @@ mod alias_tests {
             data_dir: Some(directory.path().join("data")),
             codex_home: Some(directory.path().join("main")),
             codex_bin: None,
+            stop_codex: false,
             command: crate::cli::Action::List(crate::cli::Output { json: false }),
         };
         let mut store = Store::open(&cli).unwrap();

@@ -26,6 +26,7 @@ fn new_account_transaction_handles_commit_failures_on_every_platform() {
                 data_dir: Some(temporary.path().join("store")),
                 codex_home: Some(temporary.path().join("main")),
                 codex_bin: None,
+                stop_codex: false,
                 command: Action::List(Output { json: true }),
             };
             let mut store = Store::open(&cli).unwrap();

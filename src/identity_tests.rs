@@ -17,6 +17,7 @@ impl Fixture {
             data_dir: Some(directory.path().join("registry")),
             codex_home: Some(main),
             codex_bin: Some("xswap-identity-test".into()),
+            stop_codex: false,
             command: Action::Status(Output { json: false }),
         };
         Ok(Self { directory, cli })

@@ -1,4 +1,8 @@
-use crate::{auth::Identity, cli::Cli, fsutil};
+use crate::{
+    auth::Identity,
+    cli::{Cli, StopCodex},
+    fsutil,
+};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -60,6 +64,8 @@ pub struct Store {
     pub data: Registry,
     // Released before exec; account leases use separate lock files.
     _lock: File,
+    stop_codex: StopCodex,
+    configured_codex: OsString,
 }
 
 impl Store {
@@ -144,10 +150,17 @@ impl Store {
                 crate::auth::enrich_legacy_identity(&account.home, &mut account.identity);
             }
         }
+        let configured_codex = cli
+            .codex_bin
+            .clone()
+            .or_else(|| data.preferences.codex_bin.as_ref().map(OsString::from))
+            .unwrap_or_else(|| OsString::from("codex"));
         Ok(Self {
             root,
             data,
             _lock: lock,
+            stop_codex: cli.stop_policy(),
+            configured_codex,
         })
     }
 
@@ -332,7 +345,30 @@ impl Store {
         let dir = self.root.join("locks");
         fsutil::private_dir(&dir)?;
         let hash = format!("{:x}", Sha256::digest(home.as_os_str().as_encoded_bytes()));
-        fsutil::lock(&dir.join(format!("{hash}.lock")), exclusive, false)
+        let path = dir.join(format!("{hash}.lock"));
+        let error = match fsutil::lock(&path, exclusive, false) {
+            Ok(file) => return Ok(file),
+            Err(error) if fsutil::contended(&error) => error,
+            Err(error) => return Err(error),
+        };
+        let holders = crate::platform::lease_holders(&path);
+        if holders.is_empty() {
+            return Err(error);
+        }
+        let codex = crate::platform::codex_pids(&self.configured_codex).unwrap_or_default();
+        let shown: Vec<u32> = holders
+            .iter()
+            .copied()
+            .filter(|pid| codex.contains(pid))
+            .collect();
+        crate::platform::clear_codex_blockers(
+            &shown,
+            &holders,
+            self.stop_codex,
+            "is using an account this command changes",
+            || Ok(crate::platform::lease_holders(&path)),
+        )?;
+        fsutil::lock(&path, exclusive, true)
     }
 
     pub fn ensure_unique_identity(&self, identity: &Identity, except: u32) -> Result<()> {
@@ -373,6 +409,7 @@ mod tests {
             data_dir: Some(directory.path().join("data")),
             codex_home: Some(directory.path().join("main")),
             codex_bin: None,
+            stop_codex: false,
             command: Action::List(Output { json: false }),
         };
         let mut store = Store::open(&cli).unwrap();

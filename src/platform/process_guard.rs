@@ -1,3 +1,4 @@
+use crate::cli::StopCodex;
 use anyhow::{Context, Result, bail};
 use std::{ffi::OsStr, path::Path, process::Command};
 
@@ -5,26 +6,32 @@ use std::{ffi::OsStr, path::Path, process::Command};
 /// Codex does not cooperate with xswap's registry lock when refreshing its global login.
 /// Refuse global credential changes while a current-user Codex process or launcher is visible, regardless of its unknown CODEX_HOME.
 /// This is a process snapshot, not an exclusion lock: a separately started Codex can still race a later write, so callers recheck immediately before committing and users must keep Codex closed through the operation.
-pub fn ensure_codex_stopped(configured_binary: &OsStr) -> Result<()> {
-    let configured = Path::new(configured_binary)
+pub fn ensure_codex_stopped(configured_binary: &OsStr, stop: StopCodex) -> Result<()> {
+    let configured = configured_name(configured_binary)?;
+    let pids = codex_pids(configured_binary)?;
+    super::codex_blockers::clear(
+        &pids,
+        &pids,
+        stop,
+        "must be closed before the global Codex login changes",
+        || codex_pids(OsStr::new(configured)),
+    )
+}
+
+/// Current-user Codex processes and launchers, sorted and without duplicates.
+pub fn codex_pids(configured_binary: &OsStr) -> Result<Vec<u32>> {
+    let mut pids = running_codex(configured_name(configured_binary)?)?;
+    pids.sort_unstable();
+    pids.dedup();
+    Ok(pids)
+}
+
+fn configured_name(configured_binary: &OsStr) -> Result<&str> {
+    Path::new(configured_binary)
         .file_name()
         .and_then(OsStr::to_str)
         .filter(|name| !name.is_empty())
-        .context("cannot identify the configured Codex executable for the process check")?;
-    let mut pids = running_codex(configured)?;
-    pids.sort_unstable();
-    pids.dedup();
-    if !pids.is_empty() {
-        let pids = pids
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        bail!(
-            "Codex is still running (PID {pids}). Close Codex terminals, the Codex app and its app-server, then retry; keep them closed until the account operation finishes. Restart Codex afterward to use the selected account"
-        );
-    }
-    Ok(())
+        .context("cannot identify the configured Codex executable for the process check")
 }
 
 #[cfg(unix)]

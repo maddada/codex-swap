@@ -57,7 +57,7 @@ pub fn export(cli: &Cli, file: &Path, identifier: Option<&str>, output: &Output)
     }
     let _leases: Vec<_> = sources
         .iter()
-        .map(|home| store.lease(home, true))
+        .map(|home| store.lease(home, false))
         .collect::<Result<_>>()?;
     let mut exported = Vec::new();
     for (account, home) in accounts.into_iter().zip(sources) {

@@ -169,7 +169,7 @@ xswap --switch-to 1            # cswap-compatible spelling
 
 `switch` saves the latest outgoing main-home credentials before restoring the selected account into the main home’s regular `auth.json`. It also sets the saved default for future `xswap run` launches. Self-switching keeps the live credentials, including refreshes Codex has already performed. The command does not create an auth symlink or refresh tokens itself.
 
-Existing Codex processes cache authentication. Before replacing the global login, xswap conservatively refuses while it detects a running Codex process for your user, including independently launched Codex sessions and sessions using another account home. Exit those processes and restart Codex after switching. The check detects existing processes, but a new external launch does not share xswap’s lock. Keep Codex closed until `add` or `switch` finishes so it cannot write cached credentials during the operation.
+Existing Codex processes cache authentication. Before replacing the global login, xswap conservatively refuses while it detects a running Codex process for your user, including independently launched Codex sessions and sessions using another account home. In a terminal xswap lists those processes and offers to end them; `--stop-codex` ends them without asking, and `XSWAP_STOP_CODEX=never` always refuses instead. Restart Codex after switching. The check detects existing processes, but a new external launch does not share xswap’s lock. Keep Codex closed until `add` or `switch` finishes so it cannot write cached credentials during the operation.
 
 `status` reports the identity currently installed in the main Codex home; `launchDefault` separately reports the saved choice for `xswap run`. Signing into another account directly with `codex login` can change the global login without changing that saved choice. Run `xswap add` to save the new login, or `xswap switch ACCOUNT` to restore a saved account.
 
@@ -221,7 +221,7 @@ xswap disable 5
 xswap enable 5
 ```
 
-Aliases must be unique, ignoring case. Moving or swapping changes only slot numbers, preserving account homes, credentials, directory mappings and the account selected as global default. `disable` prevents implicit selection, rotation and choosing that account as a new mapping. An explicit switch or run can still select a disabled account. It does not erase credentials, stop running sessions or remove a saved default/mapping. Explicit commands such as `xswap run 5` still work; a disabled implicit choice produces an error until you enable it or explicitly select another account.
+Renaming, enabling, disabling, moving and swapping work while that account's Codex sessions run. Aliases must be unique, ignoring case. Moving or swapping changes only slot numbers, preserving account homes, credentials, directory mappings and the account selected as global default. `disable` prevents implicit selection, rotation and choosing that account as a new mapping. An explicit switch or run can still select a disabled account. It does not erase credentials, stop running sessions or remove a saved default/mapping. Explicit commands such as `xswap run 5` still work; a disabled implicit choice produces an error until you enable it or explicitly select another account.
 
 ## Back up and migrate accounts
 
@@ -238,7 +238,7 @@ Import creates fresh managed account homes and validates all accounts before sav
 
 If saving the registry fails during import or `add --login`, xswap restores the previous registry before removing the new account homes. If that restoration also fails, xswap retains the new homes and reports their paths for recovery.
 
-Export reads the latest main-home credentials for the globally active account and the saved home for inactive accounts. It refuses while a selected account is running under an xswap lease, so finish that launch first. Imported credentials do not invalidate the original copy, but Codex’s refresh-token behavior still applies when using copies on multiple machines.
+Export reads the latest main-home credentials for the globally active account and the saved home for inactive accounts. It works while that account's Codex sessions run. Imported credentials do not invalidate the original copy, but Codex’s refresh-token behavior still applies when using copies on multiple machines.
 
 ## What is shared
 
@@ -279,7 +279,7 @@ xswap remove work
 
 Reauthentication shows the expected saved account and opens a fresh Codex sign-in. Choosing the wrong browser account or cancelling leaves existing credentials unchanged. Retry the same `xswap login ACCOUNT` command and select the intended account; this also repairs a saved home left with another account’s credentials by an older version. A successful sign-in preserves the slot, alias and mappings.
 
-Reauthentication works while Codex sessions on that account keep running: the new login replaces the same account's credentials, and running sessions pick it up the next time they refresh their token. Replacing a main-home login that belongs to a different account still requires existing Codex processes to be closed first. Removal refuses while that account has a live xswap launch lease. Other accounts remain available during login.
+Reauthentication works while Codex sessions on that account keep running: the new login replaces the same account's credentials, and running sessions pick it up the next time they refresh their token. Replacing a main-home login that belongs to a different account still requires existing Codex processes to be closed first. Removal also works while that account's sessions run, since it keeps the account's files. Other accounts remain available during login.
 
 `remove` unregisters the account and prints its retained directory. It does **not** delete credentials or history, and does not log out Codex. Removing the selected launch default returns future launches to the saved original account when available. Removal does not rewrite the installed global login. Slot numbers are not automatically reused.
 
@@ -305,7 +305,7 @@ xswap purge
 xswap purge --yes
 ```
 
-`purge` requires typing `purge` at its interactive prompt or passing `--yes`. It deletes the managed `accounts/` tree, including homes retained by earlier `remove` commands, and abandoned sign-in staging created with the current xswap provenance marker. The marker binds staging to its filesystem directory identity; `login-*`/`new-login-*` names alone never authorize deletion. Unmarked legacy staging or unrelated folders with those prefixes stop purge before confirmation: inspect the reported directory and move it outside the data directory before retrying, or remove it manually only after confirming it is abandoned sign-in data.
+`purge` requires typing `purge` at its interactive prompt or passing `--yes`. While Codex sessions or sign-ins still use an xswap account, purge names those processes and, in a terminal, offers to end them (`--stop-codex` ends them without asking). It deletes the managed `accounts/` tree, including homes retained by earlier `remove` commands, and abandoned sign-in staging created with the current xswap provenance marker. The marker binds staging to its filesystem directory identity; `login-*`/`new-login-*` names alone never authorize deletion. Unmarked legacy staging or unrelated folders with those prefixes stop purge before confirmation: inspect the reported directory and move it outside the data directory before retrying, or remove it manually only after confirming it is abandoned sign-in data.
 
 Original and adopted Codex homes, and the targets of shared settings/history links, remain intact. Purge refuses if a cleanup directory overlaps an original/adopted home, or an account/sign-in has a live xswap lease. Staging must be owned real directories inside the private data root; links and invalid candidates cause an error. Sign-in staging stays leased through credential saving; interrupted launchers retain that lease in their Unix child, and Windows terminates the child with the launcher.
 

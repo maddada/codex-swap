@@ -158,7 +158,7 @@ pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
         live?;
     }
     if !concurrent {
-        crate::platform::ensure_codex_stopped(&store.codex_bin(cli))?;
+        crate::platform::ensure_codex_stopped(&store.codex_bin(cli), cli.stop_policy())?;
     }
     let mut paths = vec![effective.home.join("auth.json")];
     if effective.home != account.home {

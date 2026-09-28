@@ -305,6 +305,15 @@ pub fn lock(path: &Path, exclusive: bool, wait: bool) -> Result<File> {
     }
 }
 
+/// True when `lock` failed only because another process holds the lease.
+pub fn contended(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+    })
+}
+
 pub fn optional_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
     match fs::symlink_metadata(path) {
         Ok(_) => {
