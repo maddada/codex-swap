@@ -1,6 +1,6 @@
 [package]
 name = "codex-swap"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 rust-version = "1.85"
 description = "Account-specific Codex launches with shared conversation history"
