@@ -254,6 +254,27 @@ class InputState:
                 self.dirty = True
 
 
+class InputHold:
+    """A bounded wait for CLI readiness, measured from the first held input."""
+    def __init__(self):
+        self.data = b""
+        self.since = None
+
+    def append(self, data, now=None):
+        if self.since is None:
+            self.since = time.monotonic() if now is None else now
+        self.data += data
+
+    def expired(self, now=None):
+        now = time.monotonic() if now is None else now
+        return self.since is not None and now - self.since >= 15
+
+    def release(self):
+        data = self.data
+        self.data, self.since = b"", None
+        return data
+
+
 class Quotas:
     """Network reads never block terminal forwarding."""
     def __init__(self, xswap, interval):
@@ -582,7 +603,7 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
     wakeup_sent = False
     terminal_text, dirty, announced = "", False, False
     input_state = InputState()
-    held_input = b""
+    held_input = InputHold()
     goal_submit_at = None
     started = time.monotonic()
 
@@ -599,6 +620,12 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
         tty.setraw(0)
         while True:
             quotas.tick()
+            if action in ("goal-resume", "quota-continue") and held_input.expired():
+                pending = held_input.release()
+                os.write(master, pending)
+                input_state.feed(pending)
+                dirty, action = input_state.dirty, None
+                note("Could not confirm CLI readiness; input restored. Resume manually if needed.")
             ready, _, _ = select.select([master, 0], [], [], .1)
             if master in ready:
                 try:
@@ -616,11 +643,11 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
                 if not data:
                     return conversation, None, 0
                 if action in ("goal-resume", "goal-submit", "quota-continue", "quota-submit") and not data.startswith(b"\x1b") and b"\x03" not in data:
-                    held_input += data
+                    held_input.append(data)
                     continue
                 if action in ("goal-resume", "goal-submit", "quota-continue", "quota-submit") and b"\x03" in data:
                     action = None
-                    held_input = b""
+                    held_input.release()
                 os.write(master, data)
                 # Avoid dropping a partially typed composer draft on an idle handoff.
                 input_state.feed(data)
@@ -657,10 +684,10 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
                 goal_submit_at = time.monotonic() + .4
                 action = "goal-submit" if action == "goal-resume" else "quota-submit"
             if action in ("goal-submit", "quota-submit") and time.monotonic() >= goal_submit_at:
-                os.write(master, b"\r" + held_input)
-                input_state.feed(held_input)
+                pending = held_input.release()
+                os.write(master, b"\r" + pending)
+                input_state.feed(pending)
                 dirty = input_state.dirty
-                held_input = b""
                 action = None
                 note("Submitted the continuation needed for the cooperative handoff checkpoint.")
             quota_failed = any(quota_error(event) for event in events)

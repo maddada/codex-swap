@@ -133,7 +133,9 @@ with the native `/goal resume` command after the resumed CLI becomes ready.
 Explicitly paused, blocked, complete, and budget-limited goals are not restarted.
 The launcher reads goal state but never edits its database or recreates a goal.
 An unreadable goal database is treated as unknown state, not as proof that no
-goal exists; automatic continuation is withheld in that case.
+goal exists; automatic continuation is withheld in that case. Input held while
+waiting for a ready terminal is restored after 15 seconds from the first held
+keystroke if readiness cannot be confirmed, allowing manual continuation.
 
 Resuming across accounts sends the selected conversation's context using the
 next account. Per-account billing and permissions still apply. The launcher does

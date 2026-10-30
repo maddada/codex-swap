@@ -155,6 +155,19 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(auto.resume_options(args),['--enable','hooks','-c','hooks.Stop=[]','-m','model'])
         self.assertEqual(auto.permission_options(['resume',A,'-s','read-only','-a','on-request','-m','model']),['resume',A,'-m','model'])
 
+    def test_readiness_hold_has_a_per_input_deadline_and_preserves_bytes(self):
+        hold=auto.InputHold()
+        self.assertFalse(hold.expired(now=10000))
+        hold.append(b'draft',now=10000)
+        hold.append(b' continued',now=10010)
+        self.assertFalse(hold.expired(now=10014.9))
+        self.assertTrue(hold.expired(now=10015))
+        self.assertEqual(hold.release(),b'draft continued')
+        self.assertFalse(hold.expired(now=20000))
+        hold.append(b'new draft',now=20000)
+        self.assertFalse(hold.expired(now=20001))
+        self.assertEqual(hold.release(),b'new draft')
+
     def test_pasted_multiline_draft_is_not_a_submit(self):
         state=auto.InputState()
         state.feed(b'\x1b]10;rgb:ffff/ffff/ffff\x1b\\')
