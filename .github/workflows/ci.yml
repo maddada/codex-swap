@@ -49,3 +49,19 @@ jobs:
           path: |
             target/release/xswap
             target/release/xswap.exe
+
+  auto-swap:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m unittest discover -s tests/auto_swap -v
+      - run: sh -n scripts/codex-auto-cli
+      - name: Validate zsh integration
+        run: |
+          if command -v zsh >/dev/null 2>&1; then zsh -n scripts/codex-auto.zsh; fi
