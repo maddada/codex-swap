@@ -13,6 +13,7 @@ import re
 import select
 import shutil
 import signal
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -113,6 +114,7 @@ class Conversation:
         self.cwd = None
         self.root = True
         self.percent = None
+        self.turn = None
 
     def attach(self):
         if self.tail:
@@ -147,7 +149,9 @@ class Conversation:
                     self.observe(event, replay=not fresh)
                 except ValueError:
                     pass
-        self.tail = Tail(path, skip_existing=True)
+            stream_offset = stream.tell()
+        self.tail = Tail(path)
+        self.tail.offset = stream_offset
 
     def observe(self, event, replay=False):
         if event.get("type") != "event_msg":
@@ -156,6 +160,7 @@ class Conversation:
         kind = data.get("type")
         if kind in ("task_started", "turn_started"):
             self.active = True
+            self.turn = data.get("turn_id")
         elif kind in ("task_complete", "turn_complete", "turn_aborted"):
             self.active = False
         if kind == "token_count" and not replay:
@@ -215,6 +220,40 @@ class Titles:
         return matches[0] if len(matches) == 1 else None
 
 
+class InputState:
+    """Track unsent text, including bracketed/multiline pastes split across reads."""
+    def __init__(self):
+        self.dirty = False
+        self.paste = False
+        self.escape = b""
+
+    def feed(self, data):
+        for byte in data:
+            if self.escape:
+                self.escape += bytes([byte])
+                if self.escape.startswith(b"\x1b["):
+                    if len(self.escape) >= 3 and 0x40 <= byte <= 0x7e:
+                        if self.escape == b"\x1b[200~":
+                            self.paste = True
+                        elif self.escape == b"\x1b[201~":
+                            self.paste = False
+                        self.escape = b""
+                elif self.escape.startswith(b"\x1b]"):
+                    if byte == 7 or self.escape.endswith(b"\x1b\\"):
+                        self.escape = b""
+                elif len(self.escape) >= 3 or self.escape[1:2] != b"O":
+                    self.escape = b""
+                continue
+            if byte == 27:
+                self.escape = b"\x1b"
+            elif self.paste:
+                self.dirty = True
+            elif byte in (3, 4, 10, 13):
+                self.dirty = False
+            elif byte >= 32 or byte == 8:
+                self.dirty = True
+
+
 class Quotas:
     """Network reads never block terminal forwarding."""
     def __init__(self, xswap, interval):
@@ -228,7 +267,7 @@ class Quotas:
         if self.future and self.future.done():
             try:
                 self.reports = self.future.result()
-            except (RuntimeError, OSError, subprocess.TimeoutExpired):
+            except (RuntimeError, OSError, KeyError, TypeError, ValueError, subprocess.TimeoutExpired):
                 pass  # Keep last good data; a failed read never means exhaustion.
             self.future = None
             self.next_poll = time.monotonic() + self.interval
@@ -278,12 +317,181 @@ def goal_status(directory, session):
                 db.close()
         except sqlite3.Error:
             continue
-    return None
+    return "unknown" if files else None
 
 
-def stop_owned(pid, reaped=False):
+def checkpoint_hook(directory):
+    """Native synchronous PreModelRequest callback; never authorizes a model call."""
+    directory = Path(directory)
+    gate = directory / "handoff-gate.json"
+    ready = directory / "handoff-ready.json"
+    if not gate.exists():
+        return 0
+    payload = json.loads(sys.stdin.buffer.read(1024 * 1024))
+    request = json.loads(gate.read_text())
+    if (payload.get("hook_event_name") != "PreModelRequest" or payload.get("agent_id")
+            or payload.get("session_id") != request.get("session")):
+        return 0
+    os.kill(request["owner"], 0)
+    expires = time.monotonic() + 45
+    record = {"session": payload["session_id"], "turn": payload.get("turn_id"),
+              "nonce": request["nonce"], "pid": os.getpid(), "expires": expires,
+              "transcript": payload.get("transcript_path")}
+    temporary = directory / ("ready-%s.tmp" % os.getpid())
+    temporary.write_text(json.dumps(record))
+    temporary.replace(ready)
+    try:
+        while time.monotonic() < expires:
+            try:
+                current = json.loads(gate.read_text())
+                if current != request:
+                    break
+                os.kill(request["owner"], 0)
+            except (FileNotFoundError, ProcessLookupError):
+                break
+            time.sleep(.05)
+    finally:
+        try:
+            if json.loads(ready.read_text()).get("pid") == os.getpid():
+                ready.unlink()
+        except FileNotFoundError:
+            pass
+    return 0
+
+
+def toml_inline(value):
+    """Serialize the native JSON hook configuration without discarding handlers."""
+    if isinstance(value, dict):
+        return "{" + ",".join(json.dumps(k) + "=" + toml_inline(v)
+                               for k, v in value.items() if v is not None) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(toml_inline(v) for v in value) + "]"
+    if isinstance(value, (str, bool, int, float)):
+        return json.dumps(value, ensure_ascii=False, allow_nan=False)
+    raise RuntimeError("Unsupported hook configuration value")
+
+
+def effective_pre_hooks(xswap, real_codex, account, options):
+    """Ask Codex's loader to resolve hooks, profiles and project configuration."""
+    config_args = []
+    cwd = os.getcwd()
+    index = 0
+    while index < len(options):
+        argument = options[index]
+        if argument in ("-c", "--config", "--enable", "--disable"):
+            config_args += options[index:index + 2]
+            index += 2
+            continue
+        if argument in ("-p", "--profile", "-C", "--cd"):
+            value = options[index + 1]
+            if argument in ("-p", "--profile"):
+                config_args += ["-c", "profile=" + toml_inline(value)]
+            else:
+                cwd = str(Path(value).expanduser().absolute())
+            index += 2
+            continue
+        if argument.startswith(("--config=", "--enable=", "--disable=", "-c=")):
+            config_args.append(argument)
+        elif argument.startswith("--profile="):
+            config_args += ["-c", "profile=" + toml_inline(argument.split("=", 1)[1])]
+        elif argument.startswith("--cd="):
+            cwd = str(Path(argument.split("=", 1)[1]).expanduser().absolute())
+        index += 1
+    command = [xswap, "--codex-bin", real_codex, "run", account["alias"] or str(account["number"]),
+               "--share-history", "--", "app-server"] + config_args
+    proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, cwd=cwd, start_new_session=True,
+                            env={**os.environ, "XSWAP_STOP_CODEX": "never", "CODEX_AUTO_BYPASS": "1"})
+    buffered = b""
+    def request(message, response_id):
+        nonlocal buffered
+        proc.stdin.write((json.dumps(message) + "\n").encode())
+        proc.stdin.flush()
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            while b"\n" in buffered:
+                line, buffered = buffered.split(b"\n", 1)
+                data = json.loads(line)
+                if data.get("id") == response_id:
+                    if "error" in data:
+                        raise RuntimeError("Codex could not resolve checkpoint hook configuration")
+                    return data.get("result", {})
+            if select.select([proc.stdout], [], [], .1)[0]:
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                buffered += chunk
+        raise RuntimeError("Timed out resolving Codex checkpoint hooks; no session was stopped")
+    try:
+        request({"id": 1, "method": "initialize", "params": {
+            "clientInfo": {"name": "codex_auto", "version": "1.0"},
+            "capabilities": {"experimentalApi": True}}}, 1)
+        proc.stdin.write(b'{"method":"initialized","params":{}}\n')
+        proc.stdin.flush()
+        config = request({"id": 2, "method": "config/read", "params": {
+            "includeLayers": False, "cwd": cwd}}, 2).get("config", {})
+        groups = (config.get("hooks") or {}).get("PreModelRequest", [])
+        if not isinstance(groups, list):
+            raise RuntimeError("Invalid native PreModelRequest hook configuration")
+        return groups
+    finally:
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            stop_owned(proc.pid)
+
+
+class HandoffGate:
+    def __init__(self, directory):
+        self.directory = directory
+        self.path = directory / "handoff-gate.json"
+        self.ready = directory / "handoff-ready.json"
+        self.request = None
+
+    def arm(self, session):
+        if self.request and self.request["session"] == session:
+            return
+        self.cancel()
+        self.request = {"session": session, "owner": os.getpid(), "nonce": uuid.uuid4().hex}
+        temporary = self.directory / "gate.tmp"
+        temporary.write_text(json.dumps(self.request))
+        temporary.replace(self.path)
+
+    def cancel(self):
+        self.request = None
+        for path in (self.path, self.ready):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def held(self, session):
+        try:
+            record = json.loads(self.ready.read_text())
+            if (not self.request or record.get("nonce") != self.request["nonce"] or
+                    record.get("session") != session or time.monotonic() >= record["expires"] - 2):
+                return False
+            os.kill(record["pid"], 0)
+            return record
+        except (FileNotFoundError, ProcessLookupError, KeyError, ValueError):
+            return False
+
+
+def stop_owned(pid, reaped=False, parked=False):
     if pid <= 1 or pid == os.getpgrp():
         raise RuntimeError("Refusing unsafe process group")
+    if parked:
+        # The root is blocked in our synchronous hook. Freeze the group before
+        # killing it, so a dying callback cannot release another model request.
+        try:
+            os.killpg(pid, signal.SIGSTOP)
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if not reaped:
+            os.waitpid(pid, 0)
+        return
     try:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -331,13 +539,22 @@ def write_state(state, conversation, account):
 
 
 def run_one(xswap, real_codex, account, options, session, logdir, action, state, locks,
-            quotas, alternate_available, threshold, full_permissions=False):
+            quotas, alternate_available, threshold, full_permissions=False, shared_sqlite=None):
     if session:
         claim_session(session, state, locks)
+    logdir.mkdir(mode=0o700, parents=True)
+    gate = HandoffGate(logdir)
+    groups = effective_pre_hooks(xswap, real_codex, account, options)
+    hook_command = shlex.join([sys.executable, str(Path(__file__).resolve()), "--checkpoint", str(logdir)])
+    groups = groups + [{"hooks": [{"type": "command", "command": hook_command, "timeout": 60, "async": False}]}]
+    checkpoint_options = ["--enable", "hooks", "-c", "hooks.PreModelRequest=" + toml_inline(groups)]
+    options = list(options)
+    insert_at = options.index("--") if "--" in options else len(options)
+    options[insert_at:insert_at] = checkpoint_options
     if full_permissions:
         options = permission_options(options)
     command = [xswap, "--codex-bin", real_codex, "run", account["alias"] or str(account["number"]),
-               "--share-history", "--", "--no-daemon", "-c", "log_dir=" + json.dumps(str(logdir)),
+               "--share-history", "--", "--no-daemon", "-c", "log_dir=" + toml_inline(str(logdir)),
                "-c", 'tui.terminal_title=["session-id","thread-name","activity"]'] + options
     if action == "continue":
         command += [CONTINUE]
@@ -345,7 +562,6 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
         command.insert(command.index("--no-daemon") + 1, "--dangerously-bypass-approvals-and-sandbox")
     since = time.time()
     home = Path(account["home"])
-    logdir.mkdir(mode=0o700, parents=True)
     logtail, titles = Tail(logdir / "codex-tui.log"), Titles()
     conversation = Conversation(session, home, since) if session else None
     if conversation:
@@ -362,7 +578,10 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
         os.environ.pop("CODEX_SQLITE_HOME", None)
         os.execv(xswap, command)
     reaped, recorded, status = False, None, 0
+    parked = False
+    wakeup_sent = False
     terminal_text, dirty, announced = "", False, False
+    input_state = InputState()
     held_input = b""
     goal_submit_at = None
     started = time.monotonic()
@@ -396,16 +615,16 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
                 data = os.read(0, 65536)
                 if not data:
                     return conversation, None, 0
-                if action in ("goal-resume", "goal-submit") and not data.startswith(b"\x1b") and b"\x03" not in data:
+                if action in ("goal-resume", "goal-submit", "quota-continue", "quota-submit") and not data.startswith(b"\x1b") and b"\x03" not in data:
                     held_input += data
                     continue
-                if action in ("goal-resume", "goal-submit") and b"\x03" in data:
+                if action in ("goal-resume", "goal-submit", "quota-continue", "quota-submit") and b"\x03" in data:
                     action = None
                     held_input = b""
                 os.write(master, data)
                 # Avoid dropping a partially typed composer draft on an idle handoff.
-                if not data.startswith(b"\x1b"):
-                    dirty = not any(key in data for key in (b"\r", b"\n", b"\x03", b"\x04"))
+                input_state.feed(data)
+                dirty = input_state.dirty
             for line in logtail.lines():
                 known.update(THREAD.findall(line))
             selected = titles.resolve(known)
@@ -419,6 +638,7 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
                 candidate.attach()
                 if candidate.root:
                     conversation, recorded, dirty = candidate, None, False
+                    input_state.dirty = False
             if conversation is None:
                 child, status = os.waitpid(pid, os.WNOHANG)
                 if child:
@@ -430,17 +650,19 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
                 write_state(state, conversation, account)
                 recorded = (conversation.id, conversation.cwd)
             events = conversation.events()
-            if action == "goal-resume" and titles.resolve(known) == conversation.id and titles.idle and time.monotonic() - started > .5:
+            if action in ("goal-resume", "quota-continue") and titles.resolve(known) == conversation.id and titles.idle and time.monotonic() - started > .5:
                 # Separate text from Enter so Codex does not classify the whole
                 # burst as a multiline paste and leave /goal resume unsubmitted.
-                os.write(master, b"/goal resume")
+                os.write(master, b"/goal resume" if action == "goal-resume" else CONTINUE.encode())
                 goal_submit_at = time.monotonic() + .4
-                action = "goal-submit"
-            if action == "goal-submit" and time.monotonic() >= goal_submit_at:
+                action = "goal-submit" if action == "goal-resume" else "quota-submit"
+            if action in ("goal-submit", "quota-submit") and time.monotonic() >= goal_submit_at:
                 os.write(master, b"\r" + held_input)
+                input_state.feed(held_input)
+                dirty = input_state.dirty
                 held_input = b""
                 action = None
-                note("Resuming the quota-limited goal with its existing budget and accounting.")
+                note("Submitted the continuation needed for the cooperative handoff checkpoint.")
             quota_failed = any(quota_error(event) for event in events)
             report = quotas.reports.get(str(account["number"]), {})
             usage = report.get("usage") or {}
@@ -450,26 +672,34 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
             title_confirmed = titles.resolve(known) == conversation.id
             if quota_failed:
                 quota_pending.add(conversation.id)
-            if conversation.id in quota_pending and title_confirmed and conversation.tail:
-                return conversation, "quota", 0
             percent = max(usage_percent(report), conversation.percent or 0)
-            over = percent >= threshold or usage.get("limitReached") is True or usage.get("allowed") is False
-            completed = any(event.get("type") == "event_msg" and
-                            event.get("payload", {}).get("type") in ("task_complete", "turn_complete") for event in events)
-            # A different/unresolved title means the user is switching chats.
-            at_boundary = completed or (conversation.active is False and titles.idle and not dirty)
-            if over and alternate_available() and title_confirmed:
+            over = percent >= threshold or conversation.id in quota_pending or usage.get("limitReached") is True or usage.get("allowed") is False
+            if over and alternate_available() and title_confirmed and not dirty:
+                gate.arm(conversation.id)
                 if not announced:
-                    note("Usage reached %.1f%%; handoff at the next completed turn." % percent)
+                    note("Usage reached %.1f%%; waiting for a synchronous pre-request checkpoint." % percent)
                     announced = True
-                if at_boundary and not dirty and conversation.tail:
-                    return conversation, "threshold", 0
+                checkpoint = gate.held(conversation.id)
+                if (checkpoint and conversation.tail and conversation.turn and
+                        checkpoint.get("turn") == conversation.turn and not dirty):
+                    parked = True
+                    return conversation, "quota" if conversation.id in quota_pending else "checkpoint", 0
+                if conversation.id in quota_pending and conversation.active is False and titles.idle and not dirty and not wakeup_sent:
+                    shared = shared_sqlite or sqlite_home((home / "sessions").resolve().parent)
+                    goal = goal_status(shared, conversation.id)
+                    if goal is None or goal == "usage_limited":
+                        action = "goal-resume" if goal == "usage_limited" else "quota-continue"
+                        wakeup_sent = True
+            else:
+                gate.cancel()
+                announced = False
             child, status = os.waitpid(pid, os.WNOHANG)
             if child:
                 reaped = True
                 return conversation, None, os.waitstatus_to_exitcode(status)
     finally:
-        stop_owned(pid, reaped)
+        stop_owned(pid, reaped, parked=parked)
+        gate.cancel()
         termios.tcsetattr(0, termios.TCSADRAIN, oldterm)
         signal.signal(signal.SIGWINCH, oldresize)
         os.close(master)
@@ -642,17 +872,17 @@ def main():
             note(("Resuming " + session + " on " if session else "Starting on ") + chosen)
             conversation, reason, code = run_one(xswap, real_codex, account, next_options, session,
                 launch / str(attempt), action, state, locks, quotas,
-                lambda: any(name != chosen and eligible(name) for name in order), threshold, full_permissions)
+                lambda: any(name != chosen and eligible(name) for name in order), threshold, full_permissions, shared_sqlite)
             if reason is None:
                 return code
             session, current_cwd = conversation.id, conversation.cwd
-            note(chosen + (" reached the handoff threshold." if reason == "threshold" else " quota exhausted.") +
+            note(chosen + (" reached the handoff threshold." if reason in ("threshold", "checkpoint") else " quota exhausted.") +
                  " Resuming this conversation only.")
             failed[chosen] = time.monotonic()
             order = order[order.index(chosen) + 1:] + order[:order.index(chosen) + 1]
             goal = goal_status(shared_sqlite, session)
             action = ("goal-resume" if goal == "usage_limited" else
-                      "continue" if reason == "quota" and goal is None else None)
+                      "continue" if reason in ("quota", "checkpoint") and goal is None else None)
             next_options = ["resume", session] + retry_options
             if current_cwd:
                 next_options += ["-C", current_cwd]
@@ -669,6 +899,8 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGHUP, interrupted)
     try:
+        if sys.argv[1:2] == ["--checkpoint"]:
+            sys.exit(checkpoint_hook(sys.argv[2]))
         sys.exit(main())
     except KeyboardInterrupt:
         note("Stopped.")

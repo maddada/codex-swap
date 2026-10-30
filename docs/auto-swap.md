@@ -7,7 +7,7 @@ It never uses a global account switch or a process-name-based kill command.
 
 ## Install
 
-Install the official Codex CLI and xswap first. Save at least two accounts with
+Install the official Codex CLI (tested with 0.166.0) and xswap first. Save at least two accounts with
 `xswap add --login --alias NAME`. Python 3.9 or newer is required; Python 3.11+
 also supports arbitrary TOML syntax for custom `sqlite_home` configuration.
 
@@ -74,16 +74,39 @@ codex-auto --session EXACT_SESSION_UUID
 ## What triggers a handoff
 
 Core Codex quota windows are checked in the background every 30 seconds. Fresh
-`token_count` records from the managed conversation also update usage. At 97%
-used in any core window, a handoff is scheduled for a completed-turn boundary or
-an idle conversation. A partially typed composer draft delays an idle handoff.
-A long active turn can take usage above 97% before it finishes.
+`token_count` records also update usage. At 97%, the wrapper arms a private gate
+for the focused conversation. It does **not** infer a safe restart from a
+completed-turn event or an idle-looking terminal: a goal can start another turn
+before the launcher processes either signal.
+
+The launcher adds a synchronous `PreModelRequest` hook while preserving existing
+inline handlers through Codex's effective `config/read` result. The callback
+parks before a model request can start and acknowledges its exact session,
+turn ID and one-use gate nonce. Handoff requires that turn's start to be present
+in the persisted transcript and the callback's lease to still be live. The
+launcher then freezes and terminates only its own PTY group, so the callback's
+exit cannot release another request during shutdown. A stale, expired, absent
+or untrusted callback never causes an automatic restart.
+
+Handoff happens at a pre-request checkpoint, which can be within a turn after
+its tools finish. An ordinary idle chat waits for its next request; a running
+goal checkpoints at its next model request. A long model request or tool call
+can take usage above 97% before the callback is reached. Unsubmitted text,
+including multiline bracketed pastes, defers handoff. Existing custom hook
+handlers should tolerate cancellation and retries during a handoff.
+
+The native hook must be supported, enabled and trusted. Review it using Codex's
+normal hook trust UI if prompted; the launcher never adds a hook-trust bypass.
+If policy disables the callback, the CLI keeps running but automatic rotation
+waits for a valid acknowledgement instead of stopping the process from logs.
+A failed config preflight stops the launcher before starting a managed session.
 
 Only accounts with confirmed available quota below the threshold are selected.
 When no alternative is available, the current session can keep using its
-remaining quota. After an actual `usage_limit_exceeded` failure, only that
-launch's private PTY process group is stopped and the exact conversation is
-resumed on another account. An unfinished ordinary request gets a continuation
+remaining quota. After an actual `usage_limit_exceeded` failure, the wrapper also waits for
+a cooperative checkpoint before resuming the exact conversation on another
+account. A stalled ordinary request may receive an automatic continuation to
+reach that checkpoint; a quota-paused goal uses `/goal resume`. An unfinished ordinary request gets a continuation
 prompt that asks Codex to inspect state and avoid duplicating work. Original
 prompts are never replayed. Generic HTTP 429 errors, transient request limits,
 and failed quota reads do not by themselves cause rotation.
@@ -109,6 +132,8 @@ resume, without an extra continuation prompt. A `usage_limited` goal is resumed
 with the native `/goal resume` command after the resumed CLI becomes ready.
 Explicitly paused, blocked, complete, and budget-limited goals are not restarted.
 The launcher reads goal state but never edits its database or recreates a goal.
+An unreadable goal database is treated as unknown state, not as proof that no
+goal exists; automatic continuation is withheld in that case.
 
 Resuming across accounts sends the selected conversation's context using the
 next account. Per-account billing and permissions still apply. The launcher does
@@ -128,10 +153,17 @@ Run the isolated tests without making model requests:
 python3 -m unittest discover -s tests/auto_swap -v
 zsh -n scripts/codex-auto.zsh
 sh -n scripts/codex-auto-cli
+
+# Requires the official Codex CLI; uses only a local mock model server:
+python3 tests/auto_swap/native_checkpoint_smoke.py
 ```
 
 Tests use fake xswap/CLI processes in real PTYs and temporary SQLite fixtures.
-They exercise proactive and error-triggered rotation, exact conversation
-selection, full permissions, goal status/accounting preservation, and survival
-of an unrelated process. Recheck compatibility after major Codex CLI updates;
+They exercise proactive and error-triggered rotation, same-batch and delayed
+next-turn races, missing/untrusted callbacks, stale checkpoint leases, draft
+pastes, concurrent transcript appends, exact conversation selection, full
+permissions, goal accounting preservation, and survival of an unrelated process.
+The native smoke test proves that an actual Codex callback blocks the model
+request until released and that its turn is already persisted. It sends no
+requests to an external model provider. CI runs both layers on macOS and Linux. Recheck compatibility after major Codex CLI updates;
 the launcher depends on its session history, terminal-title and log formats.

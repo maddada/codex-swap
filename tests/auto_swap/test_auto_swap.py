@@ -7,11 +7,13 @@ import pty
 import select
 import shutil
 import signal
+import sys
 import sqlite3
 import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[2] / 'scripts/codex-auto'
 loader = importlib.machinery.SourceFileLoader('auto_swap', str(SCRIPT))
@@ -21,7 +23,7 @@ loader.exec_module(auto)
 A = '00000000-0000-7000-8000-000000000001'
 B = '10000000-0000-7000-8000-000000000002'
 FAKE = r'''#!/usr/bin/env python3
-import datetime, json, os, pathlib, select, sqlite3, sys, time, tty
+import datetime, json, os, pathlib, re, select, shlex, sqlite3, subprocess, sys, time, tty
 root=pathlib.Path(os.environ['FAKE_ROOT']); args=sys.argv[1:]; mode=os.environ['FAKE_MODE']
 accounts=[dict(alias=a,number=i+1,home=str(root/'home'),enabled=True,loginStatus='present',isDefault=i==0) for i,a in enumerate(['alt','personal','work'])]
 if args[0]=='--codex-bin': args=args[2:]
@@ -30,11 +32,23 @@ if args[0]=='status': print(json.dumps({'defaultHome':str(root/'main')}));sys.ex
 if args[0]=='usage':
  values=json.loads((root/'usage.json').read_text())
  print(json.dumps({'accounts':[dict(number=a['number'],usage=dict(allowed=True,limitReached=False,windows=[dict(scope='codex',usedPercent=values[a['alias']])])) for a in accounts]}));sys.exit()
+if args[0]=='run' and 'app-server' in args:
+ for line in sys.stdin:
+  message=json.loads(line)
+  if message.get('id')==1:print(json.dumps({'id':1,'result':{}}),flush=True)
+  if message.get('method')=='config/read':
+   print(json.dumps({'id':message['id'],'result':{'config':{'hooks':{'PreModelRequest':[{'hooks':[{'type':'command','command':'printf existing-hook','timeout':5}]}]}}}}),flush=True)
+ sys.exit()
 assert args[0]=='run' and '--share-history' in args and '--no-daemon' in args
 assert os.environ['XSWAP_STOP_CODEX']=='never' and os.getpgrp()==os.getpid()
 with (root/'launches').open('a') as f:f.write(json.dumps(args)+'\n')
 logdir=pathlib.Path(json.loads(next(x for x in args if x.startswith('log_dir=')).split('=',1)[1]));logdir.mkdir(parents=True,exist_ok=True)
 log=logdir/'codex-tui.log'
+config=next(value for value in args if value.startswith('hooks.PreModelRequest='))
+assert 'existing-hook' in config, 'Existing native hooks were overwritten'
+commands=re.findall(r'"command"=("(?:\\.|[^"\\])*")',config)
+hook_command=json.loads(commands[-1])
+
 a='00000000-0000-7000-8000-000000000001';b='10000000-0000-7000-8000-000000000002';child='20000000-0000-7000-8000-000000000003'
 sid=b if mode=='chat-switch' else a
 home=root/'home/sessions/2026/10/30';home.mkdir(parents=True,exist_ok=True)
@@ -43,8 +57,15 @@ def meta(s,parent=None):
  if not p.exists():p.write_text(json.dumps({'type':'session_meta','payload':{'id':s,'cwd':str(root/'project'),'parent_thread_id':parent}})+'\n')
  return p
 def event(p,kind,**fields):
+ if kind=='task_started':fields.setdefault('turn_id','turn-1')
  d={'timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat(),'type':'event_msg','payload':dict(type=kind,**fields)}
  with p.open('a') as f:f.write(json.dumps(d)+'\n')
+def checkpoint(p,turn='turn-2'):
+ event(p,'task_started',turn_id=turn)
+ payload=dict(hook_event_name='PreModelRequest',session_id=sid,turn_id=turn,transcript_path=str(p),cwd=str(root/'project'))
+ callback=subprocess.Popen(shlex.split(hook_command),stdin=subprocess.PIPE)
+ callback.communicate(json.dumps(payload).encode(),timeout=8)
+ assert callback.returncode==0, callback.returncode
 def title(s):
  os.write(1,('\x1b]0;'+s[:29]+'... | fixture\x07\x1b]7501;state=idle:app=codex\x1b\\').encode())
 def announce(s):
@@ -68,20 +89,39 @@ if args[1]=='alt':
   if mode=='goal-limited':
    db=sqlite3.connect(root/'main/goals_1.sqlite');db.execute("update thread_goals set status='usage_limited'");db.commit();db.close()
   event(p,'task_complete',error={'codex_error_info':'usage_limit_exceeded'})
+  time.sleep(.3)
+  checkpoint(p)
  else:
   if mode=='poll-threshold':
    (root/'usage.json').write_text(json.dumps(dict(alt=97,personal=10,work=10)))
   event(p,'token_count',rate_limits={'limit_id':'codex','primary':{'used_percent':90 if mode=='poll-threshold' else 97}})
   time.sleep(.6)
   (root/'work-finished').write_text('yes')
-  event(p,'task_complete',error=None)
+  if mode=='race-batch':
+   timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat()
+   batch=[dict(timestamp=timestamp,type='event_msg',payload=dict(type=kind,turn_id='turn-2')) for kind in ('task_complete','task_started')]
+   with p.open('a') as f:f.write(''.join(json.dumps(d)+'\n' for d in batch))
+   time.sleep(.7)
+   (root/'second-turn-finished').write_text('yes')
+   event(p,'task_complete')
+  else:
+   event(p,'task_complete',error=None)
+  if mode=='no-checkpoint':time.sleep(.7);sys.exit(0)
+  if mode=='race-delayed':
+   time.sleep(.2)
+   event(p,'task_started',turn_id='turn-2')
+   time.sleep(.7)
+   (root/'second-turn-finished').write_text('yes')
+   event(p,'task_complete')
+  checkpoint(p,'turn-3' if mode.startswith('race-') else 'turn-2')
  while True:time.sleep(.1)
 assert args[1]=='personal',args
 assert 'resume' in args and args[args.index('resume')+1]==sid,args
 assert 'ORIGINAL TASK' not in args,args
 if mode not in ('quota','goal-limited','goal-paused'):assert (root/'work-finished').exists(),'Restarted during active work'
-if mode=='quota':assert 'Continue the unfinished request' in args[-1]
+if mode in ('quota','threshold','poll-threshold','historical','chat-switch','race-batch','race-delayed'):assert 'Continue the unfinished request' in args[-1]
 else:assert not any('Continue the unfinished request' in arg for arg in args)
+if mode.startswith('race-'):assert (root/'second-turn-finished').exists(), 'Interrupted the next active turn'
 announce(sid)
 if mode=='goal-limited':
  tty.setraw(0);received=b'';end=time.monotonic()+5
@@ -115,6 +155,68 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(auto.resume_options(args),['--enable','hooks','-c','hooks.Stop=[]','-m','model'])
         self.assertEqual(auto.permission_options(['resume',A,'-s','read-only','-a','on-request','-m','model']),['resume',A,'-m','model'])
 
+    def test_pasted_multiline_draft_is_not_a_submit(self):
+        state=auto.InputState()
+        state.feed(b'\x1b]10;rgb:ffff/ffff/ffff\x1b\\')
+        self.assertFalse(state.dirty)
+        for chunk in (b'\x1b[20',b'0~unsent\ntext',b'\x1b[201~'):
+            state.feed(chunk)
+        self.assertTrue(state.dirty)
+        state.feed(b'\r')
+        self.assertFalse(state.dirty)
+
+    def test_attach_does_not_skip_concurrently_appended_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp);directory=home/'sessions/2026/10/30';directory.mkdir(parents=True)
+            path=directory/('rollout-'+A+'.jsonl')
+            path.write_text(json.dumps({'type':'session_meta','payload':{'id':A}})+'\n')
+            original=auto.Tail.__init__
+            def append_before_tail(tail,*args,**kwargs):
+                with path.open('a') as stream:
+                    stream.write(json.dumps({'type':'event_msg','payload':{'type':'task_started','turn_id':'concurrent-turn'}})+'\n')
+                original(tail,*args,**kwargs)
+            with mock.patch.object(auto.Tail,'__init__',append_before_tail):
+                conversation=auto.Conversation(A,home)
+                events=conversation.events()
+            self.assertEqual(conversation.turn,'concurrent-turn')
+            self.assertEqual(len(events),1)
+
+    def test_unreadable_goal_state_is_not_no_goal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory=Path(tmp)
+            (directory/'goals_1.sqlite').write_bytes(b'invalid database')
+            self.assertEqual(auto.goal_status(directory,A),'unknown')
+
+    def test_checkpoint_requires_current_nonce_session_and_live_lease(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gate=auto.HandoffGate(Path(tmp));gate.arm(A)
+            record=dict(session=A,nonce='wrong',pid=os.getpid(),expires=time.monotonic()+30,turn='turn')
+            gate.ready.write_text(json.dumps(record));self.assertFalse(gate.held(A))
+            record['nonce']=gate.request['nonce'];record['session']=B
+            gate.ready.write_text(json.dumps(record));self.assertFalse(gate.held(A))
+            record['session']=A;record['expires']=time.monotonic()-1
+            gate.ready.write_text(json.dumps(record));self.assertFalse(gate.held(A))
+
+    def test_native_callback_cannot_release_until_gate_is_cancelled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gate=auto.HandoffGate(Path(tmp));gate.arm(A)
+            callback=subprocess.Popen([sys.executable,str(SCRIPT),'--checkpoint',tmp],stdin=subprocess.PIPE)
+            callback.stdin.write(json.dumps(dict(session_id=A,hook_event_name='PreModelRequest',turn_id='turn')).encode());callback.stdin.close()
+            try:
+                end=time.monotonic()+3
+                while time.monotonic()<end and not gate.held(A):time.sleep(.02)
+                self.assertTrue(gate.held(A));self.assertIsNone(callback.poll())
+                gate.cancel();self.assertEqual(callback.wait(timeout=3),0)
+            finally:
+                if callback.poll() is None:callback.kill();callback.wait()
+
+    def test_subagent_callback_does_not_park_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gate=auto.HandoffGate(Path(tmp));gate.arm(A)
+            payload=dict(session_id=A,hook_event_name='PreModelRequest',agent_id='child',turn_id='turn')
+            result=subprocess.run([sys.executable,str(SCRIPT),'--checkpoint',tmp],input=json.dumps(payload).encode(),timeout=3)
+            self.assertEqual(result.returncode,0);self.assertFalse(gate.held(A))
+
 
 class HandoffTests(unittest.TestCase):
     def exercise(self,mode):
@@ -145,7 +247,7 @@ class HandoffTests(unittest.TestCase):
                 self.assertIsNotNone(status,output.decode(errors='replace'))
                 self.assertIsNone(sibling.poll(),'Unrelated cmux-like process was interrupted')
                 launches=[json.loads(line) for line in (root/'launches').read_text().splitlines()]
-                self.assertEqual([args[1] for args in launches],['alt'] if mode=='transient' else ['alt','personal'],output)
+                self.assertEqual([args[1] for args in launches],['alt'] if mode in ('transient','no-checkpoint') else ['alt','personal'],output)
                 for args in launches:
                     self.assertIn('--dangerously-bypass-approvals-and-sandbox',args)
                     self.assertNotIn('-s',args);self.assertNotIn('-a',args)
@@ -160,6 +262,9 @@ class HandoffTests(unittest.TestCase):
                 os.close(fd);sibling.terminate();sibling.wait()
 
     def test_97_percent_waits_for_completed_turn(self):self.exercise('threshold')
+    def test_completion_followed_by_start_in_same_read(self):self.exercise('race-batch')
+    def test_new_turn_after_observed_completion(self):self.exercise('race-delayed')
+    def test_missing_or_untrusted_hook_never_forces_handoff(self):self.exercise('no-checkpoint')
     def test_background_quota_poll_hands_off_at_97(self):self.exercise('poll-threshold')
     def test_quota_failure_continues_exact_conversation(self):self.exercise('quota')
     def test_transient_rate_limit_does_not_rotate(self):self.exercise('transient')
