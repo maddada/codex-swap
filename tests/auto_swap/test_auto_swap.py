@@ -186,9 +186,9 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(fence.permits(b''))
 
     def test_non_submitting_input_does_not_wait_for_a_nonexistent_turn(self):
-        fence = auto.InputFence()
         for data in [b'\x1b]10;rgb:ffff/0000/aaaa\x1b\\', b'\x1b[12;34R',
                      b'\x1b[A', b'\x03', b'cancelled draft\x03', b'\r']:
+            fence = auto.InputFence()
             fence.received(data)
             self.assertTrue(fence.permits(b''))
 
