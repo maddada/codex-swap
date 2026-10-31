@@ -92,7 +92,10 @@ Handoff happens at a pre-request checkpoint, which can be within a turn after
 its tools finish. An ordinary idle chat waits for its next request; a running
 goal checkpoints at its next model request. A long model request or tool call
 can take usage above 97% before the callback is reached. Unsubmitted text,
-including multiline bracketed pastes, defers handoff. Existing custom hook
+including multiline bracketed pastes, defers handoff. Submitted input also defers
+handoff until a later persisted turn acknowledges it and the PTY input queue
+is empty. Multiple submissions each require a later turn; same-turn steering
+may therefore wait for the next goal turn or user request before switching. Existing custom hook
 handlers should tolerate cancellation and retries during a handoff.
 
 The native hook must be supported, enabled and trusted. Review it using Codex's

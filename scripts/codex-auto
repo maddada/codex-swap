@@ -233,6 +233,7 @@ class InputState:
         self.dirty = False
         self.paste = False
         self.escape = b""
+        self.submissions = 0
 
     def feed(self, data):
         for byte in data:
@@ -257,6 +258,8 @@ class InputState:
                 self.dirty = True
             elif byte in (3, 4, 10, 13):
                 self.dirty = False
+                if byte in (10, 13):
+                    self.submissions += 1
             elif byte >= 32 or byte == 8:
                 self.dirty = True
 
@@ -291,6 +294,52 @@ class InputHold:
         data = self.data
         self.data, self.since = b"", None
         return data
+
+
+class InputFence:
+    """Wait for a persisted new turn after terminal input, not merely Enter."""
+    def __init__(self):
+        self.since = None
+        self.turn = None
+        self.skip_turns = 0
+        self.submissions = 0
+        self.input = InputState()
+
+    def received(self, turn, now=None, skip_turns=0, data=None):
+        self.since = time.time() if now is None else now
+        self.turn = turn
+        self.skip_turns = max(self.skip_turns, skip_turns)
+        if data is not None:
+            before = self.input.submissions
+            self.input.feed(data)
+            self.submissions += self.input.submissions - before
+
+    def observe(self, events):
+        if self.since is None:
+            return
+        for event in events:
+            payload = event.get("payload", {})
+            if (event.get("type") == "event_msg" and payload.get("type") in ("task_started", "turn_started")
+                    and payload.get("turn_id") and payload["turn_id"] != self.turn):
+                try:
+                    timestamp = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp()
+                except (KeyError, ValueError):
+                    continue
+                if timestamp >= self.since:
+                    if self.skip_turns:
+                        self.skip_turns -= 1
+                        self.turn = payload["turn_id"]
+                        continue
+                    if self.submissions > 1:
+                        self.submissions -= 1
+                        self.turn = payload["turn_id"]
+                        continue
+                    self.since = None
+                    self.submissions = 0
+                    return
+
+    def permits(self, pending):
+        return self.since is None and not pending
 
 
 class TerminalPump:
@@ -364,6 +413,45 @@ class Quotas:
         self.pool.shutdown(wait=False)
 
 
+def toml_path_scalar(raw):
+    """Read a single-line TOML string with an optional trailing comment."""
+    if raw[:1] not in ("'", '"') or raw.startswith(("'''", '"""')):
+        raise ValueError("sqlite_home requires a single-line TOML string on Python 3.9/3.10")
+    quote, result, index = raw[0], [], 1
+    escapes = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
+    while index < len(raw):
+        char = raw[index]
+        index += 1
+        if char == quote:
+            suffix = raw[index:].lstrip()
+            if suffix and not suffix.startswith("#"):
+                raise ValueError("Unexpected text after sqlite_home string")
+            return "".join(result)
+        if ord(char) < 32 and char != "\t":
+            raise ValueError("Control character in sqlite_home string")
+        if char == "\\" and quote == '"':
+            if index >= len(raw):
+                break
+            char = raw[index]
+            index += 1
+            if char in escapes:
+                char = escapes[char]
+            elif char in ("u", "U"):
+                count = 4 if char == "u" else 8
+                digits = raw[index:index + count]
+                if len(digits) != count or not re.fullmatch(r"[0-9a-fA-F]+", digits):
+                    raise ValueError("Invalid Unicode escape in sqlite_home")
+                code = int(digits, 16)
+                if code > 0x10ffff or 0xd800 <= code <= 0xdfff:
+                    raise ValueError("Invalid Unicode scalar in sqlite_home")
+                char = chr(code)
+                index += count
+            else:
+                raise ValueError("Invalid TOML escape in sqlite_home")
+        result.append(char)
+    raise ValueError("Unterminated sqlite_home string")
+
+
 def sqlite_home(main_home):
     text = (main_home / "config.toml").read_text() if (main_home / "config.toml").exists() else ""
     try:
@@ -378,11 +466,7 @@ def sqlite_home(main_home):
                 break
             match = re.match(r"\s*sqlite_home\s*=\s*(.*)", line)
             if match:
-                raw = match.group(1).strip()
-                if raw.startswith("'") and raw.endswith("'"):
-                    configured = raw[1:-1]
-                else:
-                    configured = json.loads(raw)
+                configured = toml_path_scalar(match.group(1).strip())
     if not configured:
         return main_home
     path = Path(configured).expanduser()
@@ -668,6 +752,7 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
     wakeup_sent = False
     terminal_text, dirty, announced = "", False, False
     input_state = InputState()
+    input_fence = InputFence()
     held_input = InputHold()
     goal_submit_at = None
     started = time.monotonic()
@@ -708,6 +793,8 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
                 data = os.read(0, 65536)
                 if not data:
                     return conversation, None, 0
+                input_fence.received(conversation.turn if conversation else None, data=data)
+                gate.cancel()
                 if action in ("goal-resume", "goal-submit", "quota-continue", "quota-submit") and b"\x03" not in data:
                     replies = held_input.append(data)
                     if replies:
@@ -745,6 +832,7 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
                 write_state(state, conversation, account)
                 recorded = (conversation.id, conversation.cwd)
             events = conversation.events()
+            input_fence.observe(events)
             if action in ("goal-resume", "quota-continue") and titles.resolve(known) == conversation.id and titles.idle and time.monotonic() - started > .5:
                 # Separate text from Enter so Codex does not classify the whole
                 # burst as a multiline paste and leave /goal resume unsubmitted.
@@ -761,6 +849,10 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
                 action = "goal-submit" if action == "goal-resume" else "quota-submit"
             if action in ("goal-submit", "quota-submit") and time.monotonic() >= goal_submit_at:
                 pending = held_input.release()
+                if pending:
+                    # The first new turn acknowledges our generated command,
+                    # not user input queued behind it. Require the following turn.
+                    input_fence.received(conversation.turn, skip_turns=1)
                 pump.queue(master, b"\r" + pending)
                 input_state.feed(pending)
                 dirty = input_state.dirty
@@ -778,14 +870,27 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
             percent = max(usage_percent(report), conversation.percent or 0)
             over = percent >= threshold or conversation.id in quota_pending or usage.get("limitReached") is True or usage.get("allowed") is False
             if over and alternate_available() and title_confirmed and not dirty:
-                gate.arm(conversation.id)
+                can_handoff = input_fence.permits(pump.pending[master])
+                if can_handoff:
+                    gate.arm(conversation.id)
+                else:
+                    gate.cancel()
                 if not announced:
                     note("Usage reached %.1f%%; waiting for a synchronous pre-request checkpoint." % percent)
                     announced = True
                 checkpoint = gate.held(conversation.id)
-                if (checkpoint and conversation.tail and conversation.turn and
+                if (can_handoff and checkpoint and conversation.tail and conversation.turn and
                         checkpoint.get("turn") == conversation.turn and not dirty):
+                    # Freeze before the final stdin check. Bytes arriving after
+                    # this check remain on the outer terminal for the resumed
+                    # child; bytes already forwarded require a persisted turn.
+                    os.killpg(pid, signal.SIGSTOP)
                     parked = True
+                    if select.select([0], [], [], 0)[0]:
+                        gate.cancel()
+                        os.killpg(pid, signal.SIGCONT)
+                        parked = False
+                        continue
                     return conversation, "quota" if conversation.id in quota_pending else "checkpoint", 0
                 if conversation.id in quota_pending and conversation.active is False and titles.idle and not dirty and not wakeup_sent:
                     shared = shared_sqlite or sqlite_home((home / "sessions").resolve().parent)

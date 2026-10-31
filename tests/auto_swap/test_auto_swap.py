@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import fcntl
+import builtins
 import json
 import os
 from pathlib import Path
@@ -115,15 +116,27 @@ if args[1]=='alt':
    time.sleep(.7)
    (root/'second-turn-finished').write_text('yes')
    event(p,'task_complete')
-  checkpoint(p,'turn-3' if mode.startswith('race-') else 'turn-2')
+  if mode=='checkpoint-input':
+   tty.setraw(0)
+   print('CHECKPOINT_INPUT_NOW',flush=True)
+   checkpoint(p,'turn-input-held')
+   received=b'';end=time.monotonic()+5
+   while time.monotonic()<end and b'\r' not in received:
+    if select.select([0],[],[],.1)[0]:received+=os.read(0,4096)
+   assert received==b'KEEP USER MESSAGE\r',received
+   (root/'user-input-saved').write_bytes(received)
+   checkpoint(p,'turn-user-ack')
+  else:
+   checkpoint(p,'turn-3' if mode.startswith('race-') else 'turn-2')
  while True:time.sleep(.1)
 assert args[1]=='personal',args
 assert 'resume' in args and args[args.index('resume')+1]==sid,args
 assert 'ORIGINAL TASK' not in args,args
 if mode not in ('quota','goal-limited','goal-paste','goal-paused'):assert (root/'work-finished').exists(),'Restarted during active work'
-if mode in ('quota','threshold','poll-threshold','historical','chat-switch','race-batch','race-delayed'):assert 'Continue the unfinished request' in args[-1]
+if mode in ('quota','threshold','poll-threshold','historical','chat-switch','race-batch','race-delayed','checkpoint-input'):assert 'Continue the unfinished request' in args[-1]
 else:assert not any('Continue the unfinished request' in arg for arg in args)
 if mode.startswith('race-'):assert (root/'second-turn-finished').exists(), 'Interrupted the next active turn'
+if mode=='checkpoint-input':assert (root/'user-input-saved').read_bytes()==b'KEEP USER MESSAGE\r'
 announce(sid)
 if mode in ('goal-limited','goal-paste'):
  tty.setraw(0);received=b'';end=time.monotonic()+5
@@ -143,6 +156,66 @@ print('EXACT_HANDOFF_OK',flush=True);time.sleep(.3)
 
 
 class PolicyTests(unittest.TestCase):
+    def test_enter_needs_persisted_input_acknowledgement_before_handoff(self):
+        state, fence = auto.InputState(), auto.InputFence()
+        state.feed(b'new request\r')
+        fence.received('old', now=100)
+        self.assertFalse(state.dirty)
+        self.assertFalse(fence.permits(b''))
+        def started(turn, timestamp):
+            return {'type': 'event_msg', 'timestamp': timestamp,
+                    'payload': {'type': 'task_started', 'turn_id': turn}}
+        fence.observe([started('new', '1970-01-01T00:01:39Z')])
+        self.assertFalse(fence.permits(b''))  # Old, delayed transcript batch.
+        fence.observe([started('old', '1970-01-01T00:01:41Z')])
+        self.assertFalse(fence.permits(b''))  # Same turn is not input acknowledgement.
+        fence.observe([started('new', '1970-01-01T00:01:41Z')])
+        self.assertFalse(fence.permits(b'not yet written'))
+        self.assertTrue(fence.permits(b''))
+
+    def test_each_submission_needs_ack_but_pasted_newlines_are_not_submissions(self):
+        fence = auto.InputFence()
+        fence.received('old', now=100, data=b'one\r')
+        fence.received('old', now=100, data=b'\x1b[200~two\nlines\x1b[201~\r')
+        def started(turn):
+            return {'type': 'event_msg', 'timestamp': '1970-01-01T00:01:41Z',
+                    'payload': {'type': 'task_started', 'turn_id': turn}}
+        fence.observe([started('first')])
+        self.assertFalse(fence.permits(b''))
+        fence.observe([started('second')])
+        self.assertTrue(fence.permits(b''))
+
+    def test_generated_continuation_does_not_acknowledge_held_user_input(self):
+        fence = auto.InputFence()
+        fence.received('old', now=100, skip_turns=1)
+        def started(turn):
+            return {'type': 'event_msg', 'timestamp': '1970-01-01T00:01:41Z',
+                    'payload': {'type': 'task_started', 'turn_id': turn}}
+        fence.observe([started('generated'), started('generated')])
+        self.assertFalse(fence.permits(b''))
+        fence.observe([started('user')])
+        self.assertTrue(fence.permits(b''))
+
+    def test_python39_sqlite_home_accepts_toml_comments_and_string_escapes(self):
+        original_import = builtins.__import__
+        def without_tomllib(name, *args, **kwargs):
+            if name == 'tomllib':
+                raise ImportError('exercise Python 3.9 fallback')
+            return original_import(name, *args, **kwargs)
+        examples = [(r'"custom#state" # trailing comment', 'custom#state'),
+                    ("'literal#state' # trailing comment", 'literal#state'),
+                    (r'"unicode-\U0001F9EA" # comment', 'unicode-🧪'),
+                    (r'"escaped-\u0061" # comment', 'escaped-a')]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch('builtins.__import__', side_effect=without_tomllib):
+            home = Path(tmp)
+            for scalar, expected in examples:
+                (home/'config.toml').write_text('sqlite_home = ' + scalar + '\n[other]\n')
+                self.assertEqual(auto.sqlite_home(home), (home/expected).resolve())
+            for scalar in ['"unterminated # comment', '"ok" extra', r'"bad-\q"', r'"bad-\uD800"']:
+                (home/'config.toml').write_text('sqlite_home = ' + scalar)
+                with self.subTest(scalar=scalar), self.assertRaises(ValueError):
+                    auto.sqlite_home(home)
+
     def test_only_terminal_replies_bypass_hold_and_paste_payload_is_literal(self):
         hold = auto.InputHold()
         self.assertEqual(hold.append(b'\x1b]10;rgb:ffff'), b'')
@@ -341,7 +414,7 @@ class HandoffTests(unittest.TestCase):
             sibling=subprocess.Popen(['/bin/sleep','60'])
             pid,fd=pty.fork()
             if pid==0:os.execve(sys.executable,[sys.executable,str(SCRIPT),'--','-m','test-model','-s','read-only','-a','on-request','ORIGINAL TASK'],env)
-            output=b'';status=None;paste_sent=False;end=time.monotonic()+30
+            output=b'';status=None;paste_sent=False;checkpoint_input_sent=False;end=time.monotonic()+30
             try:
                 while time.monotonic()<end:
                     ready,_,_=select.select([fd],[],[],.1)
@@ -351,6 +424,9 @@ class HandoffTests(unittest.TestCase):
                         if mode=='goal-paste' and b'PASTE_NOW' in output and not paste_sent:
                             os.write(fd,b'\x1b[200~USER DRAFT\x1b[201~')
                             paste_sent=True
+                    if mode=='checkpoint-input' and b'CHECKPOINT_INPUT_NOW' in output and not checkpoint_input_sent:
+                        os.write(fd,b'KEEP USER MESSAGE\r')
+                        checkpoint_input_sent=True
                     child,st=os.waitpid(pid,os.WNOHANG)
                     if child:status=st;break
                 self.assertIsNotNone(status,output.decode(errors='replace'))
@@ -369,6 +445,8 @@ class HandoffTests(unittest.TestCase):
             finally:
                 if status is None:os.kill(pid,signal.SIGTERM);os.waitpid(pid,0)
                 os.close(fd);sibling.terminate();sibling.wait()
+
+    def test_submitted_input_at_checkpoint_is_saved_before_handoff(self):self.exercise('checkpoint-input')
 
     def test_97_percent_waits_for_completed_turn(self):self.exercise('threshold')
     def test_completion_followed_by_start_in_same_read(self):self.exercise('race-batch')
