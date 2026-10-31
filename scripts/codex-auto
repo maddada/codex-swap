@@ -6,6 +6,7 @@ from datetime import datetime
 import errno
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import pty
@@ -18,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import termios
+import tempfile
 import time
 import tty
 import uuid
@@ -1026,9 +1028,88 @@ def real_binary(config):
     raise RuntimeError("Set real_codex in codex-auto config to the official Codex executable")
 
 
+def rotation_settings(config):
+    result = {"threshold": config.get("threshold", 97),
+              "poll_seconds": config.get("poll_seconds", 30),
+              "cooldown_seconds": config.get("cooldown_seconds", 300),
+              "full_permissions": config.get("full_permissions", False)}
+    for key in ("threshold", "poll_seconds", "cooldown_seconds"):
+        value = result[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise RuntimeError(key + " must be a finite number")
+    if not 0 < result["threshold"] <= 100:
+        raise RuntimeError("threshold must be in (0, 100]")
+    if result["poll_seconds"] < .1 or result["cooldown_seconds"] < 0:
+        raise RuntimeError("poll_seconds must be >= 0.1; cooldown_seconds must be >= 0")
+    if not isinstance(result["full_permissions"], bool):
+        raise RuntimeError("full_permissions must be true or false")
+    return result
+
+
+def configure(path, config, arguments):
+    """Edit only explicitly selected settings, without launching or authenticating."""
+    parser = argparse.ArgumentParser(prog="codex-auto configure",
+                                     description="Customize future wrapper launches; running sessions are unchanged.")
+    cutoff = parser.add_mutually_exclusive_group()
+    cutoff.add_argument("--threshold", type=float, help="handoff at this percentage USED")
+    cutoff.add_argument("--remaining-percent", type=float, help="handoff with this percentage REMAINING")
+    parser.add_argument("--poll-seconds", type=float)
+    parser.add_argument("--cooldown-seconds", type=float)
+    parser.add_argument("--accounts", help="comma-separated saved aliases, in fallback order")
+    parser.add_argument("--account", help="starting alias (must be in the pool)")
+    permissions = parser.add_mutually_exclusive_group()
+    permissions.add_argument("--full-permissions", dest="full_permissions", action="store_true", default=None)
+    permissions.add_argument("--no-full-permissions", dest="full_permissions", action="store_false")
+    parser.add_argument("--show", action="store_true", help="show effective settings without editing")
+    args = parser.parse_args(arguments)
+    updates = {key: getattr(args, key) for key in ("threshold", "poll_seconds", "cooldown_seconds",
+                                                "full_permissions", "account") if getattr(args, key) is not None}
+    if args.remaining_percent is not None:
+        updates["threshold"] = 100 - args.remaining_percent
+    if args.accounts is not None:
+        updates["accounts"] = [name.strip() for name in args.accounts.split(",")]
+    if args.show and updates:
+        parser.error("--show cannot be combined with edits")
+    if not args.show and not updates:
+        parser.error("choose settings to edit, or use --show")
+    merged = {**config, **updates}
+    effective = rotation_settings(merged)
+    names = merged.get("accounts")
+    if names is not None:
+        if (not isinstance(names, list) or not names or any(not isinstance(n, str) or not n.strip() for n in names)
+                or len(set(names)) != len(names)):
+            raise RuntimeError("accounts must be a nonempty list of unique aliases")
+        if merged.get("account") is not None and merged["account"] not in names:
+            raise RuntimeError("starting account must be in the accounts pool")
+    if not args.show:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # No backup copies of configuration secrets; atomic replacement preserves
+        # unrelated keys and leaves the previous file intact on write failure.
+        fd, temporary = tempfile.mkstemp(prefix=".config-", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(merged, stream, indent=2, allow_nan=False)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    view = {"config_file": str(path), **effective,
+            "remaining_percent": 100 - effective["threshold"],
+            "accounts": names, "account": merged.get("account")}
+    print(json.dumps(view, indent=2))
+    if not args.show:
+        print("Saved for future launches. Running sessions are unchanged.")
+    return 0
+
+
 def main():
     config_path = Path(os.environ.get("CODEX_AUTO_CONFIG", Path.home() / ".config/codex-auto/config.json"))
     config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    if sys.argv[1:2] == ["configure"]:
+        return configure(config_path, config, sys.argv[2:])
     real_codex = real_binary(config)
     cli_mode = sys.argv[1:2] == ["--cli"]
     if cli_mode:
@@ -1046,7 +1127,8 @@ def main():
         args = argparse.Namespace(account=None, accounts=None, session=None, check=False,
                                   threshold=None, poll_seconds=None, full_permissions=None)
     else:
-        parser = argparse.ArgumentParser(description=__doc__)
+        parser = argparse.ArgumentParser(description=__doc__,
+                                         epilog="Save defaults with: codex-auto configure --help")
         parser.add_argument("--account", help="starting account alias")
         parser.add_argument("--accounts", help="comma-separated rotation order")
         parser.add_argument("--session", help="exact conversation UUID to resume")
@@ -1069,8 +1151,8 @@ def main():
     threshold = args.threshold if args.threshold is not None else config.get("threshold", 97)
     interval = args.poll_seconds if args.poll_seconds is not None else config.get("poll_seconds", 30)
     full_permissions = args.full_permissions if args.full_permissions is not None else config.get("full_permissions", False)
-    if not (0 < threshold <= 100 and interval >= .1):
-        raise RuntimeError("threshold must be in (0, 100]; poll_seconds must be >= 0.1")
+    settings = rotation_settings({**config, "threshold": threshold, "poll_seconds": interval,
+                                  "full_permissions": full_permissions})
     xswap = shutil.which("xswap") or str(Path.home() / ".local/bin/xswap")
     accounts = read_json([xswap, "list", "--json"])["accounts"]
     by_alias = {a.get("alias") or str(a["number"]): a for a in accounts
@@ -1108,7 +1190,7 @@ def main():
     next_options, action = options, None
     current_cwd = None
     def eligible(name):
-        return (time.monotonic() - failed.get(name, -1e10) >= 300 and
+        return (time.monotonic() - failed.get(name, -1e10) >= settings["cooldown_seconds"] and
                 usable(quotas.reports.get(str(by_alias[name]["number"]), {}), threshold))
     try:
         while True:

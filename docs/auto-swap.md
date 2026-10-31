@@ -46,6 +46,7 @@ Create `~/.config/codex-auto/config.json`, for example:
   "account": "primary",
   "threshold": 97,
   "poll_seconds": 30,
+  "cooldown_seconds": 300,
   "full_permissions": false,
   "real_codex": "/absolute/path/to/the/official/codex"
 }
@@ -70,6 +71,42 @@ codex-auto --threshold 97 --account primary
 codex-auto --full-permissions -- -m MODEL 'your task'
 codex-auto --session EXACT_SESSION_UUID
 ```
+
+### Change settings without editing JSON
+
+```sh
+codex-auto configure --show
+codex-auto configure --remaining-percent 3
+codex-auto configure --threshold 95 --poll-seconds 15 --cooldown-seconds 120
+codex-auto configure --accounts primary,work,secondary --account primary
+codex-auto configure --full-permissions
+codex-auto configure --no-full-permissions
+```
+
+`--threshold` means percentage **used**; `--remaining-percent` means percentage
+**left**. Choose one: 97 used and 3 remaining are equivalent. The supported
+cutoff is greater than 0 and at most 100 used (0 to less than 100 remaining).
+The cutoff still waits for the same safe native checkpoint; it never forces an
+immediate interruption at an exact usage percentage.
+
+`poll_seconds` controls background quota checks (minimum 0.1 seconds).
+`cooldown_seconds` controls how long a rejected account is excluded before
+retry (minimum 0; default 300). Polling more frequently makes more usage queries.
+Account order controls fallback preference; aliases must already be saved and
+enabled in xswap before launching. Configuration editing validates the pool's
+shape without starting Codex or contacting accounts.
+
+Only specified settings change. Unrelated keys, the real Codex path and existing
+permission choices are preserved. Writes replace the configuration atomically
+with owner-only permissions; `--show` displays supported effective settings
+without exposing unrelated configuration values or writing a file.
+`CODEX_AUTO_CONFIG` also selects the file edited by this command.
+
+Settings apply to **future wrapper launches**, including ordinary `codex` in
+new cmux shells configured as above. Running sessions retain their existing
+settings. One-off `--threshold` and `--poll-seconds` launcher flags override saved
+values for that invocation. Use `configure --show` to inspect saved defaults and
+`--check` to inspect current account quota.
 
 ## What triggers a handoff
 
@@ -120,7 +157,7 @@ and failed quota reads do not by themselves cause rotation.
 
 If every account is exhausted, at the threshold, or unavailable after an actual
 quota failure, the wrapper waits and checks again. A rejected account has a
-five-minute cooldown before it can be retried. Exiting Codex normally exits the
+configurable cooldown (five minutes by default) before it can be retried. Exiting Codex normally exits the
 wrapper; Ctrl-C exits while the wrapper is waiting for quota.
 
 ## Chats and goals

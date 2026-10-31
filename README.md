@@ -209,6 +209,10 @@ makes ordinary `codex` launches in cmux use the launcher and retains cmux's nati
 hooks. Install and configure it separately; the xswap binary itself still performs
 only explicitly requested launches and switches.
 
+Use `codex-auto configure --remaining-percent 3` to save a cutoff with 3% quota
+left, or `codex-auto configure --show` to inspect settings. Polling frequency,
+retry cooldown, account order and permissions are configurable for future launches.
+
 ## Directory mappings
 
 ```sh

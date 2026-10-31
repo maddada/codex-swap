@@ -2,6 +2,8 @@ import importlib.machinery
 import importlib.util
 import fcntl
 import builtins
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -482,6 +484,81 @@ class PolicyTests(unittest.TestCase):
             payload=dict(session_id=A,hook_event_name='PreModelRequest',agent_id='child',turn_id='turn')
             result=subprocess.run([sys.executable,str(SCRIPT),'--checkpoint',tmp],input=json.dumps(payload).encode(),timeout=3)
             self.assertEqual(result.returncode,0);self.assertFalse(gate.held(A))
+
+
+class ConfigurationTests(unittest.TestCase):
+    def configure(self, path, config, arguments):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            auto.configure(path, config, arguments)
+        return output.getvalue()
+
+    def test_remaining_cutoff_preserves_unrelated_settings_and_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.json'
+            old = {'full_permissions': True, 'real_codex': '/custom/codex',
+                   'future_setting': {'secret': 'private'}, 'accounts': ['one', 'two']}
+            path.write_text(json.dumps(old))
+            text = self.configure(path, old, ['--remaining-percent', '5', '--poll-seconds', '12',
+                                              '--cooldown-seconds', '60'])
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved, {**old, 'threshold': 95, 'poll_seconds': 12, 'cooldown_seconds': 60})
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn('private', text)
+            self.assertIn('Running sessions are unchanged', text)
+
+    def test_show_does_not_create_files_or_launch_codex(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'missing/config.json'
+            with mock.patch.dict(os.environ, {'CODEX_AUTO_CONFIG': str(path)}), \
+                    mock.patch.object(sys, 'argv', ['codex-auto', 'configure', '--show']), \
+                    mock.patch.object(auto, 'real_binary', side_effect=AssertionError('must not launch')):
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(auto.main(), 0)
+            settings = json.loads(output.getvalue())
+            self.assertEqual(settings['threshold'], 97)
+            self.assertEqual(settings['remaining_percent'], 3)
+            self.assertEqual(settings['cooldown_seconds'], 300)
+            self.assertFalse(path.parent.exists())
+
+    def test_invalid_values_leave_config_intact(self):
+        bad = [['--threshold', 'nan'], ['--threshold', '101'], ['--remaining-percent', '100'],
+               ['--poll-seconds', '0'], ['--cooldown-seconds', '-1'],
+               ['--accounts', 'a,a'], ['--accounts', 'a,'], ['--account', 'absent']]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.json'
+            old = {'accounts': ['a', 'b'], 'account': 'a'}
+            path.write_text(json.dumps(old))
+            original = path.read_bytes()
+            for arguments in bad:
+                with self.subTest(arguments=arguments), self.assertRaises(RuntimeError):
+                    self.configure(path, old, arguments)
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_explicit_permission_toggle_and_account_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.json'
+            self.configure(path, {}, ['--accounts', 'b,a', '--account', 'b', '--full-permissions'])
+            saved = json.loads(path.read_text())
+            self.assertEqual(saved['accounts'], ['b', 'a'])
+            self.assertTrue(saved['full_permissions'])
+            self.configure(path, saved, ['--no-full-permissions'])
+            self.assertFalse(json.loads(path.read_text())['full_permissions'])
+
+    def test_atomic_write_failure_preserves_old_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'config.json'
+            path.write_text('{"threshold": 97}')
+            with mock.patch.object(auto.os, 'replace', side_effect=OSError('write failure')):
+                with self.assertRaises(OSError):
+                    self.configure(path, {'threshold': 97}, ['--threshold', '90'])
+            self.assertEqual(path.read_text(), '{"threshold": 97}')
+            self.assertEqual(list(Path(tmp).iterdir()), [path])
+
+    def test_numeric_and_boolean_configuration_types_are_strict(self):
+        for config in ({'threshold': True}, {'poll_seconds': '30'}, {'cooldown_seconds': float('inf')},
+                       {'full_permissions': 'false'}):
+            with self.subTest(config=config), self.assertRaises(RuntimeError):
+                auto.rotation_settings(config)
 
 
 class HandoffTests(unittest.TestCase):
