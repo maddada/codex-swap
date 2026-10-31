@@ -125,6 +125,8 @@ if args[1]=='alt':
     if select.select([0],[],[],.1)[0]:received+=os.read(0,4096)
    assert received==b'KEEP USER MESSAGE\r',received
    (root/'user-input-saved').write_bytes(received)
+   with p.open('a') as f:
+    f.write(json.dumps({'timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat(), 'type':'response_item', 'payload':{'type':'message','role':'user','content':[{'type':'input_text','text':'KEEP USER MESSAGE'}]}})+'\n')
    checkpoint(p,'turn-user-ack')
   else:
    checkpoint(p,'turn-3' if mode.startswith('race-') else 'turn-2')
@@ -156,44 +158,61 @@ print('EXACT_HANDOFF_OK',flush=True);time.sleep(.3)
 
 
 class PolicyTests(unittest.TestCase):
-    def test_enter_needs_persisted_input_acknowledgement_before_handoff(self):
-        state, fence = auto.InputState(), auto.InputFence()
-        state.feed(b'new request\r')
-        fence.received('old', now=100)
-        self.assertFalse(state.dirty)
+    @staticmethod
+    def user_receipt(text, timestamp='1970-01-01T00:01:41Z'):
+        return {'type': 'response_item', 'timestamp': timestamp,
+                'payload': {'type': 'message', 'role': 'user',
+                            'content': [{'type': 'input_text', 'text': text}]}}
+
+    def test_enter_needs_matching_persisted_message_before_handoff(self):
+        fence = auto.InputFence()
+        fence.received(b'new request\r', now=100)
         self.assertFalse(fence.permits(b''))
-        def started(turn, timestamp):
-            return {'type': 'event_msg', 'timestamp': timestamp,
-                    'payload': {'type': 'task_started', 'turn_id': turn}}
-        fence.observe([started('new', '1970-01-01T00:01:39Z')])
-        self.assertFalse(fence.permits(b''))  # Old, delayed transcript batch.
-        fence.observe([started('old', '1970-01-01T00:01:41Z')])
-        self.assertFalse(fence.permits(b''))  # Same turn is not input acknowledgement.
-        fence.observe([started('new', '1970-01-01T00:01:41Z')])
+        fence.observe([self.user_receipt('new request', '1970-01-01T00:01:39Z')])
+        self.assertFalse(fence.permits(b''))
+        fence.observe([self.user_receipt('unrelated queued request')])
+        self.assertFalse(fence.permits(b''))
+        fence.observe([self.user_receipt('new request')])
         self.assertFalse(fence.permits(b'not yet written'))
         self.assertTrue(fence.permits(b''))
 
-    def test_each_submission_needs_ack_but_pasted_newlines_are_not_submissions(self):
+    def test_each_submission_needs_its_own_receipt(self):
         fence = auto.InputFence()
-        fence.received('old', now=100, data=b'one\r')
-        fence.received('old', now=100, data=b'\x1b[200~two\nlines\x1b[201~\r')
-        def started(turn):
-            return {'type': 'event_msg', 'timestamp': '1970-01-01T00:01:41Z',
-                    'payload': {'type': 'task_started', 'turn_id': turn}}
-        fence.observe([started('first')])
+        fence.received(b'one\r', now=100)
+        fence.received(b'\x1b[200~two\nlines\x1b[201~\r', now=100)
+        fence.observe([self.user_receipt('one')])
         self.assertFalse(fence.permits(b''))
-        fence.observe([started('second')])
+        fence.observe([self.user_receipt('two\nlines')])
         self.assertTrue(fence.permits(b''))
 
-    def test_generated_continuation_does_not_acknowledge_held_user_input(self):
+    def test_non_submitting_input_does_not_wait_for_a_nonexistent_turn(self):
         fence = auto.InputFence()
-        fence.received('old', now=100, skip_turns=1)
-        def started(turn):
-            return {'type': 'event_msg', 'timestamp': '1970-01-01T00:01:41Z',
-                    'payload': {'type': 'task_started', 'turn_id': turn}}
-        fence.observe([started('generated'), started('generated')])
+        for data in [b'\x1b]10;rgb:ffff/0000/aaaa\x1b\\', b'\x1b[12;34R',
+                     b'\x1b[A', b'\x03', b'cancelled draft\x03', b'\r']:
+            fence.received(data)
+            self.assertTrue(fence.permits(b''))
+
+    def test_generated_turn_and_context_do_not_acknowledge_user_input(self):
+        fence = auto.InputFence()
+        fence.received(b'KEEP USER MESSAGE\r', now=100)
+        fence.observe([{'type': 'event_msg', 'timestamp': '1970-01-01T00:01:41Z',
+                        'payload': {'type': 'task_started', 'turn_id': 'generated'}},
+                       self.user_receipt('<codex_internal_context>continue goal</codex_internal_context>')])
         self.assertFalse(fence.permits(b''))
-        fence.observe([started('user')])
+        fence.observe([self.user_receipt('KEEP USER MESSAGE')])
+        self.assertTrue(fence.permits(b''))
+
+    def test_unknown_composer_edits_cannot_be_acknowledged_by_a_guess(self):
+        fence = auto.InputFence()
+        fence.received(b'word\x1b[Dedited\r', now=100)
+        fence.observe([self.user_receipt('wordedited')])
+        self.assertFalse(fence.permits(b''))
+
+    def test_basic_editing_and_paste_bytes_match_the_actual_user_message(self):
+        fence = auto.InputFence()
+        fence.received('typo🧪'.encode()+b'\x7f\x7f' + b'\x15', now=100)
+        fence.received(b'\x1b[200~literal\x1b[12;34R\x1b[201~\r', now=100)
+        fence.observe([self.user_receipt('literal\x1b[12;34R')])
         self.assertTrue(fence.permits(b''))
 
     def test_python39_sqlite_home_accepts_toml_comments_and_string_escapes(self):

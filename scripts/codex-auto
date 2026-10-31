@@ -228,40 +228,73 @@ class Titles:
 
 
 class InputState:
-    """Track unsent text, including bracketed/multiline pastes split across reads."""
+    """Track drafts and exact submissions for the supported basic composer edits."""
     def __init__(self):
         self.dirty = False
         self.paste = False
         self.escape = b""
-        self.submissions = 0
+        self.text = bytearray()
+        self.uncertain = False
+        self.submitted = []
+
+    def submit(self):
+        try:
+            text = self.text.decode("utf-8") if not self.uncertain else None
+        except UnicodeDecodeError:
+            text = None
+        if text or self.uncertain:
+            self.submitted.append(text)
+        self.text.clear()
+        self.uncertain, self.dirty = False, False
 
     def feed(self, data):
+        self.submitted = []
         for byte in data:
             if self.escape:
                 self.escape += bytes([byte])
                 if self.escape.startswith(b"\x1b["):
-                    if len(self.escape) >= 3 and 0x40 <= byte <= 0x7e:
-                        if self.escape == b"\x1b[200~":
-                            self.paste = True
-                        elif self.escape == b"\x1b[201~":
-                            self.paste = False
-                        self.escape = b""
+                    complete = len(self.escape) >= 3 and 0x40 <= byte <= 0x7e
                 elif self.escape.startswith(b"\x1b]"):
-                    if byte == 7 or self.escape.endswith(b"\x1b\\"):
-                        self.escape = b""
-                elif len(self.escape) >= 3 or self.escape[1:2] != b"O":
+                    complete = byte == 7 or self.escape.endswith(b"\x1b\\")
+                else:
+                    complete = len(self.escape) >= 3 or self.escape[1:2] != b"O"
+                if complete:
+                    if self.paste:
+                        if self.escape == b"\x1b[201~":
+                            self.paste = False
+                        else:
+                            self.text.extend(self.escape)
+                    elif self.escape == b"\x1b[200~":
+                        self.paste = True
+                    elif InputHold.REPLY.fullmatch(self.escape):
+                        pass
+                    elif re.fullmatch(rb"\x1b\[13(?:;[0-9]+)?u", self.escape):
+                        self.submit()
+                    else:
+                        self.uncertain, self.dirty = True, True
                     self.escape = b""
                 continue
             if byte == 27:
                 self.escape = b"\x1b"
             elif self.paste:
+                self.text.append(byte)
                 self.dirty = True
-            elif byte in (3, 4, 10, 13):
-                self.dirty = False
-                if byte in (10, 13):
-                    self.submissions += 1
-            elif byte >= 32 or byte == 8:
+            elif byte in (10, 13):
+                self.submit()
+            elif byte in (3, 4, 21):
+                self.text.clear()
+                self.uncertain, self.dirty = False, False
+            elif byte in (8, 127):
+                if self.text:
+                    last = self.text.pop()
+                    while 0x80 <= last <= 0xbf and self.text:
+                        last = self.text.pop()
+                self.dirty = bool(self.text) or self.uncertain
+            elif byte >= 32:
+                self.text.append(byte)
                 self.dirty = True
+            else:
+                self.uncertain, self.dirty = True, True
 
 
 class InputHold:
@@ -297,49 +330,38 @@ class InputHold:
 
 
 class InputFence:
-    """Wait for a persisted new turn after terminal input, not merely Enter."""
+    """Match each submitted prompt to its own persisted user message receipt."""
     def __init__(self):
-        self.since = None
-        self.turn = None
-        self.skip_turns = 0
-        self.submissions = 0
         self.input = InputState()
+        self.pending = []
 
-    def received(self, turn, now=None, skip_turns=0, data=None):
-        self.since = time.time() if now is None else now
-        self.turn = turn
-        self.skip_turns = max(self.skip_turns, skip_turns)
-        if data is not None:
-            before = self.input.submissions
-            self.input.feed(data)
-            self.submissions += self.input.submissions - before
+    def received(self, data, now=None):
+        self.input.feed(data)
+        now = time.time() if now is None else now
+        self.pending.extend((text, now) for text in self.input.submitted)
 
     def observe(self, events):
-        if self.since is None:
-            return
         for event in events:
+            if not self.pending:
+                return
             payload = event.get("payload", {})
-            if (event.get("type") == "event_msg" and payload.get("type") in ("task_started", "turn_started")
-                    and payload.get("turn_id") and payload["turn_id"] != self.turn):
-                try:
-                    timestamp = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp()
-                except (KeyError, ValueError):
-                    continue
-                if timestamp >= self.since:
-                    if self.skip_turns:
-                        self.skip_turns -= 1
-                        self.turn = payload["turn_id"]
-                        continue
-                    if self.submissions > 1:
-                        self.submissions -= 1
-                        self.turn = payload["turn_id"]
-                        continue
-                    self.since = None
-                    self.submissions = 0
-                    return
+            if not (event.get("type") == "response_item" and payload.get("type") == "message"
+                    and payload.get("role") == "user"):
+                continue
+            text = "\n".join(item.get("text", "") for item in payload.get("content", [])
+                             if item.get("type") in ("input_text", "text", "output_text"))
+            expected, since = self.pending[0]
+            if expected is None or text != expected or text.lstrip().startswith("<codex_internal_context>"):
+                continue
+            try:
+                timestamp = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp()
+            except (KeyError, ValueError):
+                continue
+            if timestamp >= since:
+                self.pending.pop(0)
 
-    def permits(self, pending):
-        return self.since is None and not pending
+    def permits(self, queued):
+        return not self.pending and not queued
 
 
 class TerminalPump:
@@ -793,7 +815,7 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
                 data = os.read(0, 65536)
                 if not data:
                     return conversation, None, 0
-                input_fence.received(conversation.turn if conversation else None, data=data)
+                input_fence.received(data)
                 gate.cancel()
                 if action in ("goal-resume", "goal-submit", "quota-continue", "quota-submit") and b"\x03" not in data:
                     replies = held_input.append(data)
@@ -849,10 +871,6 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
                 action = "goal-submit" if action == "goal-resume" else "quota-submit"
             if action in ("goal-submit", "quota-submit") and time.monotonic() >= goal_submit_at:
                 pending = held_input.release()
-                if pending:
-                    # The first new turn acknowledges our generated command,
-                    # not user input queued behind it. Require the following turn.
-                    input_fence.received(conversation.turn, skip_turns=1)
                 pump.queue(master, b"\r" + pending)
                 input_state.feed(pending)
                 dirty = input_state.dirty
