@@ -1046,6 +1046,44 @@ def rotation_settings(config):
     return result
 
 
+
+def validate_configuration(config):
+    effective = rotation_settings(config)
+    names = config.get("accounts")
+    if names is not None:
+        if (not isinstance(names, list) or not names or any(not isinstance(n, str) or not n.strip() for n in names)
+                or len(set(names)) != len(names)):
+            raise RuntimeError("accounts must be a nonempty list of unique aliases")
+        if config.get("account") is not None and config["account"] not in names:
+            raise RuntimeError("starting account must be in the accounts pool")
+    return effective
+
+
+def update_configuration(path, updates):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Keep a stable lock inode: deleting it would let concurrent writers acquire
+    # different locks. Read AFTER acquiring it, not from main's earlier snapshot.
+    lock_path = path.with_name(path.name + ".lock")
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = json.loads(path.read_text()) if path.exists() else {}
+        merged = {**current, **updates}
+        effective = validate_configuration(merged)
+        fd, temporary = tempfile.mkstemp(prefix=".config-", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(merged, stream, indent=2, allow_nan=False)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+    return merged, effective
+
+
 def configure(path, config, arguments):
     """Edit only explicitly selected settings, without launching or authenticating."""
     parser = argparse.ArgumentParser(prog="codex-auto configure",
@@ -1072,30 +1110,11 @@ def configure(path, config, arguments):
         parser.error("--show cannot be combined with edits")
     if not args.show and not updates:
         parser.error("choose settings to edit, or use --show")
-    merged = {**config, **updates}
-    effective = rotation_settings(merged)
+    if args.show:
+        merged, effective = config, validate_configuration(config)
+    else:
+        merged, effective = update_configuration(path, updates)
     names = merged.get("accounts")
-    if names is not None:
-        if (not isinstance(names, list) or not names or any(not isinstance(n, str) or not n.strip() for n in names)
-                or len(set(names)) != len(names)):
-            raise RuntimeError("accounts must be a nonempty list of unique aliases")
-        if merged.get("account") is not None and merged["account"] not in names:
-            raise RuntimeError("starting account must be in the accounts pool")
-    if not args.show:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # No backup copies of configuration secrets; atomic replacement preserves
-        # unrelated keys and leaves the previous file intact on write failure.
-        fd, temporary = tempfile.mkstemp(prefix=".config-", dir=str(path.parent))
-        try:
-            with os.fdopen(fd, "w") as stream:
-                json.dump(merged, stream, indent=2, allow_nan=False)
-                stream.write("\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
     view = {"config_file": str(path), **effective,
             "remaining_percent": 100 - effective["threshold"],
             "accounts": names, "account": merged.get("account")}

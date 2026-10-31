@@ -544,6 +544,46 @@ class ConfigurationTests(unittest.TestCase):
             self.configure(path, saved, ['--no-full-permissions'])
             self.assertFalse(json.loads(path.read_text())['full_permissions'])
 
+    def test_concurrent_writers_reread_under_a_stable_lock(self):
+        worker = """import importlib.machinery, importlib.util, json, pathlib, sys
+loader=importlib.machinery.SourceFileLoader('config_worker',sys.argv[1])
+spec=importlib.util.spec_from_loader(loader.name,loader)
+module=importlib.util.module_from_spec(spec);loader.exec_module(module)
+snapshot=json.loads(pathlib.Path(sys.argv[2]).read_text())
+print('READY',flush=True)
+sys.stdin.readline()
+module.configure(pathlib.Path(sys.argv[2]),snapshot,sys.argv[3:])
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'config.json'
+            path.write_text(json.dumps({'threshold': 97, 'poll_seconds': 30, 'full_permissions': True}))
+            lock_path = path.with_name(path.name+'.lock')
+            processes = []
+            try:
+                with lock_path.open('a') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    for arguments in (['--threshold', '90'], ['--poll-seconds', '12']):
+                        proc = subprocess.Popen([sys.executable, '-c', worker, str(SCRIPT), str(path)] + arguments,
+                                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                text=True)
+                        processes.append(proc)
+                    for proc in processes:
+                        self.assertTrue(select.select([proc.stdout], [], [], 10)[0])
+                        self.assertEqual(proc.stdout.readline().strip(), 'READY')
+                    for proc in processes:
+                        proc.stdin.write('GO\n');proc.stdin.flush()
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                for proc in processes:
+                    out, err = proc.communicate(timeout=10)
+                    self.assertEqual(proc.returncode, 0, out+err)
+                saved = json.loads(path.read_text())
+                self.assertEqual(saved, {'threshold': 90, 'poll_seconds': 12, 'full_permissions': True})
+                self.assertTrue(lock_path.exists())
+            finally:
+                for proc in processes:
+                    if proc.poll() is None:
+                        proc.kill();proc.wait()
+
     def test_atomic_write_failure_preserves_old_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'config.json'
@@ -552,7 +592,7 @@ class ConfigurationTests(unittest.TestCase):
                 with self.assertRaises(OSError):
                     self.configure(path, {'threshold': 97}, ['--threshold', '90'])
             self.assertEqual(path.read_text(), '{"threshold": 97}')
-            self.assertEqual(list(Path(tmp).iterdir()), [path])
+            self.assertEqual(set(Path(tmp).iterdir()), {path, path.with_name(path.name+'.lock')})
 
     def test_numeric_and_boolean_configuration_types_are_strict(self):
         for config in ({'threshold': True}, {'poll_seconds': '30'}, {'cooldown_seconds': float('inf')},

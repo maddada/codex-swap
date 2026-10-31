@@ -97,7 +97,9 @@ enabled in xswap before launching. Configuration editing validates the pool's
 shape without starting Codex or contacting accounts.
 
 Only specified settings change. Unrelated keys, the real Codex path and existing
-permission choices are preserved. Writes replace the configuration atomically
+permission choices are preserved. Configuration edits serialize through a stable owner-private lock file and reread
+the latest settings while holding it, preserving concurrent edits to different
+keys. Writes replace the configuration atomically
 with owner-only permissions; `--show` displays supported effective settings
 without exposing unrelated configuration values or writing a file.
 `CODEX_AUTO_CONFIG` also selects the file edited by this command.
