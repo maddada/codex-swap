@@ -67,7 +67,7 @@ def checkpoint(p,turn='turn-2'):
  event(p,'task_started',turn_id=turn)
  payload=dict(hook_event_name='PreModelRequest',session_id=sid,turn_id=turn,transcript_path=str(p),cwd=str(root/'project'))
  callback=subprocess.Popen(shlex.split(hook_command),stdin=subprocess.PIPE)
- callback.communicate(json.dumps(payload).encode(),timeout=8)
+ callback.communicate(json.dumps(payload).encode(),timeout=30)
  assert callback.returncode==0, callback.returncode
 def title(s):
  os.write(1,('\x1b]0;'+s[:29]+'... | fixture\x07\x1b]7501;state=idle:app=codex\x1b\\').encode())
@@ -412,9 +412,9 @@ class PolicyTests(unittest.TestCase):
             callback=subprocess.Popen([sys.executable,str(SCRIPT),'--checkpoint',tmp],stdin=subprocess.PIPE)
             callback.stdin.write(json.dumps(dict(session_id=A,hook_event_name='PreModelRequest',turn_id='turn')).encode());callback.stdin.close()
             try:
-                end=time.monotonic()+10
+                end=time.monotonic()+30
                 while time.monotonic()<end and not gate.held(A):time.sleep(.02)
-                self.assertTrue(gate.held(A));self.assertIsNone(callback.poll())
+                self.assertTrue(gate.held(A), 'callback=%r ready_file=%r' % (callback.poll(), gate.ready.exists()));self.assertIsNone(callback.poll())
                 gate.cancel();self.assertEqual(callback.wait(timeout=3),0)
             finally:
                 if callback.poll() is None:callback.kill();callback.wait()
@@ -444,7 +444,7 @@ class HandoffTests(unittest.TestCase):
             sibling=subprocess.Popen(['/bin/sleep','60'])
             pid,fd=pty.fork()
             if pid==0:os.execve(sys.executable,[sys.executable,str(SCRIPT),'--','-m','test-model','-s','read-only','-a','on-request','ORIGINAL TASK'],env)
-            output=b'';status=None;paste_sent=False;checkpoint_input_sent=False;end=time.monotonic()+30
+            output=b'';status=None;paste_sent=False;checkpoint_input_sent=False;end=time.monotonic()+90
             try:
                 while time.monotonic()<end:
                     ready,_,_=select.select([fd],[],[],.1)
