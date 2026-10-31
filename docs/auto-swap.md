@@ -96,8 +96,7 @@ including multiline bracketed pastes, defers handoff. Submitted input also defer
 handoff until each submitted prompt has an exact matching persisted user-message
 receipt and the PTY input queue is empty. An unrelated message or automatic goal
 turn is not a receipt. Terminal replies, empty Enter and cancelled drafts do not
-create pending message receipts. Basic typing, bracketed pastes, backspace and
-Ctrl-U are tracked; unsupported composer edits or native commands that do not
+create pending message receipts. Basic typing, bracketed pastes and backspace are tracked; ambiguous draft-control keys, unsupported composer edits or native commands that do not
 persist a matching message conservatively defer automatic handoff for that
 invocation. Resume manually when needed; there is no timeout that discards
 unacknowledged input. Existing custom hook

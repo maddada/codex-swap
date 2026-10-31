@@ -208,9 +208,20 @@ class PolicyTests(unittest.TestCase):
         fence.observe([self.user_receipt('wordedited')])
         self.assertFalse(fence.permits(b''))
 
+    def test_control_keys_cannot_falsely_clear_an_unpersisted_draft(self):
+        for control in (b'\x03', b'\x04', b'\x15', b'\x1b[D\x15'):
+            state = auto.InputState()
+            state.feed(b'KEEP DRAFT' + control)
+            self.assertTrue(state.dirty, control)
+            self.assertTrue(state.uncertain, control)
+            fence = auto.InputFence()
+            fence.received(b'KEEP DRAFT' + control + b'\r', now=100)
+            fence.observe([self.user_receipt('KEEP DRAFT')])
+            self.assertFalse(fence.permits(b''), control)
+
     def test_basic_editing_and_paste_bytes_match_the_actual_user_message(self):
         fence = auto.InputFence()
-        fence.received('typo🧪'.encode()+b'\x7f\x7f' + b'\x15', now=100)
+        fence.received('🧪'.encode()+b'\x7f', now=100)
         fence.received(b'\x1b[200~literal\x1b[12;34R\x1b[201~\r', now=100)
         fence.observe([self.user_receipt('literal\x1b[12;34R')])
         self.assertTrue(fence.permits(b''))

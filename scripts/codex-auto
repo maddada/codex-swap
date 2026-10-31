@@ -282,8 +282,10 @@ class InputState:
             elif byte in (10, 13):
                 self.submit()
             elif byte in (3, 4, 21):
-                self.text.clear()
-                self.uncertain, self.dirty = False, False
+                # These controls may interrupt, delete at cursor, or erase only
+                # part of a draft. Never assume they acknowledge a full clear.
+                if self.text or self.uncertain:
+                    self.uncertain, self.dirty = True, True
             elif byte in (8, 127):
                 if self.text:
                     last = self.text.pop()
