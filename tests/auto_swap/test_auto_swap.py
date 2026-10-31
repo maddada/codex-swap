@@ -63,8 +63,12 @@ def event(p,kind,**fields):
  if kind=='task_started':fields.setdefault('turn_id','turn-1')
  d={'timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat(),'type':'event_msg','payload':dict(type=kind,**fields)}
  with p.open('a') as f:f.write(json.dumps(d)+'\n')
-def checkpoint(p,turn='turn-2'):
+def checkpoint(p,turn='turn-2',wait_gate=True):
  event(p,'task_started',turn_id=turn)
+ if wait_gate:
+  end=time.monotonic()+20
+  while time.monotonic()<end and not (logdir/'handoff-gate.json').exists():time.sleep(.02)
+  assert (logdir/'handoff-gate.json').exists(), 'gate was not armed after persisted receipt/usage'
  payload=dict(hook_event_name='PreModelRequest',session_id=sid,turn_id=turn,transcript_path=str(p),cwd=str(root/'project'))
  callback=subprocess.Popen(shlex.split(hook_command),stdin=subprocess.PIPE)
  callback.communicate(json.dumps(payload).encode(),timeout=30)
@@ -119,7 +123,7 @@ if args[1]=='alt':
   if mode=='checkpoint-input':
    tty.setraw(0)
    print('CHECKPOINT_INPUT_NOW',flush=True)
-   checkpoint(p,'turn-input-held')
+   checkpoint(p,'turn-input-held',wait_gate=False)
    received=b'';end=time.monotonic()+5
    while time.monotonic()<end and b'\r' not in received:
     if select.select([0],[],[],.1)[0]:received+=os.read(0,4096)
@@ -207,6 +211,22 @@ class PolicyTests(unittest.TestCase):
         fence.received(b'word\x1b[Dedited\r', now=100)
         fence.observe([self.user_receipt('wordedited')])
         self.assertFalse(fence.permits(b''))
+
+    def test_identical_generated_continuation_cannot_acknowledge_user_submission(self):
+        fence = auto.InputFence()
+        fence.expect_generated(auto.CONTINUE)
+        fence.received(auto.CONTINUE.encode()+b'\r', now=100)
+        fence.observe([self.user_receipt(auto.CONTINUE)])
+        self.assertFalse(fence.permits(b''))
+        fence.observe([self.user_receipt(auto.CONTINUE)])
+        self.assertTrue(fence.permits(b''))
+
+    def test_modified_enter_does_not_falsely_clear_a_multiline_draft(self):
+        state = auto.InputState()
+        state.feed(b'KEEP DRAFT\x1b[13;2u')
+        self.assertTrue(state.dirty)
+        self.assertTrue(state.uncertain)
+        self.assertEqual(state.submitted, [])
 
     def test_control_keys_cannot_falsely_clear_an_unpersisted_draft(self):
         for control in (b'\x03', b'\x04', b'\x15', b'\x1b[D\x15'):
@@ -405,6 +425,21 @@ class PolicyTests(unittest.TestCase):
             gate.ready.write_text(json.dumps(record));self.assertFalse(gate.held(A))
             record['session']=A;record['expires']=time.monotonic()-1
             gate.ready.write_text(json.dumps(record));self.assertFalse(gate.held(A))
+
+    def test_callback_tolerates_gate_cancelled_after_existence_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory/'handoff-gate.json').write_text('{}')
+            original = Path.read_text
+            def cancelled(path, *args, **kwargs):
+                if path.name == 'handoff-gate.json':
+                    raise FileNotFoundError('cancelled while reading payload')
+                return original(path, *args, **kwargs)
+            class Stdin:
+                buffer = __import__('io').BytesIO(b'{"hook_event_name":"PreModelRequest"}')
+            with mock.patch.object(auto.sys, 'stdin', Stdin()), mock.patch.object(Path, 'read_text', cancelled):
+                self.assertEqual(auto.checkpoint_hook(directory), 0)
+            self.assertFalse((directory/'handoff-ready.json').exists())
 
     def test_native_callback_cannot_release_until_gate_is_cancelled(self):
         with tempfile.TemporaryDirectory() as tmp:

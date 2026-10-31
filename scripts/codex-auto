@@ -268,7 +268,7 @@ class InputState:
                         self.paste = True
                     elif InputHold.REPLY.fullmatch(self.escape):
                         pass
-                    elif re.fullmatch(rb"\x1b\[13(?:;[0-9]+)?u", self.escape):
+                    elif re.fullmatch(rb"\x1b\[13(?:;1)?u", self.escape):
                         self.submit()
                     else:
                         self.uncertain, self.dirty = True, True
@@ -336,6 +336,10 @@ class InputFence:
     def __init__(self):
         self.input = InputState()
         self.pending = []
+        self.generated = []
+
+    def expect_generated(self, text):
+        self.generated.append(text)
 
     def received(self, data, now=None):
         self.input.feed(data)
@@ -344,14 +348,17 @@ class InputFence:
 
     def observe(self, events):
         for event in events:
-            if not self.pending:
-                return
             payload = event.get("payload", {})
             if not (event.get("type") == "response_item" and payload.get("type") == "message"
                     and payload.get("role") == "user"):
                 continue
             text = "\n".join(item.get("text", "") for item in payload.get("content", [])
                              if item.get("type") in ("input_text", "text", "output_text"))
+            if self.generated and text == self.generated[0]:
+                self.generated.pop(0)
+                continue
+            if not self.pending:
+                continue
             expected, since = self.pending[0]
             if expected is None or text != expected or text.lstrip().startswith("<codex_internal_context>"):
                 continue
@@ -522,7 +529,10 @@ def checkpoint_hook(directory):
     if not gate.exists():
         return 0
     payload = json.loads(sys.stdin.buffer.read(1024 * 1024))
-    request = json.loads(gate.read_text())
+    try:
+        request = json.loads(gate.read_text())
+    except FileNotFoundError:
+        return 0  # Input may cancel the gate while the hook reads its payload.
     if (payload.get("hook_event_name") != "PreModelRequest" or payload.get("agent_id")
             or payload.get("session_id") != request.get("session")):
         return 0
@@ -777,6 +787,8 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
     terminal_text, dirty, announced = "", False, False
     input_state = InputState()
     input_fence = InputFence()
+    if action == "continue":
+        input_fence.expect_generated(CONTINUE)
     held_input = InputHold()
     goal_submit_at = None
     started = time.monotonic()
@@ -868,6 +880,8 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
                     dirty, action = input_state.dirty, None
                     wakeup_sent = True
                     continue
+                if action == "quota-continue":
+                    input_fence.expect_generated(CONTINUE)
                 pump.queue(master, b"/goal resume" if action == "goal-resume" else CONTINUE.encode())
                 goal_submit_at = time.monotonic() + .4
                 action = "goal-submit" if action == "goal-resume" else "quota-submit"
