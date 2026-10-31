@@ -142,6 +142,32 @@ next account. Per-account billing and permissions still apply. The launcher does
 not buy credits or alter billing settings. This manages the focused conversation;
 it does not migrate all background subagent runtimes or other cmux panes.
 
+## MCP authentication and account-linked connectors
+
+xswap shares local MCP server definitions through the shared `config.toml`.
+Configuration sharing is not a guarantee that every account has the same
+authenticated tools. Check the destination account before relying on a connector
+after a handoff.
+
+For local HTTP MCP servers, Codex supports `bearer_token_env_var` and
+`env_http_headers`. Keep secrets in your existing environment or credential
+manager and share the variable names in configuration, rather than making copies
+of tokens in each account home. Ensure the environment is available to the
+terminal launching the wrapper. This reuses the same service identity; changing
+the Codex account does not change that service identity or its permissions.
+
+MCP OAuth logins and account-linked apps are separate from these definitions.
+Use the provider's supported authorization flow for any missing connection.
+Do not copy an entire credential store, browser cookies, or another account's
+`auth.json` to make tools appear connected. The latter contains the Codex login
+and must remain isolated for correct account selection. The wrapper does not
+export connector credentials, transfer account grants, or automatically broaden
+tool access. Account-linked connections may require one initial authorization
+per account; normal rotation does not itself require reconnecting each time.
+
+See the [official MCP configuration documentation](https://developers.openai.com/codex/mcp/)
+for supported environment-based authentication and MCP login options.
+
 ## Recovery and verification
 
 Private logs and per-launch recovery JSON are stored under
