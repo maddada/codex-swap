@@ -142,6 +142,22 @@ next account. Per-account billing and permissions still apply. The launcher does
 not buy credits or alter billing settings. This manages the focused conversation;
 it does not migrate all background subagent runtimes or other cmux panes.
 
+## Terminal input and backpressure
+
+The launcher forwards input and output through bounded nonblocking queues.
+Partial writes are retried without dropping their unwritten bytes; a full terminal
+queue does not block quota polling or the opposite direction. When automatic
+continuation is pending, terminal input (including split bracketed pastes) is
+held until submission. Recognized terminal query replies pass through so CLI
+startup can finish; pasted payloads are never treated as query replies. A draft received before generated text is queued cancels
+that automatic submission and restores the draft for manual continuation.
+Ctrl-C cancels automatic submission and releases held input. The existing
+15-second readiness fallback also restores input when readiness is unknown.
+
+Replacing the installed script does not hot-patch a running Python process.
+Existing sessions continue with the code they loaded; the fixes take effect on
+their next wrapper launch. No sessions need to be stopped to install the update.
+
 ## MCP authentication and account-linked connectors
 
 xswap shares local MCP server definitions through the shared `config.toml`.

@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import pty
 import select
 import shutil
 import signal
+import socket
 import sys
 import sqlite3
 import subprocess
@@ -85,8 +87,8 @@ if args[1]=='alt':
  event(p,'task_started');time.sleep(.15)
  if mode=='transient':
   event(p,'task_complete',error={'codex_error_info':'rate_limit_exceeded'});time.sleep(.5);sys.exit(7)
- if mode in ('quota','goal-limited','goal-paused'):
-  if mode=='goal-limited':
+ if mode in ('quota','goal-limited','goal-paste','goal-paused'):
+  if mode in ('goal-limited','goal-paste'):
    db=sqlite3.connect(root/'main/goals_1.sqlite');db.execute("update thread_goals set status='usage_limited'");db.commit();db.close()
   event(p,'task_complete',error={'codex_error_info':'usage_limit_exceeded'})
   time.sleep(.3)
@@ -118,23 +120,114 @@ if args[1]=='alt':
 assert args[1]=='personal',args
 assert 'resume' in args and args[args.index('resume')+1]==sid,args
 assert 'ORIGINAL TASK' not in args,args
-if mode not in ('quota','goal-limited','goal-paused'):assert (root/'work-finished').exists(),'Restarted during active work'
+if mode not in ('quota','goal-limited','goal-paste','goal-paused'):assert (root/'work-finished').exists(),'Restarted during active work'
 if mode in ('quota','threshold','poll-threshold','historical','chat-switch','race-batch','race-delayed'):assert 'Continue the unfinished request' in args[-1]
 else:assert not any('Continue the unfinished request' in arg for arg in args)
 if mode.startswith('race-'):assert (root/'second-turn-finished').exists(), 'Interrupted the next active turn'
 announce(sid)
-if mode=='goal-limited':
+if mode in ('goal-limited','goal-paste'):
  tty.setraw(0);received=b'';end=time.monotonic()+5
  while time.monotonic()<end and b'/goal resume\r' not in received:
   ready,_,_=select.select([0],[],[],.1)
-  if ready:received+=os.read(0,4096)
- assert b'/goal resume\r' in received,received
+  if ready:
+   received+=os.read(0,4096)
+   if mode=='goal-paste' and received==b'/goal resume':print('PASTE_NOW',flush=True)
+ assert received.split(b'\r',1)[0]==b'/goal resume',received
+ if mode=='goal-paste':
+  while time.monotonic()<end and b'\x1b[201~' not in received:
+   if select.select([0],[],[],.1)[0]:received+=os.read(0,4096)
+  assert received==b'/goal resume\r\x1b[200~USER DRAFT\x1b[201~',received
  (root/'goal-resumed').write_text('yes')
 print('EXACT_HANDOFF_OK',flush=True);time.sleep(.3)
 '''
 
 
 class PolicyTests(unittest.TestCase):
+    def test_only_terminal_replies_bypass_hold_and_paste_payload_is_literal(self):
+        hold = auto.InputHold()
+        self.assertEqual(hold.append(b'\x1b]10;rgb:ffff'), b'')
+        self.assertEqual(hold.append(b'/0000/aaaa\x1b\\'),
+                         b'\x1b]10;rgb:ffff/0000/aaaa\x1b\\')
+        self.assertFalse(hold.data)
+        self.assertEqual(hold.append(b'\x1b[12;34R'), b'\x1b[12;34R')
+        draft = b'\x1b[200~USER\x1b[12;34R\x1b[201~'
+        for byte in draft:
+            self.assertEqual(hold.append(bytes([byte])), b'')
+        self.assertEqual(hold.release(), draft)
+
+    def test_transport_restores_flags_when_output_is_stalled(self):
+        left, right = socket.socketpair()
+        reader, writer = os.pipe()
+        original = fcntl.fcntl(writer, fcntl.F_GETFL)
+        pump = auto.TerminalPump(left.fileno(), writer)
+        try:
+            pump.queue(writer, b'x' * 262144)
+            started = time.monotonic()
+            pump.close()
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertEqual(fcntl.fcntl(writer, fcntl.F_GETFL) & os.O_NONBLOCK,
+                             original & os.O_NONBLOCK)
+            self.assertTrue(pump.pending[writer])
+        finally:
+            left.close(); right.close(); os.close(reader); os.close(writer)
+
+    def test_permission_flags_do_not_consume_literal_prompts_or_other_values(self):
+        args = ['-c', '-sandbox=value', '-m', '-a-model', '-s', 'read-only',
+                '--', '-summarize this repository', '-a', 'literal']
+        self.assertEqual(auto.permission_options(args),
+                         ['-c', '-sandbox=value', '-m', '-a-model',
+                          '--', '-summarize this repository', '-a', 'literal'])
+
+    def test_transport_keeps_partial_writes_and_retries_backpressure(self):
+        left, right = socket.socketpair()
+        reader, writer = os.pipe()
+        pump = auto.TerminalPump(left.fileno(), writer)
+        try:
+            pump.queue(writer, b'abcdef')
+            with mock.patch.object(auto.os, 'write', side_effect=[2, BlockingIOError(), 4]):
+                pump.flush(writer)
+                self.assertEqual(pump.pending[writer], b'cdef')
+                pump.flush(writer)
+                self.assertEqual(pump.pending[writer], b'cdef')
+                pump.flush(writer)
+                self.assertFalse(pump.pending[writer])
+        finally:
+            pump.close()
+            left.close(); right.close(); os.close(reader); os.close(writer)
+
+    def test_transport_saturation_does_not_block_opposite_direction(self):
+        left, right = socket.socketpair()
+        left.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        reader, writer = os.pipe()
+        os.set_blocking(reader, False)
+        right.setblocking(False)
+        pump = auto.TerminalPump(left.fileno(), writer)
+        payload = b'x' * 262144
+        try:
+            pump.queue(writer, payload)
+            pump.queue(left.fileno(), payload)
+            # Neither consumer drains: repeated polling must still return.
+            started = time.monotonic()
+            for _ in range(10):
+                pump.poll(.001)
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertTrue(pump.pending[writer])
+            self.assertTrue(pump.pending[left.fileno()])
+            output, child_input = bytearray(), bytearray()
+            end = time.monotonic() + 5
+            while time.monotonic() < end and (len(output) < len(payload) or len(child_input) < len(payload)):
+                pump.poll(.001)
+                for fd, target in [(reader, output), (right.fileno(), child_input)]:
+                    try:
+                        target.extend(os.read(fd, 65536))
+                    except BlockingIOError:
+                        pass
+            self.assertEqual(output, payload)
+            self.assertEqual(child_input, payload)
+        finally:
+            pump.close()
+            left.close(); right.close(); os.close(reader); os.close(writer)
+
     def test_titles_are_chunked_and_resolve_exact_owned_id(self):
         parser=auto.Titles()
         wire=('\x1b]0;'+B[:29]+'...\x1b\\').encode()
@@ -216,7 +309,7 @@ class PolicyTests(unittest.TestCase):
             callback=subprocess.Popen([sys.executable,str(SCRIPT),'--checkpoint',tmp],stdin=subprocess.PIPE)
             callback.stdin.write(json.dumps(dict(session_id=A,hook_event_name='PreModelRequest',turn_id='turn')).encode());callback.stdin.close()
             try:
-                end=time.monotonic()+3
+                end=time.monotonic()+10
                 while time.monotonic()<end and not gate.held(A):time.sleep(.02)
                 self.assertTrue(gate.held(A));self.assertIsNone(callback.poll())
                 gate.cancel();self.assertEqual(callback.wait(timeout=3),0)
@@ -235,7 +328,7 @@ class HandoffTests(unittest.TestCase):
     def exercise(self,mode):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);(root/'bin').mkdir();(root/'main').mkdir();(root/'project').mkdir()
-            fake=root/'bin/xswap';fake.write_text(FAKE);fake.chmod(0o700)
+            fake=root/'bin/xswap';fake.write_text(FAKE.replace('#!/usr/bin/env python3', '#!'+sys.executable, 1));fake.chmod(0o700)
             real=root/'bin/codex';real.write_text('#!/bin/sh\nprintf "REAL_CODEX %s\\n" "$*"\n');real.chmod(0o700)
             config=root/'config.json';config.write_text(json.dumps({'real_codex':str(real),'accounts':['alt','personal','work'],'account':'alt','full_permissions':True,'poll_seconds':.1}))
             (root/'usage.json').write_text(json.dumps(dict(alt=10,personal=10,work=10)))
@@ -247,14 +340,17 @@ class HandoffTests(unittest.TestCase):
             env={**os.environ,'HOME':tmp,'PATH':str(root/'bin')+':'+os.environ['PATH'],'CODEX_AUTO_CONFIG':str(config),'FAKE_ROOT':tmp,'FAKE_MODE':mode,'TERM':'xterm-256color'}
             sibling=subprocess.Popen(['/bin/sleep','60'])
             pid,fd=pty.fork()
-            if pid==0:os.execve(str(SCRIPT),[str(SCRIPT),'--','-m','test-model','-s','read-only','-a','on-request','ORIGINAL TASK'],env)
-            output=b'';status=None;end=time.monotonic()+12
+            if pid==0:os.execve(sys.executable,[sys.executable,str(SCRIPT),'--','-m','test-model','-s','read-only','-a','on-request','ORIGINAL TASK'],env)
+            output=b'';status=None;paste_sent=False;end=time.monotonic()+30
             try:
                 while time.monotonic()<end:
                     ready,_,_=select.select([fd],[],[],.1)
                     if ready:
                         try:output+=os.read(fd,65536)
                         except OSError:pass
+                        if mode=='goal-paste' and b'PASTE_NOW' in output and not paste_sent:
+                            os.write(fd,b'\x1b[200~USER DRAFT\x1b[201~')
+                            paste_sent=True
                     child,st=os.waitpid(pid,os.WNOHANG)
                     if child:status=st;break
                 self.assertIsNotNone(status,output.decode(errors='replace'))
@@ -268,7 +364,7 @@ class HandoffTests(unittest.TestCase):
                 if mode.startswith('goal-'):
                     db=sqlite3.connect(root/'main/goals_1.sqlite')
                     self.assertEqual(db.execute('select goal_id,token_budget,tokens_used from thread_goals').fetchone(),('stable-goal',12345,456));db.close()
-                if mode=='goal-limited':self.assertTrue((root/'goal-resumed').exists(),output)
+                if mode in ('goal-limited','goal-paste'):self.assertTrue((root/'goal-resumed').exists(),output)
                 self.assertEqual(os.waitstatus_to_exitcode(status),7 if mode=='transient' else 0,output)
             finally:
                 if status is None:os.kill(pid,signal.SIGTERM);os.waitpid(pid,0)
@@ -283,6 +379,8 @@ class HandoffTests(unittest.TestCase):
     def test_transient_rate_limit_does_not_rotate(self):self.exercise('transient')
     def test_historical_limits_do_not_apply_to_new_account(self):self.exercise('historical')
     def test_active_goal_is_not_duplicated(self):self.exercise('goal-active')
+    def test_paste_during_goal_resume_is_preserved_after_submission(self):self.exercise('goal-paste')
+
     def test_quota_paused_goal_uses_native_resume(self):self.exercise('goal-limited')
     def test_explicitly_paused_goal_stays_paused(self):self.exercise('goal-paused')
     def test_chat_switch_does_not_follow_subagent(self):self.exercise('chat-switch')

@@ -40,7 +40,14 @@ CONTINUE = ("Continue the unfinished request after an account quota handoff. Fir
 
 
 def note(message):
-    os.write(2, ("\r\n[codex-auto] " + message + "\r\n").encode())
+    flags = fcntl.fcntl(2, fcntl.F_GETFL)
+    try:
+        fcntl.fcntl(2, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        os.write(2, ("\r\n[codex-auto] " + message + "\r\n").encode())
+    except BlockingIOError:
+        pass  # A diagnostic must not stall the terminal pump.
+    finally:
+        fcntl.fcntl(2, fcntl.F_SETFL, flags)
 
 
 def read_json(command):
@@ -256,6 +263,8 @@ class InputState:
 
 class InputHold:
     """A bounded wait for CLI readiness, measured from the first held input."""
+    REPLY = re.compile(rb"\x1b\](?:10|11|12);rgb:[0-9a-fA-F/]+(?:\x07|\x1b\\)|"
+                       rb"\x1b\[(?:[0-9]+;[0-9]+R|\?[0-9;:]*[cu]|[0-9]+;[0-9]+;[0-9]+t)")
     def __init__(self):
         self.data = b""
         self.since = None
@@ -264,15 +273,71 @@ class InputHold:
         if self.since is None:
             self.since = time.monotonic() if now is None else now
         self.data += data
+        # Only recognized terminal query replies bypass the hold. Never inspect
+        # a bracketed paste's payload as terminal protocol, even across reads.
+        paste = self.data.find(b"\x1b[200~")
+        prefix = self.data if paste < 0 else self.data[:paste]
+        replies = b"".join(match.group() for match in self.REPLY.finditer(prefix))
+        self.data = self.REPLY.sub(b"", prefix) + (b"" if paste < 0 else self.data[paste:])
+        if not self.data:
+            self.since = None
+        return replies
 
     def expired(self, now=None):
         now = time.monotonic() if now is None else now
-        return self.since is not None and now - self.since >= 15
+        return bool(self.data) and self.since is not None and now - self.since >= 15
 
     def release(self):
         data = self.data
         self.data, self.since = b"", None
         return data
+
+
+class TerminalPump:
+    """Bounded, nonblocking bidirectional transport; retain short-write tails."""
+    LIMIT = 1024 * 1024
+
+    def __init__(self, master, output=1):
+        self.master, self.output = master, output
+        self.pending = {master: bytearray(), output: bytearray()}
+        self.flags = {fd: fcntl.fcntl(fd, fcntl.F_GETFL) for fd in self.pending}
+        for fd, flags in self.flags.items():
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    def queue(self, fd, data):
+        if len(self.pending[fd]) + len(data) > self.LIMIT:
+            raise RuntimeError("Terminal forwarding queue exceeded its bounded capacity")
+        self.pending[fd].extend(data)
+
+    def poll(self, timeout=.1, held_bytes=0):
+        reads = []
+        # Leave room for continuation and terminal-reset control sequences.
+        if len(self.pending[self.output]) <= self.LIMIT - 65536 - 4096:
+            reads.append(self.master)
+        if len(self.pending[self.master]) + held_bytes <= self.LIMIT - 65536 - 4096:
+            reads.append(0)
+        ready, writable, _ = select.select(reads, [fd for fd, data in self.pending.items() if data], [], timeout)
+        for fd in writable:
+            self.flush(fd)
+        return ready
+
+    def flush(self, fd):
+        try:
+            written = os.write(fd, self.pending[fd])
+        except BlockingIOError:
+            return
+        del self.pending[fd][:written]
+
+    def close(self):
+        # Best effort rendering only; never wait indefinitely on a frozen pane.
+        end = time.monotonic() + .5
+        try:
+            while self.pending[self.output] and time.monotonic() < end:
+                if select.select([], [self.output], [], .05)[1]:
+                    self.flush(self.output)
+        finally:
+            for fd, flags in self.flags.items():
+                fcntl.fcntl(fd, fcntl.F_SETFL, flags)
 
 
 class Quotas:
@@ -533,8 +598,8 @@ def stop_owned(pid, reaped=False, parked=False):
         os.waitpid(pid, 0)
 
 
-def terminal_reset():
-    os.write(1, b"\x1b[?2026l\x1b[?1049l\x1b[?25h\x1b[?2004l\x1b[?1004l"
+def terminal_reset(writer=os.write):
+    writer(1, b"\x1b[?2026l\x1b[?1049l\x1b[?25h\x1b[?2004l\x1b[?1004l"
                 b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[<u\x1b[0m")
 
 
@@ -615,6 +680,7 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
             pass
 
     oldresize = signal.signal(signal.SIGWINCH, resize)
+    pump = TerminalPump(master)
     try:
         resize()
         tty.setraw(0)
@@ -622,11 +688,11 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
             quotas.tick()
             if action in ("goal-resume", "quota-continue") and held_input.expired():
                 pending = held_input.release()
-                os.write(master, pending)
+                pump.queue(master, pending)
                 input_state.feed(pending)
                 dirty, action = input_state.dirty, None
                 note("Could not confirm CLI readiness; input restored. Resume manually if needed.")
-            ready, _, _ = select.select([master, 0], [], [], .1)
+            ready = pump.poll(held_bytes=len(held_input.data))
             if master in ready:
                 try:
                     data = os.read(master, 65536)
@@ -635,20 +701,22 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
                         raise
                     data = b""
                 if data:
-                    os.write(1, data)
+                    pump.queue(1, data)
                     titles.feed(data)
                     terminal_text = (terminal_text + data.decode("utf-8", "replace"))[-16000:]
             if 0 in ready:
                 data = os.read(0, 65536)
                 if not data:
                     return conversation, None, 0
-                if action in ("goal-resume", "goal-submit", "quota-continue", "quota-submit") and not data.startswith(b"\x1b") and b"\x03" not in data:
-                    held_input.append(data)
+                if action in ("goal-resume", "goal-submit", "quota-continue", "quota-submit") and b"\x03" not in data:
+                    replies = held_input.append(data)
+                    if replies:
+                        pump.queue(master, replies)
                     continue
                 if action in ("goal-resume", "goal-submit", "quota-continue", "quota-submit") and b"\x03" in data:
                     action = None
-                    held_input.release()
-                os.write(master, data)
+                    data = held_input.release() + data
+                pump.queue(master, data)
                 # Avoid dropping a partially typed composer draft on an idle handoff.
                 input_state.feed(data)
                 dirty = input_state.dirty
@@ -680,12 +748,20 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
             if action in ("goal-resume", "quota-continue") and titles.resolve(known) == conversation.id and titles.idle and time.monotonic() - started > .5:
                 # Separate text from Enter so Codex does not classify the whole
                 # burst as a multiline paste and leave /goal resume unsubmitted.
-                os.write(master, b"/goal resume" if action == "goal-resume" else CONTINUE.encode())
+                # Existing user bytes must not concatenate with generated input.
+                if held_input.data:
+                    pending = held_input.release()
+                    pump.queue(master, pending)
+                    input_state.feed(pending)
+                    dirty, action = input_state.dirty, None
+                    wakeup_sent = True
+                    continue
+                pump.queue(master, b"/goal resume" if action == "goal-resume" else CONTINUE.encode())
                 goal_submit_at = time.monotonic() + .4
                 action = "goal-submit" if action == "goal-resume" else "quota-submit"
             if action in ("goal-submit", "quota-submit") and time.monotonic() >= goal_submit_at:
                 pending = held_input.release()
-                os.write(master, b"\r" + pending)
+                pump.queue(master, b"\r" + pending)
                 input_state.feed(pending)
                 dirty = input_state.dirty
                 action = None
@@ -727,20 +803,30 @@ def run_one(xswap, real_codex, account, options, session, logdir, action, state,
     finally:
         stop_owned(pid, reaped, parked=parked)
         gate.cancel()
-        termios.tcsetattr(0, termios.TCSADRAIN, oldterm)
-        signal.signal(signal.SIGWINCH, oldresize)
-        os.close(master)
-        terminal_reset()
+        try:
+            terminal_reset(pump.queue)
+            pump.close()
+        finally:
+            termios.tcsetattr(0, termios.TCSANOW, oldterm)
+            signal.signal(signal.SIGWINCH, oldresize)
+            os.close(master)
 
 
 def permission_options(options):
     """Explicit full-permissions mode supersedes narrower CLI permission flags."""
-    result, skip = [], False
+    result, value_for, literal = [], None, False
     for option in options:
-        if skip:
-            skip = False
+        if value_for is not None:
+            if value_for == "preserve":
+                result.append(option)
+            value_for = None
+        elif literal:
+            result.append(option)
+        elif option == "--":
+            result.append(option)
+            literal = True
         elif option in ("-a", "--ask-for-approval", "-s", "--sandbox"):
-            skip = True
+            value_for = "discard"
         elif option in ("--approve-for-me", "--dangerously-bypass-approvals-and-sandbox", "--yolo"):
             continue
         elif option.startswith(("--ask-for-approval=", "--sandbox=")) or (
@@ -748,6 +834,9 @@ def permission_options(options):
             continue
         else:
             result.append(option)
+            if option in VALUE_FLAGS:
+                value_for = "preserve"
+
     return result
 
 
