@@ -537,7 +537,7 @@ def checkpoint_hook(directory):
             or payload.get("session_id") != request.get("session")):
         return 0
     os.kill(request["owner"], 0)
-    expires = time.monotonic() + 45
+    expires = time.time() + 45
     record = {"session": payload["session_id"], "turn": payload.get("turn_id"),
               "nonce": request["nonce"], "pid": os.getpid(), "expires": expires,
               "transcript": payload.get("transcript_path")}
@@ -545,7 +545,7 @@ def checkpoint_hook(directory):
     temporary.write_text(json.dumps(record))
     temporary.replace(ready)
     try:
-        while time.monotonic() < expires:
+        while time.time() < expires:
             try:
                 current = json.loads(gate.read_text())
                 if current != request:
@@ -674,7 +674,7 @@ class HandoffGate:
         try:
             record = json.loads(self.ready.read_text())
             if (not self.request or record.get("nonce") != self.request["nonce"] or
-                    record.get("session") != session or time.monotonic() >= record["expires"] - 2):
+                    record.get("session") != session or time.time() >= record["expires"] - 2):
                 return False
             os.kill(record["pid"], 0)
             return record

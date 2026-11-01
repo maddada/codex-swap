@@ -95,8 +95,15 @@ if args[1]=='alt':
  if mode in ('quota','goal-limited','goal-paste','goal-paused'):
   if mode in ('goal-limited','goal-paste'):
    db=sqlite3.connect(root/'main/goals_1.sqlite');db.execute("update thread_goals set status='usage_limited'");db.commit();db.close()
+  tty.setraw(0)
   event(p,'task_complete',error={'codex_error_info':'usage_limit_exceeded'})
-  time.sleep(.3)
+  if mode!='goal-paused':
+   received=b'';end=time.monotonic()+20
+   while time.monotonic()<end and b'\r' not in received:
+    if select.select([0],[],[],.1)[0]:received+=os.read(0,4096)
+   expected=b'/goal resume' if mode in ('goal-limited','goal-paste') else b'Continue the unfinished request'
+   assert received.startswith(expected) and received.endswith(b'\r'), received
+   print('OLD_ACCOUNT_WAKEUP_OK',flush=True)
   checkpoint(p)
  else:
   if mode=='poll-threshold':
@@ -134,7 +141,9 @@ if args[1]=='alt':
    checkpoint(p,'turn-user-ack')
   else:
    checkpoint(p,'turn-3' if mode.startswith('race-') else 'turn-2')
- while True:time.sleep(.1)
+ while True:
+  time.sleep(.1)
+  checkpoint(p,'retry-checkpoint')
 assert args[1]=='personal',args
 assert 'resume' in args and args[args.index('resume')+1]==sid,args
 assert 'ORIGINAL TASK' not in args,args
@@ -419,12 +428,25 @@ class PolicyTests(unittest.TestCase):
     def test_checkpoint_requires_current_nonce_session_and_live_lease(self):
         with tempfile.TemporaryDirectory() as tmp:
             gate=auto.HandoffGate(Path(tmp));gate.arm(A)
-            record=dict(session=A,nonce='wrong',pid=os.getpid(),expires=time.monotonic()+30,turn='turn')
+            record=dict(session=A,nonce='wrong',pid=os.getpid(),expires=time.time()+30,turn='turn')
             gate.ready.write_text(json.dumps(record));self.assertFalse(gate.held(A))
             record['nonce']=gate.request['nonce'];record['session']=B
             gate.ready.write_text(json.dumps(record));self.assertFalse(gate.held(A))
-            record['session']=A;record['expires']=time.monotonic()-1
+            record['session']=A;record['expires']=time.time()-1
             gate.ready.write_text(json.dumps(record));self.assertFalse(gate.held(A))
+
+    def test_checkpoint_lease_ignores_process_local_monotonic_origin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gate = auto.HandoffGate(Path(tmp)); gate.arm(A)
+            record = dict(session=A, nonce=gate.request['nonce'], pid=os.getpid(),
+                          expires=time.time()+45, turn='turn')
+            gate.ready.write_text(json.dumps(record))
+            with mock.patch.object(auto.time, 'monotonic', return_value=10**12):
+                self.assertEqual(gate.held(A), record)
+            record['expires'] = time.time()-1
+            gate.ready.write_text(json.dumps(record))
+            with mock.patch.object(auto.time, 'monotonic', return_value=0):
+                self.assertFalse(gate.held(A))
 
     def test_callback_tolerates_gate_cancelled_after_existence_check(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -506,6 +528,7 @@ class HandoffTests(unittest.TestCase):
                     db=sqlite3.connect(root/'main/goals_1.sqlite')
                     self.assertEqual(db.execute('select goal_id,token_budget,tokens_used from thread_goals').fetchone(),('stable-goal',12345,456));db.close()
                 if mode in ('goal-limited','goal-paste'):self.assertTrue((root/'goal-resumed').exists(),output)
+                if mode in ('quota','goal-limited','goal-paste'):self.assertIn(b'OLD_ACCOUNT_WAKEUP_OK',output)
                 self.assertEqual(os.waitstatus_to_exitcode(status),7 if mode=='transient' else 0,output)
             finally:
                 if status is None:os.kill(pid,signal.SIGTERM);os.waitpid(pid,0)
