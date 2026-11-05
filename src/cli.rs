@@ -210,8 +210,11 @@ pub struct Add {
     #[arg(long)]
     pub login: bool,
     /// Email expected from the browser login; prompted when omitted.
-    #[arg(long, requires = "login")]
+    #[arg(long, requires = "login", conflicts_with = "any_account")]
     pub email: Option<String>,
+    /// Save whichever account the browser signs in to, without asking for its email first.
+    #[arg(long, requires = "login")]
+    pub any_account: bool,
     #[arg(long, requires = "login")]
     pub device_auth: bool,
     #[arg(long)]

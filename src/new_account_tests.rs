@@ -174,6 +174,7 @@ impl Operation {
                         home: None,
                         login: true,
                         email: Some("new-login@example.invalid".into()),
+                        any_account: false,
                         device_auth: false,
                         share_history: false,
                         output: Output { json: true },

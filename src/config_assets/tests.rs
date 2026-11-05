@@ -907,6 +907,7 @@ mod unix {
                 home: None,
                 login: true,
                 email: Some("expected@example.test".to_owned()),
+                any_account: false,
                 device_auth: false,
                 share_history: false,
                 output: crate::cli::Output { json: true },

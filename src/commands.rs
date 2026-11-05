@@ -199,7 +199,11 @@ pub fn add(cli: &Cli, args: &Add) -> Result<()> {
         &binary,
         staging.path(),
         args.device_auth,
-        args.email.as_deref(),
+        if args.any_account {
+            launch::ExpectedAccount::Any
+        } else {
+            launch::ExpectedAccount::Email(args.email.as_deref())
+        },
     )?;
     let mut store = Store::open(cli)?;
     if store.data.main_home != main_home {

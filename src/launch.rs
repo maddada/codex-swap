@@ -224,28 +224,45 @@ pub fn login(cli: &Cli, identifier: &str, device_auth: bool) -> Result<()> {
     Ok(())
 }
 
+/// Which account a new login may save.
+pub enum ExpectedAccount<'a> {
+    /// Only this email; `None` asks for it on the terminal.
+    Email(Option<&'a str>),
+    /// Whichever account the browser signs in to (`--any-account`).
+    Any,
+}
+
+/// CDXC:AgentProviders 2026-11-05 DECISION:
+/// The Ghostex user asked for Codex accounts to be added without typing the email first, the way Claude accounts are: `--any-account` saves whichever account the browser signs in to. An account that is already saved is still refused (`ensure_unique_identity`). Without the flag a new login keeps the 2026-09-07 rule below.
+///
 /// CDXC:AgentProviders 2026-09-07 DECISION:
 /// New Codex logins must verify the requested email before being saved, just like Claude.
 pub fn login_new_profile(
     binary: &OsStr,
     home: &Path,
     device_auth: bool,
-    email: Option<&str>,
+    expected: ExpectedAccount<'_>,
 ) -> Result<(serde_json::Value, auth::Identity)> {
-    let email = match email {
-        Some(email) => email.trim().to_string(),
-        None => {
+    let email = match expected {
+        ExpectedAccount::Any => None,
+        ExpectedAccount::Email(Some(email)) => Some(email.trim().to_string()),
+        ExpectedAccount::Email(None) => {
             eprint!("Email for the Codex account you want to connect: ");
             std::io::stderr().flush()?;
             let mut email = String::new();
             std::io::stdin().read_line(&mut email)?;
-            email.trim().to_string()
+            Some(email.trim().to_string())
         }
     };
-    if !email.contains('@') || email.chars().any(char::is_whitespace) {
+    if email
+        .as_deref()
+        .is_some_and(|email| !email.contains('@') || email.chars().any(char::is_whitespace))
+    {
         bail!("enter the email address of the Codex account you want to connect");
     }
-    eprintln!("Choose the requested account in the browser before authorizing.");
+    if email.is_some() {
+        eprintln!("Choose the requested account in the browser before authorizing.");
+    }
     let mut cmd = command(binary, home, true)?;
     let sqlite = toml::Value::String(home.to_string_lossy().into_owned()).to_string();
     cmd.args(["-c", &format!("sqlite_home={sqlite}"), "login"]);
@@ -261,12 +278,14 @@ pub fn login_new_profile(
         bail!("Codex login did not complete; no account was added");
     }
     let (document, identity) = auth::credentials(home)?;
-    if !identity
-        .email
-        .as_deref()
-        .is_some_and(|actual| actual.eq_ignore_ascii_case(&email))
-    {
-        bail!("the browser signed in to a different email; no account was added");
+    if let Some(email) = &email {
+        if !identity
+            .email
+            .as_deref()
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(email))
+        {
+            bail!("the browser signed in to a different email; no account was added");
+        }
     }
     Ok((document, identity))
 }
