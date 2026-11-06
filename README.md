@@ -200,6 +200,19 @@ Explicit `xswap run work` and directory mappings select an account for that laun
 
 An invalid, incomplete or unsupported login in the main Codex home does not block listing, launching, reconnecting or exporting an account with a separate saved home. xswap reports a main-login diagnostic on stderr and uses the selected account's own credentials unless a valid main identity positively matches it. `status` still reports main-home errors, and global switching refuses to replace an unrecognized main login. Entries whose saved home is the main home still report errors from that source. Home aliases resolve to their physical destinations so leases and main-home replacement checks apply to the same directory.
 
+## Optional automatic handoff in cmux
+
+For interactive macOS/Linux sessions, the optional [`codex-auto` launcher](docs/auto-swap.md)
+can schedule account handoff at 97% quota usage, resume the exact conversation,
+and preserve `/goal` state while other panes keep running. Its zsh integration
+makes ordinary `codex` launches in cmux use the launcher and retains cmux's native
+hooks. Install and configure it separately; the xswap binary itself still performs
+only explicitly requested launches and switches.
+
+Use `codex-auto configure --remaining-percent 3` to save a cutoff with 3% quota
+left, or `codex-auto configure --show` to inspect settings. Polling frequency,
+retry cooldown, account order and permissions are configurable for future launches.
+
 ## Directory mappings
 
 ```sh

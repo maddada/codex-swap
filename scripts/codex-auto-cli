@@ -1,0 +1,3 @@
+#!/bin/sh
+# Entrypoint for cmux's native Codex wrapper; xswap always uses the real binary.
+exec "$(dirname "$0")/codex-auto" --cli -- "$@"
