@@ -1,0 +1,1165 @@
+#!/usr/bin/env python3
+"""Run interactive Codex with isolated, resumable account rotation (macOS/Linux)."""
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+import errno
+import fcntl
+import json
+import os
+from pathlib import Path
+import pty
+import re
+import select
+import shutil
+import signal
+import shlex
+import sqlite3
+import subprocess
+import sys
+import termios
+import time
+import tty
+import uuid
+
+UUID = r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}"
+THREAD = re.compile(r"session_loop\{thread_id=(" + UUID + r")\}")
+# Codex truncates terminal-title segments to 29 characters plus '...'. Resolve
+# that prefix ONLY against exact IDs emitted by this launch's session_loop spans.
+TITLE_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{5,12}")
+VALUE_FLAGS = {"-c", "--config", "-m", "--model", "-p", "--profile", "-s", "--sandbox",
+               "-a", "--ask-for-approval", "-C", "--cd", "--add-dir", "--enable", "--disable",
+               "--remote", "--remote-auth-token-env", "--local-provider", "-i", "--image"}
+SUBCOMMANDS = {"agents", "exec", "e", "review", "login", "logout", "mcp", "plugin", "app-server",
+               "remote-control", "app", "completion", "update", "doctor", "sandbox", "debug",
+               "apply", "a", "resume", "queue", "archive", "delete", "migrate-rollouts",
+               "migrate-nfs-db", "unarchive", "fork", "cloud", "exec-server", "features", "help"}
+CONTINUE = ("Continue the unfinished request after an account quota handoff. First check "
+            "the current state and still-running commands to avoid duplicating work. "
+            "Preserve all existing instructions, approval requirements, and goal budgets.")
+
+
+def note(message):
+    flags = fcntl.fcntl(2, fcntl.F_GETFL)
+    try:
+        fcntl.fcntl(2, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        os.write(2, ("\r\n[codex-auto] " + message + "\r\n").encode())
+    except BlockingIOError:
+        pass  # A diagnostic must not stall the terminal pump.
+    finally:
+        fcntl.fcntl(2, fcntl.F_SETFL, flags)
+
+
+def read_json(command):
+    result = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                            env={**os.environ, "XSWAP_STOP_CODEX": "never"})
+    try:
+        return json.loads(result.stdout)
+    except ValueError:
+        raise RuntimeError(result.stderr.strip() or "No JSON returned by xswap")
+
+
+def usage_reports(xswap):
+    return {str(r["number"]): r for r in read_json([xswap, "usage", "--all", "--json"])["accounts"]}
+
+
+def usage_percent(report):
+    windows = (report.get("usage") or {}).get("windows", [])
+    return max((w["usedPercent"] for w in windows if w.get("scope", "codex") == "codex"
+                and isinstance(w.get("usedPercent"), (float, int))), default=0)
+
+
+def usable(report, threshold=97):
+    usage = report.get("usage")
+    return bool(usage and not report.get("error") and usage.get("allowed") is True
+                and usage.get("limitReached") is False and usage_percent(report) < threshold)
+
+
+def quota_error(event):
+    if event.get("type") != "event_msg":
+        return False
+    data = event.get("payload", {})
+    if data.get("type") in ("task_complete", "turn_complete"):
+        data = data.get("error") or {}
+    elif data.get("type") != "error":
+        return False
+    return data.get("codex_error_info") in ("usage_limit_exceeded", "UsageLimitExceeded")
+
+
+class Tail:
+    def __init__(self, path, skip_existing=False):
+        self.path = path
+        self.offset = path.stat().st_size if skip_existing and path.exists() else 0
+        self.partial = b""
+
+    def lines(self):
+        try:
+            with self.path.open("rb") as stream:
+                if self.path.stat().st_size < self.offset:
+                    self.offset, self.partial = 0, b""
+                stream.seek(self.offset)
+                data = stream.read()
+                self.offset = stream.tell()
+        except FileNotFoundError:
+            return []
+        parts = (self.partial + data).split(b"\n")
+        self.partial = parts.pop()
+        return [line.decode("utf-8", "replace") for line in parts]
+
+
+def find_rollout(home, session):
+    return next((home / "sessions").glob("*/*/*/*" + session + ".jsonl"), None)
+
+
+class Conversation:
+    def __init__(self, session, home, since=None):
+        self.id, self.home = session, home
+        self.since = since if since is not None else time.time()
+        self.backlog = []
+        self.tail = None
+        self.active = None
+        self.cwd = None
+        self.root = True
+        self.percent = None
+        self.turn = None
+
+    def attach(self):
+        if self.tail:
+            return
+        path = find_rollout(self.home, self.id)
+        if not path:
+            return
+        with path.open("rb") as stream:
+            try:
+                meta = json.loads(stream.readline()).get("payload", {})
+                self.cwd = meta.get("cwd")
+                source = meta.get("source")
+                self.root = not (meta.get("parent_thread_id") or meta.get("agent_path") or
+                                 (isinstance(source, dict) and "subagent" in source))
+            except ValueError:
+                pass
+            # Read enough recent history to recover busy/idle, without replaying
+            # historical errors or reading a huge conversation into memory.
+            size = path.stat().st_size
+            if size > 1024 * 1024:
+                stream.seek(size - 1024 * 1024)
+                stream.readline()
+            else:
+                stream.seek(0)
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                    timestamp = event.get("timestamp")
+                    fresh = bool(timestamp and datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp() >= self.since)
+                    if fresh:
+                        self.backlog.append(event)
+                    self.observe(event, replay=not fresh)
+                except ValueError:
+                    pass
+            stream_offset = stream.tell()
+        self.tail = Tail(path)
+        self.tail.offset = stream_offset
+
+    def observe(self, event, replay=False):
+        if event.get("type") != "event_msg":
+            return
+        data = event.get("payload", {})
+        kind = data.get("type")
+        if kind in ("task_started", "turn_started"):
+            self.active = True
+            self.turn = data.get("turn_id")
+        elif kind in ("task_complete", "turn_complete", "turn_aborted"):
+            self.active = False
+        if kind == "token_count" and not replay:
+            limits = data.get("rate_limits") or {}
+            if limits.get("limit_id", "codex") == "codex":
+                values = [limits[k]["used_percent"] for k in ("primary", "secondary")
+                          if isinstance(limits.get(k), dict) and
+                          isinstance(limits[k].get("used_percent"), (int, float))]
+                if values:
+                    self.percent = max(values)
+
+    def events(self):
+        self.attach()
+        if not self.tail:
+            return []
+        events, self.backlog = self.backlog, []
+        for line in self.tail.lines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            self.observe(event)
+            events.append(event)
+        return events
+
+
+class Titles:
+    """Parse complete OSC records across PTY chunks, never arbitrary chat text."""
+    def __init__(self):
+        self.pending = b""
+        self.prefix = None
+        self.idle = False
+
+    def feed(self, data):
+        self.pending += data
+        while True:
+            start = self.pending.find(b"\x1b]")
+            if start < 0:
+                self.pending = self.pending[-1:]
+                return
+            ends = [(self.pending.find(end, start + 2), len(end)) for end in (b"\x07", b"\x1b\\")]
+            ends = [(pos, length) for pos, length in ends if pos >= 0]
+            if not ends:
+                self.pending = self.pending[start:][-16384:]
+                return
+            end, length = min(ends)
+            record = self.pending[start + 2:end].decode("utf-8", "replace")
+            self.pending = self.pending[end + length:]
+            if record.startswith(("0;", "2;")):
+                match = TITLE_ID.search(record[2:])
+                self.prefix = match.group(0) if match else None
+            elif record.startswith("7501;state="):
+                self.idle = record.startswith("7501;state=idle")
+
+    def resolve(self, candidates):
+        matches = [sid for sid in candidates if self.prefix and sid.startswith(self.prefix)]
+        return matches[0] if len(matches) == 1 else None
+
+
+class InputState:
+    """Track drafts and exact submissions for the supported basic composer edits."""
+    def __init__(self):
+        self.dirty = False
+        self.paste = False
+        self.escape = b""
+        self.text = bytearray()
+        self.uncertain = False
+        self.submitted = []
+
+    def submit(self):
+        try:
+            text = self.text.decode("utf-8") if not self.uncertain else None
+        except UnicodeDecodeError:
+            text = None
+        if text or self.uncertain:
+            self.submitted.append(text)
+        self.text.clear()
+        self.uncertain, self.dirty = False, False
+
+    def feed(self, data):
+        self.submitted = []
+        for byte in data:
+            if self.escape:
+                self.escape += bytes([byte])
+                if self.escape.startswith(b"\x1b["):
+                    complete = len(self.escape) >= 3 and 0x40 <= byte <= 0x7e
+                elif self.escape.startswith(b"\x1b]"):
+                    complete = byte == 7 or self.escape.endswith(b"\x1b\\")
+                else:
+                    complete = len(self.escape) >= 3 or self.escape[1:2] != b"O"
+                if complete:
+                    if self.paste:
+                        if self.escape == b"\x1b[201~":
+                            self.paste = False
+                        else:
+                            self.text.extend(self.escape)
+                    elif self.escape == b"\x1b[200~":
+                        self.paste = True
+                    elif InputHold.REPLY.fullmatch(self.escape):
+                        pass
+                    elif re.fullmatch(rb"\x1b\[13(?:;1)?u", self.escape):
+                        self.submit()
+                    else:
+                        self.uncertain, self.dirty = True, True
+                    self.escape = b""
+                continue
+            if byte == 27:
+                self.escape = b"\x1b"
+            elif self.paste:
+                self.text.append(byte)
+                self.dirty = True
+            elif byte in (10, 13):
+                self.submit()
+            elif byte in (3, 4, 21):
+                # These controls may interrupt, delete at cursor, or erase only
+                # part of a draft. Never assume they acknowledge a full clear.
+                if self.text or self.uncertain:
+                    self.uncertain, self.dirty = True, True
+            elif byte in (8, 127):
+                if self.text:
+                    last = self.text.pop()
+                    while 0x80 <= last <= 0xbf and self.text:
+                        last = self.text.pop()
+                self.dirty = bool(self.text) or self.uncertain
+            elif byte >= 32:
+                self.text.append(byte)
+                self.dirty = True
+            else:
+                self.uncertain, self.dirty = True, True
+
+
+class InputHold:
+    """A bounded wait for CLI readiness, measured from the first held input."""
+    REPLY = re.compile(rb"\x1b\](?:10|11|12);rgb:[0-9a-fA-F/]+(?:\x07|\x1b\\)|"
+                       rb"\x1b\[(?:[0-9]+;[0-9]+R|\?[0-9;:]*[cu]|[0-9]+;[0-9]+;[0-9]+t)")
+    def __init__(self):
+        self.data = b""
+        self.since = None
+
+    def append(self, data, now=None):
+        if self.since is None:
+            self.since = time.monotonic() if now is None else now
+        self.data += data
+        # Only recognized terminal query replies bypass the hold. Never inspect
+        # a bracketed paste's payload as terminal protocol, even across reads.
+        paste = self.data.find(b"\x1b[200~")
+        prefix = self.data if paste < 0 else self.data[:paste]
+        replies = b"".join(match.group() for match in self.REPLY.finditer(prefix))
+        self.data = self.REPLY.sub(b"", prefix) + (b"" if paste < 0 else self.data[paste:])
+        if not self.data:
+            self.since = None
+        return replies
+
+    def expired(self, now=None):
+        now = time.monotonic() if now is None else now
+        return bool(self.data) and self.since is not None and now - self.since >= 15
+
+    def release(self):
+        data = self.data
+        self.data, self.since = b"", None
+        return data
+
+
+class InputFence:
+    """Match each submitted prompt to its own persisted user message receipt."""
+    def __init__(self):
+        self.input = InputState()
+        self.pending = []
+        self.generated = []
+
+    def expect_generated(self, text):
+        self.generated.append(text)
+
+    def received(self, data, now=None):
+        self.input.feed(data)
+        now = time.time() if now is None else now
+        self.pending.extend((text, now) for text in self.input.submitted)
+
+    def observe(self, events):
+        for event in events:
+            payload = event.get("payload", {})
+            if not (event.get("type") == "response_item" and payload.get("type") == "message"
+                    and payload.get("role") == "user"):
+                continue
+            text = "\n".join(item.get("text", "") for item in payload.get("content", [])
+                             if item.get("type") in ("input_text", "text", "output_text"))
+            if self.generated and text == self.generated[0]:
+                self.generated.pop(0)
+                continue
+            if not self.pending:
+                continue
+            expected, since = self.pending[0]
+            if expected is None or text != expected or text.lstrip().startswith("<codex_internal_context>"):
+                continue
+            try:
+                timestamp = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp()
+            except (KeyError, ValueError):
+                continue
+            if timestamp >= since:
+                self.pending.pop(0)
+
+    def permits(self, queued):
+        return not self.pending and not queued
+
+
+class TerminalPump:
+    """Bounded, nonblocking bidirectional transport; retain short-write tails."""
+    LIMIT = 1024 * 1024
+
+    def __init__(self, master, output=1):
+        self.master, self.output = master, output
+        self.pending = {master: bytearray(), output: bytearray()}
+        self.flags = {fd: fcntl.fcntl(fd, fcntl.F_GETFL) for fd in self.pending}
+        for fd, flags in self.flags.items():
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    def queue(self, fd, data):
+        if len(self.pending[fd]) + len(data) > self.LIMIT:
+            raise RuntimeError("Terminal forwarding queue exceeded its bounded capacity")
+        self.pending[fd].extend(data)
+
+    def poll(self, timeout=.1, held_bytes=0):
+        reads = []
+        # Leave room for continuation and terminal-reset control sequences.
+        if len(self.pending[self.output]) <= self.LIMIT - 65536 - 4096:
+            reads.append(self.master)
+        if len(self.pending[self.master]) + held_bytes <= self.LIMIT - 65536 - 4096:
+            reads.append(0)
+        ready, writable, _ = select.select(reads, [fd for fd, data in self.pending.items() if data], [], timeout)
+        for fd in writable:
+            self.flush(fd)
+        return ready
+
+    def flush(self, fd):
+        try:
+            written = os.write(fd, self.pending[fd])
+        except BlockingIOError:
+            return
+        del self.pending[fd][:written]
+
+    def close(self):
+        # Best effort rendering only; never wait indefinitely on a frozen pane.
+        end = time.monotonic() + .5
+        try:
+            while self.pending[self.output] and time.monotonic() < end:
+                if select.select([], [self.output], [], .05)[1]:
+                    self.flush(self.output)
+        finally:
+            for fd, flags in self.flags.items():
+                fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+
+
+class Quotas:
+    """Network reads never block terminal forwarding."""
+    def __init__(self, xswap, interval):
+        self.xswap, self.interval = xswap, interval
+        self.reports = usage_reports(xswap)
+        self.pool = ThreadPoolExecutor(max_workers=1)
+        self.future = None
+        self.next_poll = time.monotonic() + interval
+
+    def tick(self):
+        if self.future and self.future.done():
+            try:
+                self.reports = self.future.result()
+            except (RuntimeError, OSError, KeyError, TypeError, ValueError, subprocess.TimeoutExpired):
+                pass  # Keep last good data; a failed read never means exhaustion.
+            self.future = None
+            self.next_poll = time.monotonic() + self.interval
+        if self.future is None and time.monotonic() >= self.next_poll:
+            self.future = self.pool.submit(usage_reports, self.xswap)
+
+    def close(self):
+        self.pool.shutdown(wait=False)
+
+
+def toml_path_scalar(raw):
+    """Read a single-line TOML string with an optional trailing comment."""
+    if raw[:1] not in ("'", '"') or raw.startswith(("'''", '"""')):
+        raise ValueError("sqlite_home requires a single-line TOML string on Python 3.9/3.10")
+    quote, result, index = raw[0], [], 1
+    escapes = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
+    while index < len(raw):
+        char = raw[index]
+        index += 1
+        if char == quote:
+            suffix = raw[index:].lstrip()
+            if suffix and not suffix.startswith("#"):
+                raise ValueError("Unexpected text after sqlite_home string")
+            return "".join(result)
+        if ord(char) < 32 and char != "\t":
+            raise ValueError("Control character in sqlite_home string")
+        if char == "\\" and quote == '"':
+            if index >= len(raw):
+                break
+            char = raw[index]
+            index += 1
+            if char in escapes:
+                char = escapes[char]
+            elif char in ("u", "U"):
+                count = 4 if char == "u" else 8
+                digits = raw[index:index + count]
+                if len(digits) != count or not re.fullmatch(r"[0-9a-fA-F]+", digits):
+                    raise ValueError("Invalid Unicode escape in sqlite_home")
+                code = int(digits, 16)
+                if code > 0x10ffff or 0xd800 <= code <= 0xdfff:
+                    raise ValueError("Invalid Unicode scalar in sqlite_home")
+                char = chr(code)
+                index += count
+            else:
+                raise ValueError("Invalid TOML escape in sqlite_home")
+        result.append(char)
+    raise ValueError("Unterminated sqlite_home string")
+
+
+def sqlite_home(main_home):
+    text = (main_home / "config.toml").read_text() if (main_home / "config.toml").exists() else ""
+    try:
+        import tomllib
+        configured = tomllib.loads(text).get("sqlite_home")
+    except ImportError:
+        # Python 3.9 fallback: accept the single top-level path scalar used by
+        # xswap. Refuse unrecognized syntax instead of editing a guessed DB.
+        configured = None
+        for line in text.splitlines():
+            if line.lstrip().startswith("["):
+                break
+            match = re.match(r"\s*sqlite_home\s*=\s*(.*)", line)
+            if match:
+                configured = toml_path_scalar(match.group(1).strip())
+    if not configured:
+        return main_home
+    path = Path(configured).expanduser()
+    return (path if path.is_absolute() else main_home / path).resolve()
+
+
+def goal_status(directory, session):
+    # Read only. Native /goal resume performs the status transition and retains
+    # goal identity, objective, token budget, and accumulated usage.
+    files = sorted(directory.glob("goals_*.sqlite"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in files:
+        try:
+            db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=.2)
+            try:
+                row = db.execute("SELECT status FROM thread_goals WHERE thread_id=?", (session,)).fetchone()
+                return row[0] if row else None
+            finally:
+                db.close()
+        except sqlite3.Error:
+            continue
+    return "unknown" if files else None
+
+
+def checkpoint_hook(directory):
+    """Native synchronous PreModelRequest callback; never authorizes a model call."""
+    directory = Path(directory)
+    gate = directory / "handoff-gate.json"
+    ready = directory / "handoff-ready.json"
+    if not gate.exists():
+        return 0
+    payload = json.loads(sys.stdin.buffer.read(1024 * 1024))
+    try:
+        request = json.loads(gate.read_text())
+    except FileNotFoundError:
+        return 0  # Input may cancel the gate while the hook reads its payload.
+    if (payload.get("hook_event_name") != "PreModelRequest" or payload.get("agent_id")
+            or payload.get("session_id") != request.get("session")):
+        return 0
+    os.kill(request["owner"], 0)
+    expires = time.time() + 45
+    record = {"session": payload["session_id"], "turn": payload.get("turn_id"),
+              "nonce": request["nonce"], "pid": os.getpid(), "expires": expires,
+              "transcript": payload.get("transcript_path")}
+    temporary = directory / ("ready-%s.tmp" % os.getpid())
+    temporary.write_text(json.dumps(record))
+    temporary.replace(ready)
+    try:
+        while time.time() < expires:
+            try:
+                current = json.loads(gate.read_text())
+                if current != request:
+                    break
+                os.kill(request["owner"], 0)
+            except (FileNotFoundError, ProcessLookupError):
+                break
+            time.sleep(.05)
+    finally:
+        try:
+            if json.loads(ready.read_text()).get("pid") == os.getpid():
+                ready.unlink()
+        except FileNotFoundError:
+            pass
+    return 0
+
+
+def toml_inline(value):
+    """Serialize the native JSON hook configuration without discarding handlers."""
+    if isinstance(value, dict):
+        return "{" + ",".join(json.dumps(k) + "=" + toml_inline(v)
+                               for k, v in value.items() if v is not None) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(toml_inline(v) for v in value) + "]"
+    if isinstance(value, (str, bool, int, float)):
+        return json.dumps(value, ensure_ascii=False, allow_nan=False)
+    raise RuntimeError("Unsupported hook configuration value")
+
+
+def effective_pre_hooks(xswap, real_codex, account, options):
+    """Ask Codex's loader to resolve hooks, profiles and project configuration."""
+    config_args = []
+    cwd = os.getcwd()
+    index = 0
+    while index < len(options):
+        argument = options[index]
+        if argument in ("-c", "--config", "--enable", "--disable"):
+            config_args += options[index:index + 2]
+            index += 2
+            continue
+        if argument in ("-p", "--profile", "-C", "--cd"):
+            value = options[index + 1]
+            if argument in ("-p", "--profile"):
+                config_args += ["-c", "profile=" + toml_inline(value)]
+            else:
+                cwd = str(Path(value).expanduser().absolute())
+            index += 2
+            continue
+        if argument.startswith(("--config=", "--enable=", "--disable=", "-c=")):
+            config_args.append(argument)
+        elif argument.startswith("--profile="):
+            config_args += ["-c", "profile=" + toml_inline(argument.split("=", 1)[1])]
+        elif argument.startswith("--cd="):
+            cwd = str(Path(argument.split("=", 1)[1]).expanduser().absolute())
+        index += 1
+    command = [xswap, "--codex-bin", real_codex, "run", account["alias"] or str(account["number"]),
+               "--share-history", "--", "app-server"] + config_args
+    proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, cwd=cwd, start_new_session=True,
+                            env={**os.environ, "XSWAP_STOP_CODEX": "never", "CODEX_AUTO_BYPASS": "1"})
+    buffered = b""
+    def request(message, response_id):
+        nonlocal buffered
+        proc.stdin.write((json.dumps(message) + "\n").encode())
+        proc.stdin.flush()
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            while b"\n" in buffered:
+                line, buffered = buffered.split(b"\n", 1)
+                data = json.loads(line)
+                if data.get("id") == response_id:
+                    if "error" in data:
+                        raise RuntimeError("Codex could not resolve checkpoint hook configuration")
+                    return data.get("result", {})
+            if select.select([proc.stdout], [], [], .1)[0]:
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                buffered += chunk
+        raise RuntimeError("Timed out resolving Codex checkpoint hooks; no session was stopped")
+    try:
+        request({"id": 1, "method": "initialize", "params": {
+            "clientInfo": {"name": "codex_auto", "version": "1.0"},
+            "capabilities": {"experimentalApi": True}}}, 1)
+        proc.stdin.write(b'{"method":"initialized","params":{}}\n')
+        proc.stdin.flush()
+        config = request({"id": 2, "method": "config/read", "params": {
+            "includeLayers": False, "cwd": cwd}}, 2).get("config", {})
+        groups = (config.get("hooks") or {}).get("PreModelRequest", [])
+        if not isinstance(groups, list):
+            raise RuntimeError("Invalid native PreModelRequest hook configuration")
+        return groups
+    finally:
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            stop_owned(proc.pid)
+
+
+class HandoffGate:
+    def __init__(self, directory):
+        self.directory = directory
+        self.path = directory / "handoff-gate.json"
+        self.ready = directory / "handoff-ready.json"
+        self.request = None
+
+    def arm(self, session):
+        if self.request and self.request["session"] == session:
+            return
+        self.cancel()
+        self.request = {"session": session, "owner": os.getpid(), "nonce": uuid.uuid4().hex}
+        temporary = self.directory / "gate.tmp"
+        temporary.write_text(json.dumps(self.request))
+        temporary.replace(self.path)
+
+    def cancel(self):
+        self.request = None
+        for path in (self.path, self.ready):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def held(self, session):
+        try:
+            record = json.loads(self.ready.read_text())
+            if (not self.request or record.get("nonce") != self.request["nonce"] or
+                    record.get("session") != session or time.time() >= record["expires"] - 2):
+                return False
+            os.kill(record["pid"], 0)
+            return record
+        except (FileNotFoundError, ProcessLookupError, KeyError, ValueError):
+            return False
+
+
+def stop_owned(pid, reaped=False, parked=False):
+    if pid <= 1 or pid == os.getpgrp():
+        raise RuntimeError("Refusing unsafe process group")
+    if parked:
+        # The root is blocked in our synchronous hook. Freeze the group before
+        # killing it, so a dying callback cannot release another model request.
+        try:
+            os.killpg(pid, signal.SIGSTOP)
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if not reaped:
+            os.waitpid(pid, 0)
+        return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    if not reaped:
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            child, _ = os.waitpid(pid, os.WNOHANG)
+            if child:
+                reaped = True
+                break
+            time.sleep(.05)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if not reaped:
+        os.waitpid(pid, 0)
+
+
+def terminal_reset(writer=os.write):
+    writer(1, b"\x1b[?2026l\x1b[?1049l\x1b[?25h\x1b[?2004l\x1b[?1004l"
+                b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[<u\x1b[0m")
+
+
+def claim_session(session, state, locks):
+    if session in locks:
+        return
+    handle = (state.parent / ("thread-" + session + ".lock")).open("a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        raise RuntimeError("This conversation is already managed by codex-auto")
+    for previous in list(locks):
+        locks.pop(previous).close()
+    locks[session] = handle
+
+
+def write_state(state, conversation, account):
+    temporary = state.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"session": conversation.id, "account": account["alias"],
+                                    "cwd": conversation.cwd or os.getcwd(), "pid": os.getpid()}) + "\n")
+    temporary.replace(state)
+
+
+def run_one(xswap, real_codex, account, options, session, logdir, action, state, locks,
+            quotas, alternate_available, threshold, full_permissions=False, shared_sqlite=None):
+    if session:
+        claim_session(session, state, locks)
+    logdir.mkdir(mode=0o700, parents=True)
+    gate = HandoffGate(logdir)
+    groups = effective_pre_hooks(xswap, real_codex, account, options)
+    hook_command = shlex.join([sys.executable, str(Path(__file__).resolve()), "--checkpoint", str(logdir)])
+    groups = groups + [{"hooks": [{"type": "command", "command": hook_command, "timeout": 60, "async": False}]}]
+    checkpoint_options = ["--enable", "hooks", "-c", "hooks.PreModelRequest=" + toml_inline(groups)]
+    options = list(options)
+    insert_at = options.index("--") if "--" in options else len(options)
+    options[insert_at:insert_at] = checkpoint_options
+    if full_permissions:
+        options = permission_options(options)
+    command = [xswap, "--codex-bin", real_codex, "run", account["alias"] or str(account["number"]),
+               "--share-history", "--", "--no-daemon", "-c", "log_dir=" + toml_inline(str(logdir)),
+               "-c", 'tui.terminal_title=["session-id","thread-name","activity"]'] + options
+    if action == "continue":
+        command += [CONTINUE]
+    if full_permissions:
+        command.insert(command.index("--no-daemon") + 1, "--dangerously-bypass-approvals-and-sandbox")
+    since = time.time()
+    home = Path(account["home"])
+    logtail, titles = Tail(logdir / "codex-tui.log"), Titles()
+    conversation = Conversation(session, home, since) if session else None
+    if conversation:
+        conversation.attach()
+    known = {session} if session else set()
+    quota_pending = set()
+    oldterm = termios.tcgetattr(0)
+    pid, master = pty.fork()
+    if pid == 0:
+        os.environ["XSWAP_STOP_CODEX"] = "never"
+        os.environ["XSWAP_CODEX_BIN"] = real_codex
+        os.environ["CODEX_AUTO_BYPASS"] = "1"
+        os.environ["RUST_LOG"] = "warn,codex_core=info"
+        os.environ.pop("CODEX_SQLITE_HOME", None)
+        os.execv(xswap, command)
+    reaped, recorded, status = False, None, 0
+    parked = False
+    wakeup_sent = False
+    terminal_text, dirty, announced = "", False, False
+    input_state = InputState()
+    input_fence = InputFence()
+    if action == "continue":
+        input_fence.expect_generated(CONTINUE)
+    held_input = InputHold()
+    goal_submit_at = None
+    started = time.monotonic()
+
+    def resize(*_):
+        try:
+            size = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
+            fcntl.ioctl(master, termios.TIOCSWINSZ, size)
+        except OSError:
+            pass
+
+    oldresize = signal.signal(signal.SIGWINCH, resize)
+    pump = TerminalPump(master)
+    try:
+        resize()
+        tty.setraw(0)
+        while True:
+            quotas.tick()
+            if action in ("goal-resume", "quota-continue") and held_input.expired():
+                pending = held_input.release()
+                pump.queue(master, pending)
+                input_state.feed(pending)
+                dirty, action = input_state.dirty, None
+                note("Could not confirm CLI readiness; input restored. Resume manually if needed.")
+            ready = pump.poll(held_bytes=len(held_input.data))
+            if master in ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    data = b""
+                if data:
+                    pump.queue(1, data)
+                    titles.feed(data)
+                    terminal_text = (terminal_text + data.decode("utf-8", "replace"))[-16000:]
+            if 0 in ready:
+                data = os.read(0, 65536)
+                if not data:
+                    return conversation, None, 0
+                input_fence.received(data)
+                gate.cancel()
+                if action in ("goal-resume", "goal-submit", "quota-continue", "quota-submit") and b"\x03" not in data:
+                    replies = held_input.append(data)
+                    if replies:
+                        pump.queue(master, replies)
+                    continue
+                if action in ("goal-resume", "goal-submit", "quota-continue", "quota-submit") and b"\x03" in data:
+                    action = None
+                    data = held_input.release() + data
+                pump.queue(master, data)
+                # Avoid dropping a partially typed composer draft on an idle handoff.
+                input_state.feed(data)
+                dirty = input_state.dirty
+            for line in logtail.lines():
+                known.update(THREAD.findall(line))
+            selected = titles.resolve(known)
+            if not conversation and known:
+                # Bootstrap only the first session_loop ID; after startup the
+                # TUI's title is authoritative for /new, /resume, and /fork.
+                if len(known) == 1:
+                    selected = selected or next(iter(known))
+            if selected and (not conversation or conversation.id != selected):
+                candidate = Conversation(selected, home, since)
+                candidate.attach()
+                if candidate.root:
+                    conversation, recorded, dirty = candidate, None, False
+                    input_state.dirty = False
+            if conversation is None:
+                child, status = os.waitpid(pid, os.WNOHANG)
+                if child:
+                    reaped = True
+                    return None, None, os.waitstatus_to_exitcode(status)
+                continue
+            if recorded != (conversation.id, conversation.cwd):
+                claim_session(conversation.id, state, locks)
+                write_state(state, conversation, account)
+                recorded = (conversation.id, conversation.cwd)
+            events = conversation.events()
+            input_fence.observe(events)
+            if action in ("goal-resume", "quota-continue") and titles.resolve(known) == conversation.id and titles.idle and time.monotonic() - started > .5:
+                # Separate text from Enter so Codex does not classify the whole
+                # burst as a multiline paste and leave /goal resume unsubmitted.
+                # Existing user bytes must not concatenate with generated input.
+                if held_input.data:
+                    pending = held_input.release()
+                    pump.queue(master, pending)
+                    input_state.feed(pending)
+                    dirty, action = input_state.dirty, None
+                    wakeup_sent = True
+                    continue
+                if action == "quota-continue":
+                    input_fence.expect_generated(CONTINUE)
+                pump.queue(master, b"/goal resume" if action == "goal-resume" else CONTINUE.encode())
+                goal_submit_at = time.monotonic() + .4
+                action = "goal-submit" if action == "goal-resume" else "quota-submit"
+            if action in ("goal-submit", "quota-submit") and time.monotonic() >= goal_submit_at:
+                pending = held_input.release()
+                pump.queue(master, b"\r" + pending)
+                input_state.feed(pending)
+                dirty = input_state.dirty
+                action = None
+                note("Submitted the continuation needed for the cooperative handoff checkpoint.")
+            quota_failed = any(quota_error(event) for event in events)
+            report = quotas.reports.get(str(account["number"]), {})
+            usage = report.get("usage") or {}
+            if (re.search(r"(?i)(you.ve hit your usage limit|usage_limit_exceeded)", terminal_text)
+                    and (usage.get("limitReached") is True or usage.get("allowed") is False)):
+                quota_failed = True
+            title_confirmed = titles.resolve(known) == conversation.id
+            if quota_failed:
+                quota_pending.add(conversation.id)
+            percent = max(usage_percent(report), conversation.percent or 0)
+            over = percent >= threshold or conversation.id in quota_pending or usage.get("limitReached") is True or usage.get("allowed") is False
+            if over and alternate_available() and title_confirmed and not dirty:
+                can_handoff = input_fence.permits(pump.pending[master])
+                if can_handoff:
+                    gate.arm(conversation.id)
+                else:
+                    gate.cancel()
+                if not announced:
+                    note("Usage reached %.1f%%; waiting for a synchronous pre-request checkpoint." % percent)
+                    announced = True
+                checkpoint = gate.held(conversation.id)
+                if (can_handoff and checkpoint and conversation.tail and conversation.turn and
+                        checkpoint.get("turn") == conversation.turn and not dirty):
+                    # Freeze before the final stdin check. Bytes arriving after
+                    # this check remain on the outer terminal for the resumed
+                    # child; bytes already forwarded require a persisted turn.
+                    os.killpg(pid, signal.SIGSTOP)
+                    parked = True
+                    if select.select([0], [], [], 0)[0]:
+                        gate.cancel()
+                        os.killpg(pid, signal.SIGCONT)
+                        parked = False
+                        continue
+                    return conversation, "quota" if conversation.id in quota_pending else "checkpoint", 0
+                if conversation.id in quota_pending and conversation.active is False and titles.idle and not dirty and not wakeup_sent:
+                    shared = shared_sqlite or sqlite_home((home / "sessions").resolve().parent)
+                    goal = goal_status(shared, conversation.id)
+                    if goal is None or goal == "usage_limited":
+                        action = "goal-resume" if goal == "usage_limited" else "quota-continue"
+                        wakeup_sent = True
+            else:
+                gate.cancel()
+                announced = False
+            child, status = os.waitpid(pid, os.WNOHANG)
+            if child:
+                reaped = True
+                return conversation, None, os.waitstatus_to_exitcode(status)
+    finally:
+        stop_owned(pid, reaped, parked=parked)
+        gate.cancel()
+        try:
+            terminal_reset(pump.queue)
+            pump.close()
+        finally:
+            termios.tcsetattr(0, termios.TCSANOW, oldterm)
+            signal.signal(signal.SIGWINCH, oldresize)
+            os.close(master)
+
+
+def permission_options(options):
+    """Explicit full-permissions mode supersedes narrower CLI permission flags."""
+    result, value_for, literal = [], None, False
+    for option in options:
+        if value_for is not None:
+            if value_for == "preserve":
+                result.append(option)
+            value_for = None
+        elif literal:
+            result.append(option)
+        elif option == "--":
+            result.append(option)
+            literal = True
+        elif option in ("-a", "--ask-for-approval", "-s", "--sandbox"):
+            value_for = "discard"
+        elif option in ("--approve-for-me", "--dangerously-bypass-approvals-and-sandbox", "--yolo"):
+            continue
+        elif option.startswith(("--ask-for-approval=", "--sandbox=")) or (
+                option.startswith(("-a", "-s")) and not option.startswith("--")):
+            continue
+        else:
+            result.append(option)
+            if option in VALUE_FLAGS:
+                value_for = "preserve"
+
+    return result
+
+
+def positional_indexes(options):
+    positions, skip, literal = [], False, False
+    for index, option in enumerate(options):
+        if skip:
+            skip = False
+        elif literal:
+            positions.append(index)
+        elif option == "--":
+            literal = True
+        elif option in VALUE_FLAGS:
+            skip = True
+        elif not option.startswith("-"):
+            positions.append(index)
+    return positions
+
+
+def resume_options(options):
+    """Keep launch options, never replay a prompt, selector, or creation flag."""
+    positions = set(positional_indexes(options))
+    result, skip = [], False
+    for index, option in enumerate(options):
+        if skip:
+            skip = False
+            continue
+        if option in ("-C", "--cd", "-i", "--image"):
+            skip = True
+            continue
+        if option.startswith(("--cd=", "--image=")) or option in ("--worktree", "--last", "--all", "--include-non-interactive", "--"):
+            continue
+        if index not in positions:
+            result.append(option)
+    return result
+
+
+def real_binary(config):
+    candidates = [os.environ.get("CODEX_AUTO_REAL_CODEX"), config.get("real_codex"),
+                  str(Path.home() / ".local/bin/codex"), shutil.which("codex")]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if (path.is_file() and os.access(path, os.X_OK) and "cmux-cli-shims" not in str(path)
+                and path.resolve().name not in ("codex-auto", "codex-auto-cli", "cmux-codex-wrapper")):
+            return str(path.absolute())
+    raise RuntimeError("Set real_codex in codex-auto config to the official Codex executable")
+
+
+def main():
+    config_path = Path(os.environ.get("CODEX_AUTO_CONFIG", Path.home() / ".config/codex-auto/config.json"))
+    config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    real_codex = real_binary(config)
+    cli_mode = sys.argv[1:2] == ["--cli"]
+    if cli_mode:
+        options = sys.argv[2:]
+        if options[:1] == ["--"]:
+            options = options[1:]
+        positions = positional_indexes(options)
+        command = options[positions[0]] if positions else None
+        passthrough = (not os.isatty(0) or not os.isatty(1) or os.environ.get("CODEX_AUTO_BYPASS") == "1"
+                       or any(arg in ("--help", "-h", "--version", "-V", "--oss") or arg.split("=", 1)[0] in
+                              ("--remote", "--remote-auth-token-env", "--ephemeral") for arg in options)
+                       or (command in SUBCOMMANDS and command not in ("resume", "fork")))
+        if passthrough:
+            os.execv(real_codex, [real_codex] + options)
+        args = argparse.Namespace(account=None, accounts=None, session=None, check=False,
+                                  threshold=None, poll_seconds=None, full_permissions=None)
+    else:
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--account", help="starting account alias")
+        parser.add_argument("--accounts", help="comma-separated rotation order")
+        parser.add_argument("--session", help="exact conversation UUID to resume")
+        parser.add_argument("--threshold", type=float, help="usage percentage for handoff (default: 97)")
+        parser.add_argument("--poll-seconds", type=float, help="background quota read interval (default: 30)")
+        parser.add_argument("--full-permissions", action="store_true", default=None,
+                            help="disable approval prompts and sandbox for every managed launch")
+        parser.add_argument("--check", action="store_true")
+        parser.add_argument("options", nargs=argparse.REMAINDER)
+        args = parser.parse_args()
+        options = args.options[1:] if args.options[:1] == ["--"] else args.options
+        if args.session:
+            if not re.fullmatch(UUID, args.session):
+                parser.error("--session must be an exact UUID")
+            options = ["resume", args.session] + options
+    if any(re.search(r"(?:log_dir|sqlite_home|cli_auth_credentials_store)\s*=", item) for item in options):
+        raise RuntimeError("Do not override launcher storage/auth settings")
+    if any(item.split("=", 1)[0] in ("--remote", "--ephemeral") for item in options):
+        raise RuntimeError("Remote/ephemeral sessions cannot be automatically resumed")
+    threshold = args.threshold if args.threshold is not None else config.get("threshold", 97)
+    interval = args.poll_seconds if args.poll_seconds is not None else config.get("poll_seconds", 30)
+    full_permissions = args.full_permissions if args.full_permissions is not None else config.get("full_permissions", False)
+    if not (0 < threshold <= 100 and interval >= .1):
+        raise RuntimeError("threshold must be in (0, 100]; poll_seconds must be >= 0.1")
+    xswap = shutil.which("xswap") or str(Path.home() / ".local/bin/xswap")
+    accounts = read_json([xswap, "list", "--json"])["accounts"]
+    by_alias = {a.get("alias") or str(a["number"]): a for a in accounts
+                if a.get("enabled") and a.get("loginStatus") == "present"}
+    names = args.accounts.split(",") if args.accounts else config.get("accounts", list(by_alias))
+    names = [name.strip() for name in names if name.strip()]
+    start = args.account or config.get("account") or next((name for name in names if by_alias.get(name, {}).get("isDefault")), names[0] if names else None)
+    if not names or len(set(names)) != len(names) or start not in names or any(n not in by_alias for n in names):
+        raise RuntimeError("Use saved, enabled accounts with unique aliases in the rotation pool")
+    order = names[names.index(start):] + names[:names.index(start)]
+    quotas = Quotas(xswap, interval)
+    if args.check:
+        for name in order:
+            report = quotas.reports.get(str(by_alias[name]["number"]), {})
+            print("%s: %s (%.1f%% used; handoff %.1f%%)" %
+                  (name, "available" if usable(report, threshold) else "at threshold or unavailable",
+                   usage_percent(report), threshold))
+        quotas.close()
+        return 0
+    if not os.isatty(0) or not os.isatty(1):
+        raise RuntimeError("Run codex-auto in an interactive terminal")
+    os.umask(0o077)
+    try:
+        main_home = Path(read_json([xswap, "status", "--json"])["defaultHome"])
+    except (RuntimeError, KeyError):
+        main_home = (Path(by_alias[order[0]]["home"]) / "sessions").resolve().parent
+    shared_sqlite = sqlite_home(main_home)
+    root = Path.home() / ".local/state/codex-auto"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    launch = root / (time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8])
+    launch.mkdir(mode=0o700)
+    state = root / (launch.name + ".json")
+    session, failed, attempt, locks = args.session, {}, 0, {}
+    retry_options = resume_options(options)
+    next_options, action = options, None
+    current_cwd = None
+    def eligible(name):
+        return (time.monotonic() - failed.get(name, -1e10) >= 300 and
+                usable(quotas.reports.get(str(by_alias[name]["number"]), {}), threshold))
+    try:
+        while True:
+            quotas.tick()
+            chosen = next((name for name in order if eligible(name)), None)
+            if chosen is None:
+                note("No account is below %.1f%% with confirmed quota. Waiting; Ctrl-C exits." % threshold)
+                end = time.monotonic() + 60
+                while time.monotonic() < end:
+                    quotas.tick()
+                    if any(eligible(name) for name in order):
+                        break
+                    time.sleep(.2)
+                continue
+            account = by_alias[chosen]
+            note(("Resuming " + session + " on " if session else "Starting on ") + chosen)
+            conversation, reason, code = run_one(xswap, real_codex, account, next_options, session,
+                launch / str(attempt), action, state, locks, quotas,
+                lambda: any(name != chosen and eligible(name) for name in order), threshold, full_permissions, shared_sqlite)
+            if reason is None:
+                return code
+            session, current_cwd = conversation.id, conversation.cwd
+            note(chosen + (" reached the handoff threshold." if reason in ("threshold", "checkpoint") else " quota exhausted.") +
+                 " Resuming this conversation only.")
+            failed[chosen] = time.monotonic()
+            order = order[order.index(chosen) + 1:] + order[:order.index(chosen) + 1]
+            goal = goal_status(shared_sqlite, session)
+            action = ("goal-resume" if goal == "usage_limited" else
+                      "continue" if reason in ("quota", "checkpoint") and goal is None else None)
+            next_options = ["resume", session] + retry_options
+            if current_cwd:
+                next_options += ["-C", current_cwd]
+            attempt += 1
+    finally:
+        quotas.close()
+        for handle in locks.values():
+            handle.close()
+
+
+if __name__ == "__main__":
+    def interrupted(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGHUP, interrupted)
+    try:
+        if sys.argv[1:2] == ["--checkpoint"]:
+            sys.exit(checkpoint_hook(sys.argv[2]))
+        sys.exit(main())
+    except KeyboardInterrupt:
+        note("Stopped.")
+        sys.exit(130)
+    except (RuntimeError, OSError, KeyError, ValueError, subprocess.TimeoutExpired) as error:
+        note(str(error))
+        sys.exit(1)

@@ -49,3 +49,27 @@ jobs:
           path: |
             target/release/xswap
             target/release/xswap.exe
+
+  auto-swap:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.9', '3.12']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python3 -m unittest discover -s tests/auto_swap -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install the tested official Codex CLI
+        run: npm install --global @openai/codex@0.166.0
+      - name: Check native synchronous handoff with a local mock model
+        run: python3 tests/auto_swap/native_checkpoint_smoke.py
+      - run: sh -n scripts/codex-auto-cli
+      - name: Validate zsh integration
+        run: |
+          if command -v zsh >/dev/null 2>&1; then zsh -n scripts/codex-auto.zsh; fi
