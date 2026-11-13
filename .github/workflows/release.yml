@@ -4,6 +4,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      sign:
+        description: Sign the Windows executables with the Certum certificate (needs the CERTUM_SIMPLYSIGN_* secrets); a manual run never publishes
+        type: boolean
+        default: false
   pull_request:
     paths:
       - ".github/workflows/release.yml"
@@ -118,8 +123,132 @@ jobs:
           path: release/*
           if-no-files-found: error
 
-  assemble:
+  # Windows Defender's machine-learning check removed the unsigned xswap.exe
+  # (issue #27), so a release signs both Windows executables with the same
+  # Certum "Open Source Code Signing in the Cloud" certificate that signs
+  # Ghostex. Certum keeps the private key in its SimplySign cloud; SimplySign
+  # Desktop mounts it as a virtual smart card after a login with the account
+  # e-mail and a one-time code from the activation seed. That login is
+  # Ghostex's script, checked out at a pinned commit so a change there never
+  # reaches this job unreviewed. One job on an x64 runner signs both
+  # architectures (signtool signs ARM64 files too, and SimplySign's x64 driver
+  # does not load in the ARM64 signtool) and replaces the two Windows archives
+  # before checksums and the formula are made. A tagged release never ships
+  # unsigned: without the secrets this job fails and nothing is published.
+  sign-windows:
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.sign
     needs: build
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      CERTUM_CERT_SHA1: ${{ vars.CERTUM_CERT_SHA1 || 'E81BEDC91DEA38C8BB2DA3651E161ADA280B6734' }}
+      # Ghostex commit whose tooling/release-gpui/certum-simplysign-login.ps1 logs in.
+      GHOSTEX_SIGNING_COMMIT: bdb3a8e3e971c1812306033c08e4ec5848be3b20
+    steps:
+      - name: Require the Certum secrets
+        shell: bash
+        env:
+          CERTUM_SIMPLYSIGN_EMAIL: ${{ secrets.CERTUM_SIMPLYSIGN_EMAIL }}
+          CERTUM_SIMPLYSIGN_TOTP: ${{ secrets.CERTUM_SIMPLYSIGN_TOTP }}
+        run: |
+          if [[ -z "$CERTUM_SIMPLYSIGN_EMAIL" || -z "$CERTUM_SIMPLYSIGN_TOTP" ]]; then
+            echo "::error title=Windows signing is not configured::Set the CERTUM_SIMPLYSIGN_EMAIL and CERTUM_SIMPLYSIGN_TOTP secrets on this repository (RELEASING.md). A release never ships an unsigned Windows build."
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          repository: maddada/Ghostex
+          ref: ${{ env.GHOSTEX_SIGNING_COMMIT }}
+          path: ghostex-signing
+          fetch-depth: 1
+          sparse-checkout: tooling/release-gpui/certum-simplysign-login.ps1
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*-pc-windows-msvc
+          path: windows
+          merge-multiple: true
+      - name: Install SimplySign Desktop
+        shell: pwsh
+        run: ghostex-signing/tooling/release-gpui/certum-simplysign-login.ps1 -Install
+      - name: Log in to SimplySign
+        shell: pwsh
+        env:
+          CERTUM_SIMPLYSIGN_EMAIL: ${{ secrets.CERTUM_SIMPLYSIGN_EMAIL }}
+          CERTUM_SIMPLYSIGN_TOTP: ${{ secrets.CERTUM_SIMPLYSIGN_TOTP }}
+          GHOSTEX_CERTUM_CERT_SHA1: ${{ env.CERTUM_CERT_SHA1 }}
+        run: ghostex-signing/tooling/release-gpui/certum-simplysign-login.ps1 -Login
+      - name: Sign xswap.exe in both Windows archives
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $thumbprint = $env:CERTUM_CERT_SHA1.ToUpperInvariant()
+          $archives = @(Get-ChildItem windows -Filter 'codex-swap-*-pc-windows-msvc.zip')
+          if ($archives.Count -ne 2) { throw "Expected the x64 and ARM64 Windows archives, found $($archives.Count)" }
+          $files = @()
+          foreach ($archive in $archives) {
+            $staging = Join-Path $env:RUNNER_TEMP $archive.BaseName
+            Expand-Archive -LiteralPath $archive.FullName -DestinationPath $staging
+            $files += (Join-Path $staging 'xswap.exe')
+          }
+          # The timestamp server and the SimplySign cloud are network calls: retry what is still unsigned.
+          $pending = $files
+          for ($attempt = 1; $attempt -le 3 -and $pending.Count -gt 0; $attempt++) {
+            & $env:GHOSTEX_SIGNTOOL sign /sha1 $thumbprint /fd sha256 /tr http://time.certum.pl /td sha256 /d 'codex-swap (xswap)' /du 'https://github.com/maddada/codex-swap' @pending
+            $pending = @($pending | Where-Object { (Get-AuthenticodeSignature -LiteralPath $_).SignerCertificate.Thumbprint -ne $thumbprint })
+            if ($pending.Count -gt 0 -and $attempt -lt 3) { Start-Sleep -Seconds (15 * $attempt) }
+          }
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $file
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $thumbprint -or -not $signature.TimeStamperCertificate) {
+              throw "Signing failed for $file (status $($signature.Status), signer $($signature.SignerCertificate.Thumbprint), timestamped $([bool]$signature.TimeStamperCertificate))"
+            }
+          }
+          foreach ($archive in $archives) {
+            $staging = Join-Path $env:RUNNER_TEMP $archive.BaseName
+            if ($archive.Name -like '*x86_64*') {
+              $version = $archive.Name -replace '^codex-swap-(.+)-x86_64-pc-windows-msvc\.zip$', '$1'
+              $reported = & (Join-Path $staging 'xswap.exe') --version
+              if ($LASTEXITCODE -ne 0 -or $reported -ne "xswap $version") { throw 'The signed x64 executable failed its version check' }
+            }
+            Remove-Item -LiteralPath $archive.FullName
+            Compress-Archive -Path "$staging/*" -DestinationPath $archive.FullName
+            Write-Host "Signed xswap.exe in $($archive.Name) (Valid, $thumbprint, timestamped)"
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-x86_64-pc-windows-msvc
+          path: windows/codex-swap-*-x86_64-pc-windows-msvc.zip
+          if-no-files-found: error
+          overwrite: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-aarch64-pc-windows-msvc
+          path: windows/codex-swap-*-aarch64-pc-windows-msvc.zip
+          if-no-files-found: error
+          overwrite: true
+      # Window titles and screenshots taken before anything was typed; never a code or the seed.
+      - name: Upload the SimplySign login diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: certum-diagnostics
+          path: ${{ runner.temp }}/certum-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 3
+      - name: Log out of SimplySign
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path ghostex-signing/tooling/release-gpui/certum-simplysign-login.ps1) {
+            ghostex-signing/tooling/release-gpui/certum-simplysign-login.ps1 -Logout
+          }
+
+  assemble:
+    needs: [build, sign-windows]
+    # A pull request or an unsigned manual run skips the signing job.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.sign-windows.result == 'success' || needs.sign-windows.result == 'skipped') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

@@ -4,7 +4,7 @@ The `Release binaries` workflow builds native ARM64 and x86-64 executables for m
 
 1. Update the version in `Cargo.toml` and `Cargo.lock`, and commit the release changes.
 2. Push the commit and matching `vMAJOR.MINOR.PATCH` tag. The tag must match `Cargo.toml`.
-3. Wait for `Release binaries` to finish. It publishes six archives, the Windows `install.ps1` and macOS/Linux `install.sh` installers, `SHA256SUMS`, and a generated `codex-swap.rb` formula together. A manual workflow run builds the same artifacts without publishing a release.
+3. Wait for `Release binaries` to finish. It signs both Windows executables (see *Windows code signing*), then publishes six archives, the Windows `install.ps1` and macOS/Linux `install.sh` installers, `SHA256SUMS`, and a generated `codex-swap.rb` formula together. A manual workflow run builds the same artifacts without publishing a release.
 4. The same workflow then publishes the formula to the tap: its last step clones `maddada/homebrew-tap` over SSH with the `HOMEBREW_TAP_DEPLOY_KEY` deploy key, copies the release's `codex-swap.rb` to `Formula/codex-swap.rb`, checks it with `ruby -c`, and, only when the file changed, commits it as `github-actions[bot]` with `chore: update codex-swap formula to X.Y.Z` and pushes `main` (rebasing once if `main` moved). The formula contains checksums of the exact published archives and installs only the prebuilt executable.
 5. If that step was skipped (the run shows a `HOMEBREW_TAP_DEPLOY_KEY is not set` notice) or failed, update the tap by hand: download `codex-swap.rb` from the release into `Formula/codex-swap.rb` in `maddada/homebrew-tap`, run `ruby -c Formula/codex-swap.rb`, `brew style Formula/codex-swap.rb`, and `git diff --check` in the tap, review and commit only that formula, then push the tap update.
 6. Verify `brew install maddada/tap/codex-swap` and `xswap --version` on macOS and Linux. Use `brew upgrade` for an existing installation.
@@ -36,3 +36,20 @@ curl -fsSL https://github.com/maddada/codex-swap/releases/latest/download/instal
 It learns the latest version from the release's `SHA256SUMS` (so it never calls the rate-limited GitHub API), downloads that tag's archive, verifies it, validates the four archive members and `xswap --version`, and installs to `~/.local/bin` (`XSWAP_INSTALL_DIR` overrides; `XSWAP_VERSION` pins a release). It writes `.xswap-install-receipt.json` beside the executable with the method, directory, version, target and executable SHA-256, which `xswap upgrade` uses to rerun the embedded copy of the script.
 
 Account data on Windows lives in `%LOCALAPPDATA%\codex-swap` by default and uses owner-only Windows ACLs. Shared configuration and history use true symbolic links, so enable Windows Developer Mode or grant the Create symbolic links privilege before adding managed accounts. Hardlinks are intentionally unsuitable because Codex can replace files atomically. CI validates the installer syntax and checks the executable version and help on both native Windows architectures. macOS cross-checks cannot replace those native runtime checks.
+
+## Windows code signing
+
+Both Windows executables are Authenticode-signed with the Certum "Open Source Code Signing in the Cloud" certificate that also signs Ghostex (`CN=Open Source Developer Mohamad Yahia Youssef`, SHA-1 `E81BEDC91DEA38C8BB2DA3651E161ADA280B6734`, valid until 2027-11-09). Windows Defender's machine-learning check removed the unsigned `xswap.exe` (issue #27).
+
+The `sign-windows` job runs for every tag and for a manual run with `sign` checked. After both Windows builds it logs in to SimplySign Desktop on one x64 runner with Ghostex's `tooling/release-gpui/certum-simplysign-login.ps1` (checked out at the commit pinned in `GHOSTEX_SIGNING_COMMIT`), signs `xswap.exe` from both archives with `signtool` (`/fd sha256 /tr http://time.certum.pl /td sha256`), fails unless each signature is `Valid`, from that certificate and timestamped, and replaces the two archives before checksums and the formula are made. A tag never publishes an unsigned Windows build: without the secrets the job fails and nothing is published.
+
+It needs two repository secrets, the same values as on `maddada/Ghostex` (Ghostex's `docs/code-signing.md` explains where the seed comes from):
+
+```sh
+gh secret set CERTUM_SIMPLYSIGN_EMAIL -R maddada/codex-swap
+gh secret set CERTUM_SIMPLYSIGN_TOTP -R maddada/codex-swap
+```
+
+`CERTUM_SIMPLYSIGN_TOTP` is the full `otpauth://totp/...` URI from the SimplySign activation QR code: anyone with it and the e-mail can sign as the certificate's owner. A repository variable `CERTUM_CERT_SHA1` overrides the thumbprint after a renewal. To test signing without a release, run `Release binaries` by hand with `sign` checked; the signed archives are in the run's `homebrew-release` artifact. Certum accepts each one-time code once, so do not start a codex-swap release while a Ghostex release is logging in to SimplySign. When Ghostex changes its login script, move `GHOSTEX_SIGNING_COMMIT` to that commit.
+
+To check a published build on Windows: `Get-AuthenticodeSignature xswap.exe` must show `Valid` and the thumbprint above, or `signtool verify /pa /v xswap.exe` must end with `Successfully verified`.
